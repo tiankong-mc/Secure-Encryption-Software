@@ -18,3 +18,7 @@
 1.在根目录下右键，打开终端
 2.在终端内输入pip install -r requirements.txt安装依赖
 
+This project is licensed under the GNU General Public License v3.0 - see the LICENSE file for details.
+
+
+
