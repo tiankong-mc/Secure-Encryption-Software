@@ -57,10 +57,16 @@ class StorageManager:
             user_path = os.path.join(user_dest, os.path.basename(local_path) + '.vault')
             shutil.copy2(secret_path, user_path)
         ext = os.path.splitext(local_path)[1].lower()
-        if ext in ['.txt', '.md', '.py', '.json', '.xml', '.html', '.css', '.js']:
+        if ext in ['.txt', '.md', '.py', '.json', '.xml', '.html', '.css', '.js', '.csv']:
             ftype = 'text'
-        elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico']:
+        elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.webp']:
             ftype = 'image'
+        elif ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v']:
+            ftype = 'video'
+        elif ext in ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma']:
+            ftype = 'audio'
+        elif ext in ['.docx', '.doc', '.pdf', '.odt', '.rtf']:
+            ftype = 'document'
         else:
             ftype = 'other'
         entry = {
@@ -124,7 +130,6 @@ class StorageManager:
         return False
 
     def import_vault_file(self, vault_path, original_name=None, is_advanced=False, second_auth_methods=None):
-        """导入外部 .vault 文件，自动推断原始名（去掉 .vault 后缀）"""
         if not os.path.exists(vault_path):
             raise FileNotFoundError("文件不存在")
         with open(vault_path, 'rb') as f:
@@ -138,20 +143,24 @@ class StorageManager:
         secret_filename = uid + '.vault'
         secret_path = os.path.join(self.SECRET_DIR, secret_filename)
         shutil.copy2(vault_path, secret_path)
-        # 自动推断原始文件名
         if original_name is None:
             base = os.path.basename(vault_path)
             if base.endswith('.vault'):
-                base = base[:-6]  # 去掉 .vault
-            # 如果去掉后为空，则使用 "unknown"
+                base = base[:-6]
             if not base:
                 base = "unknown"
             original_name = base
         ext = os.path.splitext(original_name)[1].lower()
-        if ext in ['.txt', '.md', '.py', '.json', '.xml', '.html', '.css', '.js']:
+        if ext in ['.txt', '.md', '.py', '.json', '.xml', '.html', '.css', '.js', '.csv']:
             ftype = 'text'
-        elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico']:
+        elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.webp']:
             ftype = 'image'
+        elif ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v']:
+            ftype = 'video'
+        elif ext in ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma']:
+            ftype = 'audio'
+        elif ext in ['.docx', '.doc', '.pdf', '.odt', '.rtf']:
+            ftype = 'document'
         else:
             ftype = 'other'
         entry = {
@@ -169,14 +178,12 @@ class StorageManager:
         return uid
 
     def get_all_vault_paths_with_names(self):
-        """返回列表 [(vault_path, display_name), ...] 用于邮件发送"""
         result = []
         for entry in self.index:
             vault_path = entry['secret_path']
             if not os.path.exists(vault_path) and entry['user_path'] and os.path.exists(entry['user_path']):
                 vault_path = entry['user_path']
             if os.path.exists(vault_path):
-                # 显示名称为 original_name + '.vault'
                 display_name = entry['original_name'] + '.vault'
                 result.append((vault_path, display_name))
         return result
