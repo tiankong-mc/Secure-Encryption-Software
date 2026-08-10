@@ -23,7 +23,7 @@ class FileViewer(QDialog):
         layout = QVBoxLayout()
         self.tmp_path = None
         self.player = None
-        self.file_data = data          # 保存原始数据用于导出
+        self.file_data = data
 
         if ftype == 'text':
             text_edit = QTextEdit()
@@ -168,9 +168,7 @@ class FileViewer(QDialog):
                     self.position_label.setText(f"{pos_str} / {dur_str}")
 
     def export_and_view(self):
-        """从原始数据导出到新临时文件，避免文件占用问题"""
         if hasattr(self, 'file_data') and self.file_data:
-            # 获取扩展名
             ext = os.path.splitext(self.windowTitle().replace("查看: ", ""))[1] if hasattr(self, 'windowTitle') else '.bin'
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                 tmp.write(self.file_data)
@@ -188,7 +186,7 @@ class FileViewer(QDialog):
                 pass
 
 
-# ---------- 二次验证对话框 ----------
+# ---------- 二次验证对话框（错误5次触发紧急备份） ----------
 class AuthDialog(QDialog):
     def __init__(self, parent, auth_manager, allowed_methods, entry_id):
         super().__init__(parent)
@@ -354,7 +352,7 @@ class AuthDialog(QDialog):
         QApplication.quit()
 
 
-# ---------- 删除文件/操作验证对话框（不累计错误） ----------
+# ---------- 删除/操作验证对话框（不累计错误） ----------
 class DeleteAuthDialog(QDialog):
     def __init__(self, parent, auth_manager, allowed_methods):
         super().__init__(parent)
@@ -1163,13 +1161,29 @@ class MainWindow(QMainWindow):
         if entry is None:
             QMessageBox.warning(self, "错误", "未找到该文件记录")
             return
-        available_methods = self._get_available_auth_methods()
-        if not available_methods:
-            QMessageBox.warning(self, "提示", "没有可用的验证方式，请先设置安全选项。")
-            return
-        auth_dialog = DeleteAuthDialog(self, self.auth, available_methods)
-        if auth_dialog.exec_() != QDialog.Accepted:
-            return
+
+        # ---- 核心修复：高级文件使用 AuthDialog（带错误计数） ----
+        if entry['is_advanced']:
+            # 高级文件必须使用其设定的二次验证方式
+            methods = entry['second_auth_methods']
+            if not methods:
+                QMessageBox.warning(self, "提示", "该高级文件未设置二次验证方式，无法导出")
+                return
+            # 使用 AuthDialog，错误5次会触发备份删除该文件
+            auth_dialog = AuthDialog(self, self.auth, methods, entry_id)
+            if auth_dialog.exec_() != QDialog.Accepted:
+                return
+        else:
+            # 普通文件使用常规身份验证（不累计错误）
+            available_methods = self._get_available_auth_methods()
+            if not available_methods:
+                QMessageBox.warning(self, "提示", "没有可用的验证方式，请先设置安全选项。")
+                return
+            auth_dialog = DeleteAuthDialog(self, self.auth, available_methods)
+            if auth_dialog.exec_() != QDialog.Accepted:
+                return
+
+        # 验证通过，选择保存位置
         save_path, _ = QFileDialog.getSaveFileName(self, "导出解密文件", entry['original_name'], "All Files (*.*)")
         if not save_path:
             return
