@@ -1,0 +1,1 @@
+python -m PyInstaller --onefile --windowed --name Encryption --icon=myicon_1.ico main.py
