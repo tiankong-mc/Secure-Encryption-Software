@@ -12,6 +12,8 @@ from PIL import Image, ImageQt
 import docx
 import PyPDF2
 from backup import BackupManager
+from datetime import datetime  # 用于生成时间戳
+import traceback
 
 # ---------- 内置文件查看器 ----------
 class FileViewer(QDialog):
@@ -186,7 +188,7 @@ class FileViewer(QDialog):
                 pass
 
 
-# ---------- 二次验证对话框（错误5次触发紧急备份） ----------
+# ---------- 二次验证对话框 ----------
 class AuthDialog(QDialog):
     def __init__(self, parent, auth_manager, allowed_methods, entry_id):
         super().__init__(parent)
@@ -352,7 +354,7 @@ class AuthDialog(QDialog):
         QApplication.quit()
 
 
-# ---------- 删除/操作验证对话框（不累计错误） ----------
+# ---------- 删除文件/操作验证对话框（不累计错误） ----------
 class DeleteAuthDialog(QDialog):
     def __init__(self, parent, auth_manager, allowed_methods):
         super().__init__(parent)
@@ -686,14 +688,15 @@ class SetupWizard(QWizard):
         super().accept()
 
 
-# ---------- 登录对话框 ----------
+# ---------- 登录对话框（增加紧急恢复代码按钮） ----------
 class LoginDialog(QDialog):
     def __init__(self, auth_manager):
         super().__init__()
         self.auth = auth_manager
+        self.recovery_accepted = False
         self.setWindowTitle("SecureVault 登录")
         self.setModal(True)
-        self.resize(400, 300)
+        self.resize(400, 350)
         layout = QVBoxLayout()
         self.label = QLabel("请通过以下任一方式验证身份")
         layout.addWidget(self.label)
@@ -724,7 +727,23 @@ class LoginDialog(QDialog):
         self.btn_box.accepted.connect(self.accept)
         self.btn_box.rejected.connect(self.reject)
         layout.addWidget(self.btn_box)
+
+        # 紧急恢复代码按钮
+        self.recovery_btn = QPushButton("使用紧急恢复代码")
+        self.recovery_btn.clicked.connect(self.recovery_login)
+        layout.addWidget(self.recovery_btn)
+
         self.setLayout(layout)
+
+    def recovery_login(self):
+        code, ok = QInputDialog.getText(self, "紧急恢复", "请输入紧急恢复代码（格式：XXXX-XXXX-XXXX-XXXX-XXXX）:")
+        if not ok or not code:
+            return
+        if self.auth.verify_recovery_code(code):
+            self.recovery_accepted = True
+            self.accept()
+        else:
+            QMessageBox.warning(self, "错误", "恢复代码无效或已使用")
 
     def create_password_widget(self):
         w = QWidget()
@@ -780,6 +799,9 @@ class LoginDialog(QDialog):
             QMessageBox.warning(self, "错误", "发送失败")
 
     def accept(self):
+        if self.recovery_accepted:
+            super().accept()
+            return
         method = self.method_combo.currentText()
         ok = False
         if method == 'password':
@@ -842,14 +864,15 @@ class LoginDialog(QDialog):
         QApplication.quit()
 
 
-# ---------- 设置对话框 ----------
+# ---------- 设置对话框（增加生成紧急恢复代码，已修复闪退） ----------
 class SettingsDialog(QDialog):
-    def __init__(self, parent, auth_manager):
+    def __init__(self, parent, auth_manager, is_recovery_login=False):
         super().__init__(parent)
         self.auth = auth_manager
+        self.is_recovery_login = is_recovery_login
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.resize(500, 400)
+        self.resize(500, 450)
         layout = QVBoxLayout()
 
         info_label = QLabel("当前已启用的验证方式：")
@@ -883,13 +906,32 @@ class SettingsDialog(QDialog):
         self.btn_change_email.clicked.connect(self.change_email)
         layout.addWidget(self.btn_change_email)
 
+        # 生成紧急恢复代码
+        self.btn_generate_recovery = QPushButton("生成紧急恢复代码")
+        self.btn_generate_recovery.clicked.connect(self.generate_recovery)
+        layout.addWidget(self.btn_generate_recovery)
+
+        self.recovery_status = QLabel()
+        self.update_recovery_status()
+        layout.addWidget(self.recovery_status)
+
         btn_box = QDialogButtonBox(QDialogButtonBox.Close)
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
 
         self.setLayout(layout)
 
+    def update_recovery_status(self):
+        if self.auth.is_recovery_code_available():
+            self.recovery_status.setText("状态：当前有一份有效的紧急恢复代码")
+            self.recovery_status.setStyleSheet("color: green;")
+        else:
+            self.recovery_status.setText("状态：当前没有有效的紧急恢复代码")
+            self.recovery_status.setStyleSheet("color: gray;")
+
     def _verify_identity(self):
+        if self.is_recovery_login:
+            return True
         available_methods = []
         if self.auth.password_hash:
             available_methods.append('password')
@@ -904,6 +946,48 @@ class SettingsDialog(QDialog):
             return False
         dialog = DeleteAuthDialog(self, self.auth, available_methods)
         return dialog.exec_() == QDialog.Accepted
+
+    def generate_recovery(self):
+        """生成紧急恢复代码，捕获所有异常避免闪退"""
+        try:
+            if not self.is_recovery_login:
+                if not self._verify_identity():
+                    return
+            code = self.auth.generate_recovery_code()
+            dialog = QDialog(self)
+            dialog.setWindowTitle("紧急恢复代码")
+            layout = QVBoxLayout()
+            layout.addWidget(QLabel("您的紧急恢复代码已生成，请妥善保管："))
+            code_label = QLabel(code)
+            code_label.setStyleSheet("font-size: 16pt; font-weight: bold; font-family: monospace;")
+            code_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(code_label)
+            code_edit = QLineEdit(code)
+            code_edit.setReadOnly(True)
+            code_edit.setStyleSheet("font-family: monospace;")
+            layout.addWidget(code_edit)
+            export_btn = QPushButton("导出为 .txt 文件")
+            def export_code():
+                try:
+                    path, _ = QFileDialog.getSaveFileName(self, "保存恢复代码", "recovery_code.txt", "Text Files (*.txt)")
+                    if path:
+                        with open(path, 'w') as f:
+                            f.write(f"紧急恢复代码：{code}\n\n生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                        QMessageBox.information(dialog, "导出成功", f"代码已保存到：{path}")
+                except Exception as e:
+                    QMessageBox.warning(dialog, "导出失败", str(e))
+            export_btn.clicked.connect(export_code)
+            layout.addWidget(export_btn)
+            btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+            btn_box.rejected.connect(dialog.accept)
+            layout.addWidget(btn_box)
+            dialog.setLayout(layout)
+            dialog.exec_()
+            self.update_recovery_status()
+            QMessageBox.information(self, "提示", "新的恢复代码已生成，旧代码已失效，邮件通知已发送。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"生成恢复代码失败: {e}")
+            traceback.print_exc()
 
     def change_password(self):
         if not self._verify_identity():
@@ -1049,13 +1133,13 @@ class SettingsDialog(QDialog):
             return
         QMessageBox.information(self, "成功", "邮箱配置已更新")
 
-
 # ---------- 主窗口 ----------
 class MainWindow(QMainWindow):
-    def __init__(self, storage, auth):
+    def __init__(self, storage, auth, is_recovery_login=False):
         super().__init__()
         self.storage = storage
         self.auth = auth
+        self.is_recovery_login = is_recovery_login
         self.setWindowTitle("SecureVault")
         self.setGeometry(100, 100, 800, 600)
         self.initUI()
@@ -1161,20 +1245,15 @@ class MainWindow(QMainWindow):
         if entry is None:
             QMessageBox.warning(self, "错误", "未找到该文件记录")
             return
-
-        # ---- 核心修复：高级文件使用 AuthDialog（带错误计数） ----
         if entry['is_advanced']:
-            # 高级文件必须使用其设定的二次验证方式
             methods = entry['second_auth_methods']
             if not methods:
                 QMessageBox.warning(self, "提示", "该高级文件未设置二次验证方式，无法导出")
                 return
-            # 使用 AuthDialog，错误5次会触发备份删除该文件
             auth_dialog = AuthDialog(self, self.auth, methods, entry_id)
             if auth_dialog.exec_() != QDialog.Accepted:
                 return
         else:
-            # 普通文件使用常规身份验证（不累计错误）
             available_methods = self._get_available_auth_methods()
             if not available_methods:
                 QMessageBox.warning(self, "提示", "没有可用的验证方式，请先设置安全选项。")
@@ -1182,8 +1261,6 @@ class MainWindow(QMainWindow):
             auth_dialog = DeleteAuthDialog(self, self.auth, available_methods)
             if auth_dialog.exec_() != QDialog.Accepted:
                 return
-
-        # 验证通过，选择保存位置
         save_path, _ = QFileDialog.getSaveFileName(self, "导出解密文件", entry['original_name'], "All Files (*.*)")
         if not save_path:
             return
@@ -1216,7 +1293,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"打开文件失败: {e}")
 
     def open_settings(self):
-        dialog = SettingsDialog(self, self.auth)
+        dialog = SettingsDialog(self, self.auth, self.is_recovery_login)
         dialog.exec_()
 
     def delete_file(self):

@@ -12,7 +12,6 @@ def main():
     auth = AuthManager(settings)
     storage = StorageManager()
 
-    # 首次运行引导
     if not auth.settings_dict.get('initialized'):
         wizard = SetupWizard(auth)
         if wizard.exec_() != SetupWizard.Accepted:
@@ -20,13 +19,14 @@ def main():
         auth.settings_dict = auth.settings.load_settings()
         auth._init_auth_data()
 
-    # 登录验证（若失败5次会触发备份并退出）
     login = LoginDialog(auth)
     if login.exec_() != QDialog.Accepted:
         sys.exit(0)
 
-    # 启动主窗口
-    window = MainWindow(storage, auth)
+    # 检查是否通过恢复代码登录
+    is_recovery_login = login.recovery_accepted if hasattr(login, 'recovery_accepted') else False
+
+    window = MainWindow(storage, auth, is_recovery_login)
     window.show()
     sys.exit(app.exec_())
 

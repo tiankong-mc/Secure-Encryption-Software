@@ -5,6 +5,8 @@ from io import BytesIO
 import smtplib
 from email.mime.text import MIMEText
 import random
+import string
+import base64
 
 class AuthManager:
     def __init__(self, settings_manager):
@@ -19,6 +21,8 @@ class AuthManager:
         self.email_config = self.settings_dict.get('email', {})
         self.fail_count = self.settings_dict.get('fail_count', 0)
         self.initialized = self.settings_dict.get('initialized', False)
+        self.recovery_code_encrypted_b64 = self.settings_dict.get('recovery_code_encrypted_b64', None)
+        self.recovery_code_used = self.settings_dict.get('recovery_code_used', True)
 
     def _save(self):
         self.settings.save_settings(self.settings_dict)
@@ -111,3 +115,71 @@ class AuthManager:
         self.fail_count = 0
         self.settings_dict['fail_count'] = 0
         self._save()
+
+    # ---------- 紧急恢复代码 ----------
+    def generate_recovery_code(self):
+        chars = string.ascii_uppercase + string.digits
+        raw = ''.join(random.choice(chars) for _ in range(20))
+        formatted = '-'.join(raw[i:i+4] for i in range(0, 20, 4))
+        encrypted = self.settings.dpapi.protect(formatted.encode())
+        encrypted_b64 = base64.b64encode(encrypted).decode()
+        self.settings_dict['recovery_code_encrypted_b64'] = encrypted_b64
+        self.settings_dict['recovery_code_used'] = False
+        self._save()
+        # 发送邮件通知（不包含代码）
+        self._send_recovery_email(generated=True)
+        return formatted
+
+    def verify_recovery_code(self, input_code):
+        encrypted_b64 = self.settings_dict.get('recovery_code_encrypted_b64')
+        if not encrypted_b64:
+            return False
+        used = self.settings_dict.get('recovery_code_used', True)
+        if used:
+            return False
+        try:
+            encrypted = base64.b64decode(encrypted_b64)
+            stored_code = self.settings.dpapi.unprotect(encrypted).decode()
+        except Exception:
+            return False
+        if stored_code == input_code:
+            self.settings_dict['recovery_code_used'] = True
+            self._save()
+            # 发送邮件通知使用（不包含代码）
+            self._send_recovery_email(generated=False)
+            return True
+        return False
+
+    def _send_recovery_email(self, generated=True):
+        """发送紧急恢复代码相关邮件（不包含代码内容）"""
+        smtp_config = self.email_config
+        if not smtp_config:
+            return
+        to_email = smtp_config.get('receiver_email')
+        if not to_email:
+            return
+        if generated:
+            subject = '紧急恢复代码已生成'
+            body = '您的SecureVault紧急恢复代码已生成，旧代码已失效。\n\n请登录软件，在“设置”中查看并妥善保管新的紧急恢复代码。'
+        else:
+            subject = '紧急恢复代码已使用'
+            body = '您的SecureVault紧急恢复代码已被使用，该代码已失效。\n\n如非本人操作，请立即修改密码和安全设置。'
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = smtp_config['sender_email']
+        msg['To'] = to_email
+        try:
+            server = smtplib.SMTP(smtp_config['smtp_server'], smtp_config['port'])
+            server.starttls()
+            server.login(smtp_config['sender_email'], smtp_config['password'])
+            server.sendmail(smtp_config['sender_email'], [to_email], msg.as_string())
+            server.quit()
+        except Exception as e:
+            print(f"紧急恢复邮件发送失败: {e}")
+
+    def is_recovery_code_available(self):
+        encrypted_b64 = self.settings_dict.get('recovery_code_encrypted_b64')
+        if not encrypted_b64:
+            return False
+        used = self.settings_dict.get('recovery_code_used', True)
+        return not used
