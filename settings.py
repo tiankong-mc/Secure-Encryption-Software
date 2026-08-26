@@ -10,7 +10,6 @@ class DPAPI:
         self.kernel32 = ctypes.windll.kernel32
 
     def protect(self, data_bytes):
-        # 使用 CryptProtectData
         class DATA_BLOB(ctypes.Structure):
             _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
         blob_in = DATA_BLOB(len(data_bytes), ctypes.cast(data_bytes, ctypes.POINTER(ctypes.c_char)))
@@ -42,7 +41,6 @@ class SettingsManager:
         os.makedirs(self.CONFIG_DIR, exist_ok=True)
 
     def get_master_key(self):
-        """获取或生成主密钥（32字节）"""
         if os.path.exists(self.MASTER_KEY_PATH):
             with open(self.MASTER_KEY_PATH, 'rb') as f:
                 encrypted = f.read()
@@ -55,7 +53,6 @@ class SettingsManager:
             return key
 
     def load_settings(self):
-        """加载所有配置字典"""
         if os.path.exists(self.CONFIG_PATH):
             with open(self.CONFIG_PATH, 'rb') as f:
                 encrypted = f.read()

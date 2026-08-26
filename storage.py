@@ -3,6 +3,8 @@ import json
 import shutil
 import uuid
 import pickle
+import zipfile
+import tempfile
 from crypto import encrypt_data, decrypt_data, generate_key
 from settings import SettingsManager
 from backup import BackupManager
@@ -21,6 +23,14 @@ class StorageManager:
         except:
             pass
         self.index = self._load_index()
+        self._ensure_tags_list()
+
+    def _ensure_tags_list(self):
+        # 确保每个条目有 tags 字段
+        for entry in self.index:
+            if 'tags' not in entry:
+                entry['tags'] = []
+        self._save_index()
 
     def _load_index(self):
         if os.path.exists(self.INDEX_PATH):
@@ -39,7 +49,7 @@ class StorageManager:
         with open(self.INDEX_PATH, 'wb') as f:
             f.write(encrypted)
 
-    def add_file(self, local_path, user_dest=None, is_advanced=False, second_auth_methods=None):
+    def add_file(self, local_path, user_dest=None, is_advanced=False, second_auth_methods=None, tags=None):
         with open(local_path, 'rb') as f:
             plain = f.read()
         file_key = generate_key()
@@ -57,18 +67,7 @@ class StorageManager:
             user_path = os.path.join(user_dest, os.path.basename(local_path) + '.vault')
             shutil.copy2(secret_path, user_path)
         ext = os.path.splitext(local_path)[1].lower()
-        if ext in ['.txt', '.md', '.py', '.json', '.xml', '.html', '.css', '.js', '.csv']:
-            ftype = 'text'
-        elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.webp']:
-            ftype = 'image'
-        elif ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v']:
-            ftype = 'video'
-        elif ext in ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma']:
-            ftype = 'audio'
-        elif ext in ['.docx', '.doc', '.pdf', '.odt', '.rtf']:
-            ftype = 'document'
-        else:
-            ftype = 'other'
+        ftype = self._get_file_type(ext)
         entry = {
             'id': uid,
             'original_name': os.path.basename(local_path),
@@ -77,11 +76,26 @@ class StorageManager:
             'is_advanced': is_advanced,
             'second_auth_methods': second_auth_methods or [],
             'type': ftype,
-            'ext': ext
+            'ext': ext,
+            'tags': tags or []
         }
         self.index.append(entry)
         self._save_index()
         return uid
+
+    def _get_file_type(self, ext):
+        if ext in ['.txt', '.md', '.py', '.json', '.xml', '.html', '.css', '.js', '.csv']:
+            return 'text'
+        elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.webp']:
+            return 'image'
+        elif ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v']:
+            return 'video'
+        elif ext in ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma']:
+            return 'audio'
+        elif ext in ['.docx', '.doc', '.pdf', '.odt', '.rtf']:
+            return 'document'
+        else:
+            return 'other'
 
     def get_file_data(self, entry_id):
         for entry in self.index:
@@ -129,7 +143,7 @@ class StorageManager:
                 return True
         return False
 
-    def import_vault_file(self, vault_path, original_name=None, is_advanced=False, second_auth_methods=None):
+    def import_vault_file(self, vault_path, original_name=None, is_advanced=False, second_auth_methods=None, tags=None):
         if not os.path.exists(vault_path):
             raise FileNotFoundError("文件不存在")
         with open(vault_path, 'rb') as f:
@@ -151,18 +165,7 @@ class StorageManager:
                 base = "unknown"
             original_name = base
         ext = os.path.splitext(original_name)[1].lower()
-        if ext in ['.txt', '.md', '.py', '.json', '.xml', '.html', '.css', '.js', '.csv']:
-            ftype = 'text'
-        elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.webp']:
-            ftype = 'image'
-        elif ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v']:
-            ftype = 'video'
-        elif ext in ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma']:
-            ftype = 'audio'
-        elif ext in ['.docx', '.doc', '.pdf', '.odt', '.rtf']:
-            ftype = 'document'
-        else:
-            ftype = 'other'
+        ftype = self._get_file_type(ext)
         entry = {
             'id': uid,
             'original_name': original_name,
@@ -171,7 +174,8 @@ class StorageManager:
             'is_advanced': is_advanced,
             'second_auth_methods': second_auth_methods or [],
             'type': ftype,
-            'ext': ext
+            'ext': ext,
+            'tags': tags or []
         }
         self.index.append(entry)
         self._save_index()
@@ -187,3 +191,104 @@ class StorageManager:
                 display_name = entry['original_name'] + '.vault'
                 result.append((vault_path, display_name))
         return result
+
+    # ---------- 标签管理 ----------
+    def get_all_tags(self):
+        tags = set()
+        for entry in self.index:
+            tags.update(entry.get('tags', []))
+        return sorted(tags)
+
+    def add_tag_to_entry(self, entry_id, tag):
+        entry = self.get_entry_by_id(entry_id)
+        if entry and tag not in entry['tags']:
+            entry['tags'].append(tag)
+            self._save_index()
+            return True
+        return False
+
+    def remove_tag_from_entry(self, entry_id, tag):
+        entry = self.get_entry_by_id(entry_id)
+        if entry and tag in entry['tags']:
+            entry['tags'].remove(tag)
+            self._save_index()
+            return True
+        return False
+
+    def get_entries_by_tag(self, tag):
+        return [entry for entry in self.index if tag in entry.get('tags', [])]
+
+    # ---------- 保险库迁移 ----------
+    def export_vault(self, export_path, password=None):
+        """
+        将整个保险库打包到一个文件中（包含加密文件、索引、配置）
+        如果提供了密码，使用 AES 加密打包文件
+        """
+        import pyzipper
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # 复制所有 .vault 文件到临时目录
+            vault_files = []
+            for entry in self.index:
+                src = entry['secret_path']
+                if os.path.exists(src):
+                    dest = os.path.join(temp_dir, os.path.basename(src))
+                    shutil.copy2(src, dest)
+                    vault_files.append(dest)
+            # 复制索引文件
+            shutil.copy2(self.INDEX_PATH, os.path.join(temp_dir, 'index.enc'))
+            # 复制配置文件（master.key, config.dat）
+            config_dir = self.settings.CONFIG_DIR
+            shutil.copy2(os.path.join(config_dir, 'master.key'), os.path.join(temp_dir, 'master.key'))
+            shutil.copy2(os.path.join(config_dir, 'config.dat'), os.path.join(temp_dir, 'config.dat'))
+            # 创建元数据文件（记录版本等）
+            meta = {
+                'version': '1.0',
+                'timestamp': __import__('datetime').datetime.now().isoformat(),
+                'num_files': len(self.index)
+            }
+            with open(os.path.join(temp_dir, 'meta.json'), 'w') as f:
+                json.dump(meta, f)
+            # 打包
+            with pyzipper.AESZipFile(export_path, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
+                if password:
+                    zf.setpassword(password.encode())
+                for root, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        arcname = os.path.relpath(full_path, temp_dir)
+                        zf.write(full_path, arcname)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def import_vault(self, import_path, password=None):
+        """
+        从备份包导入保险库，覆盖当前所有数据
+        """
+        import pyzipper
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with pyzipper.AESZipFile(import_path, 'r') as zf:
+                if password:
+                    zf.setpassword(password.encode())
+                zf.extractall(temp_dir)
+            # 检查元数据
+            meta_path = os.path.join(temp_dir, 'meta.json')
+            if not os.path.exists(meta_path):
+                raise ValueError("无效的备份包：缺少 meta.json")
+            # 停止当前服务（没有服务，直接覆盖）
+            # 覆盖 .vault 文件到 SECRET_DIR
+            for file in os.listdir(temp_dir):
+                if file.endswith('.vault'):
+                    shutil.copy2(os.path.join(temp_dir, file), self.SECRET_DIR)
+            # 覆盖索引
+            shutil.copy2(os.path.join(temp_dir, 'index.enc'), self.INDEX_PATH)
+            # 覆盖配置
+            config_dir = self.settings.CONFIG_DIR
+            shutil.copy2(os.path.join(temp_dir, 'master.key'), config_dir)
+            shutil.copy2(os.path.join(temp_dir, 'config.dat'), config_dir)
+            # 重新加载索引
+            self.index = self._load_index()
+        finally:
+            shutil.rmtree(temp_dir)
+        return True
