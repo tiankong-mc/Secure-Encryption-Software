@@ -10,7 +10,7 @@ from auth import AuthManager
 from settings import SettingsManager
 from backup import BackupManager
 
-VERSION = "v2.4.0"  
+VERSION = "v2.4.1"  
 def main():
     app = QApplication(sys.argv)
     settings = SettingsManager()

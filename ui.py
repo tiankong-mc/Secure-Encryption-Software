@@ -1,4 +1,4 @@
-import sys,os,tempfile,shutil,json,threading,socket,webbrowser,urllib3
+import sys,os,tempfile,shutil,json,threading,socket,webbrowser,subprocess,urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -11,9 +11,10 @@ import docx,PyPDF2
 from backup import BackupManager
 from datetime import datetime
 import traceback,requests,qrcode
-from flask import Flask, request, render_template_string, session, redirect, url_for
+from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, send_file
+from packaging.version import parse as parse_version
 
-VERSION = "v2.4.0"
+VERSION = "v2.4.1"
 
 DARK_STYLE="""
 QMainWindow,QDialog{background:#2b2b2b;color:#f0f0f0}
@@ -49,6 +50,11 @@ flask_app=Flask(__name__)
 flask_app.secret_key=os.urandom(24)
 web_storage=None; web_auth=None; WEB_PORT=8080
 
+@flask_app.template_filter('b64encode')
+def b64encode_filter(data):
+    import base64
+    return base64.b64encode(data).decode('utf-8')
+
 @flask_app.route('/')
 def web_index():
     if 'authenticated' not in session or not session['authenticated']:
@@ -71,12 +77,15 @@ def web_login():
         elif method=='totp':
             ok=web_auth.verify_totp(inp) if web_auth else False
         elif method=='email':
-            ok=(inp==request.form.get('code',''))
+            stored_code=session.get('email_code')
+            if stored_code and inp==stored_code:
+                ok=True
+                session.pop('email_code',None)
         if ok:
             session['authenticated']=True
             return redirect(url_for('web_index'))
         else:
-            return render_template_string(WEB_LOGIN_TEMPLATE, methods=questions, error="验证失败，请重试")
+            return render_template_string(WEB_LOGIN_TEMPLATE, methods=questions, error="验证失败")
     return render_template_string(WEB_LOGIN_TEMPLATE, methods=questions, error=None)
 
 @flask_app.route('/view/<entry_id>')
@@ -97,10 +106,12 @@ def web_view(entry_id):
 def web_second_auth(entry_id):
     entry=web_storage.get_entry_by_id(entry_id)
     if not entry: return "文件不存在",404
-    allowed_methods = entry.get('second_auth_methods', [])
-    questions = web_auth.get_questions() if web_auth else []
+    allowed_methods=entry.get('second_auth_methods', [])
+    questions=web_auth.get_questions() if web_auth else []
     if request.method=='POST':
         method=request.form.get('method','password')
+        if method not in allowed_methods:
+            return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error="不允许的验证方式"),400
         inp=request.form.get('input','')
         ok=False
         if method=='password':
@@ -110,6 +121,11 @@ def web_second_auth(entry_id):
             ok=web_auth.verify_question(q,inp) if web_auth else False
         elif method=='totp':
             ok=web_auth.verify_totp(inp) if web_auth else False
+        elif method=='email':
+            stored_code=session.get('email_code')
+            if stored_code and inp==stored_code:
+                ok=True
+                session.pop('email_code',None)
         if ok:
             data=web_storage.get_file_data(entry_id)
             return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
@@ -117,10 +133,49 @@ def web_second_auth(entry_id):
             return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error="验证失败")
     return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error=None)
 
+@flask_app.route('/download/<entry_id>')
+def web_download(entry_id):
+    if 'authenticated' not in session or not session['authenticated']:
+        return redirect(url_for('web_login'))
+    try:
+        data=web_storage.get_file_data(entry_id)
+        entry=web_storage.get_entry_by_id(entry_id)
+        if not entry: return "文件不存在",404
+        return send_file(BytesIO(data), as_attachment=True, download_name=entry['original_name'])
+    except Exception as e:
+        return f"下载失败: {e}",500
+
+@flask_app.route('/send_code', methods=['POST'])
+def send_code():
+    if not web_auth or not web_auth.email_config:
+        return jsonify({'success':False,'message':'邮箱未配置'}),400
+    import random,smtplib
+    from email.mime.text import MIMEText
+    code=''.join(random.choices('0123456789',k=6))
+    config=web_auth.email_config
+    to_email=config.get('receiver_email')
+    if not to_email:
+        return jsonify({'success':False,'message':'未设置收件邮箱'}),400
+    msg=MIMEText(f'您的SecureVault验证码是：{code}')
+    msg['Subject']='SecureVault验证码'
+    msg['From']=config['sender_email']
+    msg['To']=to_email
+    try:
+        server=smtplib.SMTP(config['smtp_server'],config['port'])
+        server.starttls()
+        server.login(config['sender_email'],config['password'])
+        server.sendmail(config['sender_email'],[to_email],msg.as_string())
+        server.quit()
+    except Exception as e:
+        return jsonify({'success':False,'message':f'邮件发送失败: {str(e)}'}),500
+    session['email_code']=code
+    return jsonify({'success':True,'message':'验证码已发送'})
+
 def start_web_server(storage,auth):
     global web_storage,web_auth
     web_storage=storage; web_auth=auth
     try:
+        print("\n⚠️ 警告：Web服务使用明文HTTP，仅限可信局域网，公共网络下请勿启用。")
         flask_app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
     except Exception as e:
         print(f"Web server error: {e}")
@@ -140,9 +195,33 @@ WEB_LOGIN_TEMPLATE="""<!DOCTYPE html>
 function toggleQuestion() {
     var method = document.getElementById('method').value;
     var qDiv = document.getElementById('question_div');
+    var emailDiv = document.getElementById('email_div');
     if (method === 'question') { qDiv.style.display = 'block'; } else { qDiv.style.display = 'none'; }
+    if (method === 'email') { emailDiv.style.display = 'block'; } else { emailDiv.style.display = 'none'; }
 }
-window.onload = function() { toggleQuestion(); document.getElementById('method').addEventListener('change', toggleQuestion); }
+function sendCode() {
+    var btn = document.getElementById('send_code_btn');
+    btn.disabled = true;
+    btn.textContent = '发送中...';
+    fetch('/send_code', { method: 'POST' })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert('验证码已发送至您的邮箱');
+            } else {
+                alert('发送失败: ' + data.message);
+            }
+        })
+        .catch(err => alert('请求失败'))
+        .finally(() => {
+            btn.disabled = false;
+            btn.textContent = '发送验证码';
+        });
+}
+window.onload = function() {
+    toggleQuestion();
+    document.getElementById('method').addEventListener('change', toggleQuestion);
+}
 </script>
 </head><body>
 <form method="post">
@@ -159,6 +238,9 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 {% for q in methods %}<option value="{{ q }}">{{ q }}</option>{% endfor %}
 </select>
 </div>
+<div id="email_div" style="display:none;">
+<button type="button" id="send_code_btn" onclick="sendCode()">发送验证码</button>
+</div>
 <input type="text" name="input" placeholder="输入验证信息">
 <button type="submit">登录</button>
 </form>
@@ -171,9 +253,33 @@ WEB_SECOND_AUTH_TEMPLATE="""<!DOCTYPE html>
 function toggleQuestion() {
     var method = document.getElementById('method').value;
     var qDiv = document.getElementById('question_div');
+    var emailDiv = document.getElementById('email_div');
     if (method === 'question') { qDiv.style.display = 'block'; } else { qDiv.style.display = 'none'; }
+    if (method === 'email') { emailDiv.style.display = 'block'; } else { emailDiv.style.display = 'none'; }
 }
-window.onload = function() { toggleQuestion(); document.getElementById('method').addEventListener('change', toggleQuestion); }
+function sendCode() {
+    var btn = document.getElementById('send_code_btn');
+    btn.disabled = true;
+    btn.textContent = '发送中...';
+    fetch('/send_code', { method: 'POST' })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert('验证码已发送至您的邮箱');
+            } else {
+                alert('发送失败: ' + data.message);
+            }
+        })
+        .catch(err => alert('请求失败'))
+        .finally(() => {
+            btn.disabled = false;
+            btn.textContent = '发送验证码';
+        });
+}
+window.onload = function() {
+    toggleQuestion();
+    document.getElementById('method').addEventListener('change', toggleQuestion);
+}
 </script>
 </head><body>
 <form method="post">
@@ -187,6 +293,9 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 {% for q in questions %}<option value="{{ q }}">{{ q }}</option>{% endfor %}
 </select>
 </div>
+<div id="email_div" style="display:none;">
+<button type="button" id="send_code_btn" onclick="sendCode()">发送验证码</button>
+</div>
 <input type="text" name="input" placeholder="输入验证信息">
 <button type="submit">验证</button>
 </form>
@@ -194,11 +303,11 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 
 WEB_VIEW_TEMPLATE="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>预览 - SecureVault</title>
 <style>body{background:#1e1e1e;color:#eee;padding:10px}pre{background:#2b2b2b;padding:10px;border-radius:5px;white-space:pre-wrap;word-wrap:break-word}img{max-width:100%;border-radius:5px}</style>
-</head><body><h2>{{ entry.original_name }}</h2><p><a href="/">返回列表</a></p>
+</head><body><h2>{{ entry.original_name }}</h2><p><a href="/">返回列表</a> | <a href="/download/{{ entry.id }}">下载</a></p>
 {% set ext = entry.ext|lower %}
 {% if entry.type == 'text' %}<pre>{{ data.decode('utf-8', errors='replace') }}</pre>
 {% elif entry.type == 'image' %}<img src="data:image/{{ ext[1:] }};base64,{{ data|b64encode }}" />
-{% else %}<p>此文件类型不支持在线预览，请下载后查看。</p><a href="/download/{{ entry.id }}">下载</a>{% endif %}
+{% else %}<p>此文件类型不支持在线预览，请下载后查看。</p>{% endif %}
 </body></html>"""
 
 # ---------- FileViewer ----------
@@ -294,7 +403,6 @@ class FileViewer(QDialog):
         if hasattr(self,'tmp_path') and self.tmp_path and os.path.exists(self.tmp_path):
             try: os.unlink(self.tmp_path)
             except: pass
-
 # ---------- AuthDialog ----------
 class AuthDialog(QDialog):
     def __init__(self,parent,auth_manager,allowed_methods,entry_id):
@@ -704,7 +812,8 @@ class SettingsDialog(QDialog):
         self.web_status=QLabel("状态：未启动"); web_layout.addWidget(self.web_status)
         web_group.setLayout(web_layout); layout.addWidget(web_group)
         bottom_layout=QHBoxLayout()
-        bottom_layout.addWidget(QLabel(f"SecureVault v{VERSION}")); bottom_layout.addStretch()
+        bottom_layout.addWidget(QLabel(f"SecureVault {VERSION}"))
+        bottom_layout.addStretch()
         layout.addLayout(bottom_layout)
         btn_box=QDialogButtonBox(QDialogButtonBox.Close)
         btn_box.rejected.connect(self.reject)
@@ -796,18 +905,21 @@ class SettingsDialog(QDialog):
                 QMessageBox.warning(self,"错误","无法获取更新信息"); return
             data=resp.json()
             latest=data.get('tag_name','')
-            if latest>VERSION:
+            if parse_version(latest) > parse_version(VERSION):
                 ret=QMessageBox.question(self,"发现新版本",f"最新版本：{latest}\n当前版本：{VERSION}\n是否下载并更新？",QMessageBox.Yes|QMessageBox.No)
                 if ret==QMessageBox.Yes: self.download_update(data)
-            else: QMessageBox.information(self,"已是最新",f"当前已是最新版本（{VERSION}）")
+            else:
+                QMessageBox.information(self,"已是最新",f"当前已是最新版本（{VERSION}）")
         except Exception as e:
             QMessageBox.critical(self,"错误",f"检查更新失败: {e}")
     def download_update(self,data):
         try:
             assets=data.get('assets',[]); exe_asset=None
             for a in assets:
-                if a.get('name','').lower()=='encryption.exe': exe_asset=a; break
-            if not exe_asset: QMessageBox.warning(self,"错误","未找到可执行文件"); return
+                if a.get('name','').lower()=='encryption.exe':
+                    exe_asset=a; break
+            if not exe_asset:
+                QMessageBox.warning(self,"错误","未找到可执行文件"); return
             url=exe_asset['browser_download_url']
             progress=QProgressDialog("正在下载更新...","取消",0,100,self)
             progress.setWindowModality(Qt.WindowModal); progress.show()
@@ -815,14 +927,33 @@ class SettingsDialog(QDialog):
             total_size=int(response.headers.get('content-length',0))
             block_size=8192
             temp_path=os.path.join(os.path.dirname(sys.executable),"SecureVault_update.exe")
+            import hashlib
+            sha256 = hashlib.sha256()
             with open(temp_path,'wb') as f:
                 downloaded=0
                 for chunk in response.iter_content(chunk_size=block_size):
                     if chunk:
                         f.write(chunk); downloaded+=len(chunk)
+                        sha256.update(chunk)
                         if total_size: progress.setValue(int(downloaded/total_size*100))
                         QApplication.processEvents()
             progress.setValue(100)
+            body=data.get('body','')
+            import re
+            match=re.search(r'sha256[:\s]*([a-fA-F0-9]{64})', body)
+            if match:
+                expected=match.group(1).lower()
+                actual=sha256.hexdigest().lower()
+                if actual!=expected:
+                    QMessageBox.critical(self,"错误","下载文件 SHA-256 校验失败，可能文件已损坏或被篡改。")
+                    try: os.remove(temp_path)
+                    except: pass
+                    return
+            else:
+                if QMessageBox.question(self,"警告","Release 未提供 SHA-256 校验值，继续安装存在风险。是否继续？",QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes:
+                    try: os.remove(temp_path)
+                    except: pass
+                    return
             QMessageBox.information(self,"下载完成","准备重启并安装更新")
             bat_path=os.path.join(os.path.dirname(sys.executable),"update.bat")
             with open(bat_path,'w') as f:
@@ -835,7 +966,8 @@ del "%~f0"
 """)
             subprocess.Popen([bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
             QApplication.quit()
-        except Exception as e: QMessageBox.critical(self,"错误",f"更新失败: {e}")
+        except Exception as e:
+            QMessageBox.critical(self,"错误",f"更新失败: {e}")
     def show_web_qr(self):
         try:
             s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(0); s.connect(('8.8.8.8',1)); ip=s.getsockname()[0]; s.close()
@@ -851,6 +983,10 @@ del "%~f0"
         pixmap=QPixmap(); pixmap.loadFromData(qr_bytes.getvalue())
         dialog=QDialog(self); dialog.setWindowTitle("移动端二维码")
         layout=QVBoxLayout()
+        warning_label=QLabel("⚠️ 安全警告：Web服务使用明文HTTP协议，仅限在受信任的局域网内使用！\n请勿在公共Wi-Fi或不安全的网络环境下启用。")
+        warning_label.setStyleSheet("color: #ff4444; font-weight: bold; background-color: #ffeeee; padding: 8px; border: 2px solid #ff4444; border-radius: 4px;")
+        warning_label.setWordWrap(True)
+        layout.addWidget(warning_label)
         layout.addWidget(QLabel(f"请使用手机扫描二维码访问：\n{url}"))
         label=QLabel(); label.setPixmap(pixmap.scaled(300,300,Qt.KeepAspectRatio)); layout.addWidget(label)
         btn_box=QDialogButtonBox(QDialogButtonBox.Close); btn_box.rejected.connect(dialog.accept); layout.addWidget(btn_box)
