@@ -1,4 +1,8 @@
 import sys
+import os
+import json
+import tempfile
+import subprocess
 from PyQt5.QtWidgets import QApplication, QMessageBox, QWizard, QDialog
 from ui import MainWindow, LoginDialog, SetupWizard
 from storage import StorageManager
@@ -6,6 +10,7 @@ from auth import AuthManager
 from settings import SettingsManager
 from backup import BackupManager
 
+VERSION = "v2.4.0"  
 def main():
     app = QApplication(sys.argv)
     settings = SettingsManager()
@@ -23,7 +28,6 @@ def main():
     if login.exec_() != QDialog.Accepted:
         sys.exit(0)
 
-    # 检查是否通过恢复代码登录
     is_recovery_login = login.recovery_accepted if hasattr(login, 'recovery_accepted') else False
 
     window = MainWindow(storage, auth, is_recovery_login)

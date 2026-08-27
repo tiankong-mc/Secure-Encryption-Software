@@ -5,3 +5,5 @@ pyotp>=2.9.0
 qrcode>=7.4.2
 Pillow>=10.2.0
 pyzipper
+flask
+certifi
