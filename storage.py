@@ -26,7 +26,6 @@ class StorageManager:
         self._ensure_tags_list()
 
     def _ensure_tags_list(self):
-        # 确保每个条目有 tags 字段
         for entry in self.index:
             if 'tags' not in entry:
                 entry['tags'] = []
@@ -218,77 +217,81 @@ class StorageManager:
     def get_entries_by_tag(self, tag):
         return [entry for entry in self.index if tag in entry.get('tags', [])]
 
-    # ---------- 保险库迁移 ----------
+    # ---------- 保险库迁移（仅限同电脑备份恢复，不迁移验证信息） ----------
     def export_vault(self, export_path, password=None):
         """
-        将整个保险库打包到一个文件中（包含加密文件、索引、配置）
-        如果提供了密码，使用 AES 加密打包文件
+        导出加密文件和索引，不包含 master.key 和 config.dat。
+        若 password 为空，使用普通 ZIP；否则使用 AES 加密。
+        此备份包仅适用于同一台电脑的恢复，跨电脑迁移请勿依赖。
         """
-        import pyzipper
         temp_dir = tempfile.mkdtemp()
         try:
-            # 复制所有 .vault 文件到临时目录
-            vault_files = []
+            # 复制所有 .vault 文件
             for entry in self.index:
                 src = entry['secret_path']
                 if os.path.exists(src):
                     dest = os.path.join(temp_dir, os.path.basename(src))
                     shutil.copy2(src, dest)
-                    vault_files.append(dest)
             # 复制索引文件
             shutil.copy2(self.INDEX_PATH, os.path.join(temp_dir, 'index.enc'))
-            # 复制配置文件（master.key, config.dat）
-            config_dir = self.settings.CONFIG_DIR
-            shutil.copy2(os.path.join(config_dir, 'master.key'), os.path.join(temp_dir, 'master.key'))
-            shutil.copy2(os.path.join(config_dir, 'config.dat'), os.path.join(temp_dir, 'config.dat'))
-            # 创建元数据文件（记录版本等）
-            meta = {
-                'version': '1.0',
-                'timestamp': __import__('datetime').datetime.now().isoformat(),
-                'num_files': len(self.index)
-            }
+            # 写入元数据（版本标记）
+            meta = {'version': '2.0', 'timestamp': __import__('datetime').datetime.now().isoformat()}
             with open(os.path.join(temp_dir, 'meta.json'), 'w') as f:
                 json.dump(meta, f)
-            # 打包
-            with pyzipper.AESZipFile(export_path, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
-                if password:
+
+            if password:
+                import pyzipper
+                with pyzipper.AESZipFile(export_path, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
                     zf.setpassword(password.encode())
-                for root, dirs, files in os.walk(temp_dir):
-                    for file in files:
-                        full_path = os.path.join(root, file)
-                        arcname = os.path.relpath(full_path, temp_dir)
-                        zf.write(full_path, arcname)
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            full_path = os.path.join(root, file)
+                            arcname = os.path.relpath(full_path, temp_dir)
+                            zf.write(full_path, arcname)
+            else:
+                import zipfile
+                with zipfile.ZipFile(export_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            full_path = os.path.join(root, file)
+                            arcname = os.path.relpath(full_path, temp_dir)
+                            zf.write(full_path, arcname)
         finally:
             shutil.rmtree(temp_dir)
 
     def import_vault(self, import_path, password=None):
         """
-        从备份包导入保险库，覆盖当前所有数据
+        导入备份包，恢复加密文件和索引。
+        注意：验证信息（密码、问题等）不会被恢复，导入后需重新配置。
         """
-        import pyzipper
         temp_dir = tempfile.mkdtemp()
         try:
-            with pyzipper.AESZipFile(import_path, 'r') as zf:
-                if password:
-                    zf.setpassword(password.encode())
-                zf.extractall(temp_dir)
-            # 检查元数据
+            # 尝试以加密方式打开，失败则尝试普通 ZIP
+            try:
+                import pyzipper
+                with pyzipper.AESZipFile(import_path, 'r') as zf:
+                    if password:
+                        zf.setpassword(password.encode())
+                    zf.extractall(temp_dir)
+            except (RuntimeError, TypeError, pyzipper.BadPassword):
+                # 可能是普通 ZIP 或密码错误
+                import zipfile
+                with zipfile.ZipFile(import_path, 'r') as zf:
+                    zf.extractall(temp_dir)
+
             meta_path = os.path.join(temp_dir, 'meta.json')
             if not os.path.exists(meta_path):
                 raise ValueError("无效的备份包：缺少 meta.json")
-            # 停止当前服务（没有服务，直接覆盖）
-            # 覆盖 .vault 文件到 SECRET_DIR
+
+            # 覆盖 .vault 文件
             for file in os.listdir(temp_dir):
                 if file.endswith('.vault'):
                     shutil.copy2(os.path.join(temp_dir, file), self.SECRET_DIR)
             # 覆盖索引
             shutil.copy2(os.path.join(temp_dir, 'index.enc'), self.INDEX_PATH)
-            # 覆盖配置
-            config_dir = self.settings.CONFIG_DIR
-            shutil.copy2(os.path.join(temp_dir, 'master.key'), config_dir)
-            shutil.copy2(os.path.join(temp_dir, 'config.dat'), config_dir)
             # 重新加载索引
             self.index = self._load_index()
+            self._ensure_tags_list()
         finally:
             shutil.rmtree(temp_dir)
         return True

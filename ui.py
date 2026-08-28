@@ -14,7 +14,7 @@ import traceback,requests,qrcode
 from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, send_file
 from packaging.version import parse as parse_version
 
-VERSION = "v2.4.1"
+VERSION = "v2.4.2"
 
 DARK_STYLE="""
 QMainWindow,QDialog{background:#2b2b2b;color:#f0f0f0}
@@ -469,20 +469,34 @@ class AuthDialog(QDialog):
         main_window=None
         for w in QApplication.topLevelWidgets():
             if w.__class__.__name__=='MainWindow': main_window=w; break
-        if not main_window: QMessageBox.critical(self,"错误","无法找到主窗口"); return
+        if not main_window:
+            QMessageBox.critical(self,"错误","无法找到主窗口")
+            return
         storage=main_window.storage; auth=main_window.auth
         smtp_config=auth.email_config
-        if not smtp_config: QMessageBox.critical(self,"错误","未配置邮箱"); return
+        if not smtp_config:
+            QMessageBox.critical(self,"错误","未配置邮箱，无法执行紧急备份")
+            return
         to_email=smtp_config.get('receiver_email')
-        if not to_email: QMessageBox.critical(self,"错误","未设置收件邮箱"); return
+        if not to_email:
+            QMessageBox.critical(self,"错误","未设置收件邮箱")
+            return
         entry=storage.get_entry_by_id(self.entry_id)
-        if not entry: QMessageBox.critical(self,"错误","未找到该文件记录"); return
+        if not entry:
+            QMessageBox.critical(self,"错误","未找到该文件记录")
+            return
         vault_path=entry['secret_path']
-        if not os.path.exists(vault_path) and entry['user_path'] and os.path.exists(entry['user_path']): vault_path=entry['user_path']
-        if not os.path.exists(vault_path): QMessageBox.critical(self,"错误","加密文件不存在"); return
+        if not os.path.exists(vault_path) and entry['user_path'] and os.path.exists(entry['user_path']):
+            vault_path=entry['user_path']
+        if not os.path.exists(vault_path):
+            QMessageBox.critical(self,"错误","加密文件不存在")
+            return
         display_name=entry['original_name']+'.vault'
-        try: BackupManager.send_vault_file(vault_path,to_email,smtp_config,display_name)
-        except Exception as e: QMessageBox.critical(self,"错误",f"邮件发送失败: {e}"); return
+        try:
+            BackupManager.send_vault_file(vault_path,to_email,smtp_config,display_name)
+        except Exception as e:
+            QMessageBox.critical(self,"错误",f"邮件发送失败，文件未被删除。\n错误信息: {e}")
+            return
         storage.remove_entry(self.entry_id,destroy=True)
         auth.reset_fail_count()
         QMessageBox.critical(self,"紧急备份",f"加密文件已发送至您的邮箱，原始文件已被销毁。程序将退出。")
@@ -748,19 +762,31 @@ class LoginDialog(QDialog):
         main_window=None
         for w in QApplication.topLevelWidgets():
             if w.__class__.__name__=='MainWindow': main_window=w; break
-        if not main_window: QMessageBox.critical(self,"错误","无法找到主窗口"); return
+        if not main_window:
+            QMessageBox.critical(self,"错误","无法找到主窗口")
+            return
         storage=main_window.storage; auth=main_window.auth
         smtp_config=auth.email_config
-        if not smtp_config: QMessageBox.critical(self,"错误","未配置邮箱"); return
+        if not smtp_config:
+            QMessageBox.critical(self,"错误","未配置邮箱，无法执行紧急备份")
+            return
         to_email=smtp_config.get('receiver_email')
-        if not to_email: QMessageBox.critical(self,"错误","未设置收件邮箱"); return
+        if not to_email:
+            QMessageBox.critical(self,"错误","未设置收件邮箱")
+            return
         file_info_list=storage.get_all_vault_paths_with_names()
-        if not file_info_list: QMessageBox.critical(self,"错误","没有可备份的文件"); return
-        try: BackupManager.send_multiple_vault_files(file_info_list,to_email,smtp_config)
-        except Exception as e: QMessageBox.critical(self,"错误",f"邮件发送失败: {e}"); return
+        if not file_info_list:
+            QMessageBox.critical(self,"错误","没有可备份的文件")
+            return
+        try:
+            BackupManager.send_multiple_vault_files(file_info_list, to_email, smtp_config)
+        except Exception as e:
+            QMessageBox.critical(self,"错误",f"邮件发送失败，文件未被删除。\n错误信息: {e}")
+            return
         for entry in storage.get_all_entries():
-            storage.remove_entry(entry['id'],destroy=True)
-        storage.index=[]; storage._save_index()
+            storage.remove_entry(entry['id'], destroy=True)
+        storage.index = []
+        storage._save_index()
         auth.reset_fail_count()
         QMessageBox.critical(self,"紧急备份","所有加密文件已发送至您的邮箱，原始文件已被销毁。程序将退出。")
         QApplication.quit()

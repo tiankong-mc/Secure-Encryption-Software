@@ -7,10 +7,6 @@ from email import encoders
 class BackupManager:
     @classmethod
     def send_vault_file(cls, file_path, to_email, smtp_config, display_name=None):
-        """
-        发送 .vault 文件到邮箱，可指定附件显示名称
-        display_name: 附件显示的文件名（如 "myfile.txt.vault"），若为 None 则使用原文件名
-        """
         if display_name is None:
             display_name = os.path.basename(file_path)
         msg = MIMEMultipart()
@@ -32,10 +28,8 @@ class BackupManager:
     @classmethod
     def send_multiple_vault_files(cls, file_info_list, to_email, smtp_config):
         """
-        发送多个 .vault 文件，file_info_list 为 [(file_path, display_name), ...]
+        发送多个 .vault 文件，若任一文件发送失败则抛出异常，
+        确保调用方能正确处理错误，避免误删文件。
         """
         for file_path, display_name in file_info_list:
-            try:
-                cls.send_vault_file(file_path, to_email, smtp_config, display_name)
-            except Exception as e:
-                print(f"发送 {file_path} 失败: {e}")
+            cls.send_vault_file(file_path, to_email, smtp_config, display_name)
