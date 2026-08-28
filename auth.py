@@ -54,16 +54,18 @@ class AuthManager:
         return list(self.qa.keys())
 
     # ---------- TOTP ----------
-    def setup_totp(self):
-        self.totp_secret = pyotp.random_base32()
-        self.settings_dict['totp_secret'] = self.totp_secret
+    def generate_totp_secret(self):
+        """生成临时 TOTP 密钥，不保存"""
+        return pyotp.random_base32()
+
+    def verify_totp_secret(self, secret, code):
+        totp = pyotp.TOTP(secret)
+        return totp.verify(code)
+
+    def save_totp_secret(self, secret):
+        self.totp_secret = secret
+        self.settings_dict['totp_secret'] = secret
         self._save()
-        totp = pyotp.TOTP(self.totp_secret)
-        uri = totp.provisioning_uri(name="SecureVault", issuer_name="SecureApp")
-        img = qrcode.make(uri)
-        buf = BytesIO()
-        img.save(buf, format='PNG')
-        return buf.getvalue()
 
     def verify_totp(self, code):
         if not self.totp_secret:
@@ -71,8 +73,31 @@ class AuthManager:
         totp = pyotp.TOTP(self.totp_secret)
         return totp.verify(code)
 
-    # ---------- 邮箱验证码 ----------
-    def set_email_config(self, smtp_server, port, sender_email, password, receiver_email):
+    # ---------- 邮箱 ----------
+    def test_email_config(self, smtp_server, port, sender_email, password, receiver_email):
+        """测试邮箱配置是否可用，不保存，返回 (成功, 验证码或错误信息)"""
+        try:
+            # 测试登录
+            server = smtplib.SMTP(smtp_server, port)
+            server.starttls()
+            server.login(sender_email, password)
+            server.quit()
+            # 发送验证码
+            code = ''.join(random.choices('0123456789', k=6))
+            msg = MIMEText(f'您的邮箱配置测试验证码是：{code}')
+            msg['Subject'] = 'SecureVault 邮箱配置测试'
+            msg['From'] = sender_email
+            msg['To'] = receiver_email
+            server = smtplib.SMTP(smtp_server, port)
+            server.starttls()
+            server.login(sender_email, password)
+            server.sendmail(sender_email, [receiver_email], msg.as_string())
+            server.quit()
+            return True, code
+        except Exception as e:
+            return False, str(e)
+
+    def save_email_config(self, smtp_server, port, sender_email, password, receiver_email):
         self.email_config = {
             'smtp_server': smtp_server,
             'port': port,
@@ -84,11 +109,12 @@ class AuthManager:
         self._save()
 
     def send_verification_code(self, to_email=None):
+        """发送验证码（用于登录/二次验证）"""
         if not to_email:
             to_email = self.email_config.get('receiver_email')
         if not to_email:
             return None
-        code = str(random.randint(100000, 999999))
+        code = ''.join(random.choices('0123456789', k=6))
         msg = MIMEText(f'您的SecureVault验证码是：{code}')
         msg['Subject'] = 'SecureVault验证码'
         msg['From'] = self.email_config['sender_email']
@@ -126,7 +152,6 @@ class AuthManager:
         self.settings_dict['recovery_code_encrypted_b64'] = encrypted_b64
         self.settings_dict['recovery_code_used'] = False
         self._save()
-        # 发送邮件通知（不包含代码）
         self._send_recovery_email(generated=True)
         return formatted
 
@@ -145,13 +170,11 @@ class AuthManager:
         if stored_code == input_code:
             self.settings_dict['recovery_code_used'] = True
             self._save()
-            # 发送邮件通知使用（不包含代码）
             self._send_recovery_email(generated=False)
             return True
         return False
 
     def _send_recovery_email(self, generated=True):
-        """发送紧急恢复代码相关邮件（不包含代码内容）"""
         smtp_config = self.email_config
         if not smtp_config:
             return

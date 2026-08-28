@@ -14,7 +14,7 @@ import traceback,requests,qrcode
 from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, send_file
 from packaging.version import parse as parse_version
 
-VERSION = "v2.4.2"
+VERSION = "v2.4.3"
 
 DARK_STYLE="""
 QMainWindow,QDialog{background:#2b2b2b;color:#f0f0f0}
@@ -92,18 +92,23 @@ def web_login():
 def web_view(entry_id):
     if 'authenticated' not in session or not session['authenticated']:
         return redirect(url_for('web_login'))
+    # 检查二次验证授权
+    if not check_second_auth(entry_id):
+        entry = web_storage.get_entry_by_id(entry_id)
+        if entry and entry.get('is_advanced', False):
+            return redirect(url_for('web_second_auth', entry_id=entry_id))
     try:
         data=web_storage.get_file_data(entry_id)
         entry=web_storage.get_entry_by_id(entry_id)
         if not entry: return "文件不存在",404
-        if entry.get('is_advanced',False):
-            return redirect(url_for('web_second_auth', entry_id=entry_id))
         return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
     except Exception as e:
         return f"查看失败: {e}",500
 
 @flask_app.route('/second_auth/<entry_id>', methods=['GET','POST'])
 def web_second_auth(entry_id):
+    if 'authenticated' not in session or not session['authenticated']:
+        return redirect(url_for('web_login'))
     entry=web_storage.get_entry_by_id(entry_id)
     if not entry: return "文件不存在",404
     allowed_methods=entry.get('second_auth_methods', [])
@@ -127,6 +132,8 @@ def web_second_auth(entry_id):
                 ok=True
                 session.pop('email_code',None)
         if ok:
+            # 设置二次验证授权（1小时有效）
+            session.setdefault('second_auth', {})[entry_id] = datetime.now().timestamp() + 3600
             data=web_storage.get_file_data(entry_id)
             return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
         else:
@@ -137,13 +144,22 @@ def web_second_auth(entry_id):
 def web_download(entry_id):
     if 'authenticated' not in session or not session['authenticated']:
         return redirect(url_for('web_login'))
+    entry=web_storage.get_entry_by_id(entry_id)
+    if not entry:
+        return "文件不存在",404
+    # 检查二次验证授权
+    if entry.get('is_advanced', False) and not check_second_auth(entry_id):
+        return redirect(url_for('web_second_auth', entry_id=entry_id))
     try:
         data=web_storage.get_file_data(entry_id)
-        entry=web_storage.get_entry_by_id(entry_id)
-        if not entry: return "文件不存在",404
         return send_file(BytesIO(data), as_attachment=True, download_name=entry['original_name'])
     except Exception as e:
         return f"下载失败: {e}",500
+
+def check_second_auth(entry_id):
+    second_auth = session.get('second_auth', {})
+    expiry = second_auth.get(entry_id, 0)
+    return expiry > datetime.now().timestamp()
 
 @flask_app.route('/send_code', methods=['POST'])
 def send_code():
@@ -469,28 +485,17 @@ class AuthDialog(QDialog):
         main_window=None
         for w in QApplication.topLevelWidgets():
             if w.__class__.__name__=='MainWindow': main_window=w; break
-        if not main_window:
-            QMessageBox.critical(self,"错误","无法找到主窗口")
-            return
+        if not main_window: QMessageBox.critical(self,"错误","无法找到主窗口"); return
         storage=main_window.storage; auth=main_window.auth
         smtp_config=auth.email_config
-        if not smtp_config:
-            QMessageBox.critical(self,"错误","未配置邮箱，无法执行紧急备份")
-            return
+        if not smtp_config: QMessageBox.critical(self,"错误","未配置邮箱，无法执行紧急备份"); return
         to_email=smtp_config.get('receiver_email')
-        if not to_email:
-            QMessageBox.critical(self,"错误","未设置收件邮箱")
-            return
+        if not to_email: QMessageBox.critical(self,"错误","未设置收件邮箱"); return
         entry=storage.get_entry_by_id(self.entry_id)
-        if not entry:
-            QMessageBox.critical(self,"错误","未找到该文件记录")
-            return
+        if not entry: QMessageBox.critical(self,"错误","未找到该文件记录"); return
         vault_path=entry['secret_path']
-        if not os.path.exists(vault_path) and entry['user_path'] and os.path.exists(entry['user_path']):
-            vault_path=entry['user_path']
-        if not os.path.exists(vault_path):
-            QMessageBox.critical(self,"错误","加密文件不存在")
-            return
+        if not os.path.exists(vault_path) and entry['user_path'] and os.path.exists(entry['user_path']): vault_path=entry['user_path']
+        if not os.path.exists(vault_path): QMessageBox.critical(self,"错误","加密文件不存在"); return
         display_name=entry['original_name']+'.vault'
         try:
             BackupManager.send_vault_file(vault_path,to_email,smtp_config,display_name)
@@ -688,9 +693,11 @@ class SetupWizard(QWizard):
 
 # ---------- LoginDialog ----------
 class LoginDialog(QDialog):
-    def __init__(self,auth_manager):
+    def __init__(self,auth_manager,storage):
         super().__init__()
-        self.auth=auth_manager; self.recovery_accepted=False
+        self.auth=auth_manager
+        self.storage=storage   # 直接传入 storage 用于紧急备份
+        self.recovery_accepted=False
         self.setWindowTitle("SecureVault 登录"); self.setModal(True); self.resize(400,350)
         layout=QVBoxLayout()
         layout.addWidget(QLabel("请通过以下任一方式验证身份"))
@@ -759,36 +766,32 @@ class LoginDialog(QDialog):
                 self.trigger_emergency_backup(); super().reject()
     def trigger_emergency_backup(self):
         from PyQt5.QtWidgets import QApplication
-        main_window=None
-        for w in QApplication.topLevelWidgets():
-            if w.__class__.__name__=='MainWindow': main_window=w; break
-        if not main_window:
-            QMessageBox.critical(self,"错误","无法找到主窗口")
-            return
-        storage=main_window.storage; auth=main_window.auth
-        smtp_config=auth.email_config
+        # 直接使用 self.storage
+        storage = self.storage
+        auth = self.auth
+        smtp_config = auth.email_config
         if not smtp_config:
-            QMessageBox.critical(self,"错误","未配置邮箱，无法执行紧急备份")
+            QMessageBox.critical(self, "错误", "未配置邮箱，无法执行紧急备份")
             return
-        to_email=smtp_config.get('receiver_email')
+        to_email = smtp_config.get('receiver_email')
         if not to_email:
-            QMessageBox.critical(self,"错误","未设置收件邮箱")
+            QMessageBox.critical(self, "错误", "未设置收件邮箱")
             return
-        file_info_list=storage.get_all_vault_paths_with_names()
+        file_info_list = storage.get_all_vault_paths_with_names()
         if not file_info_list:
-            QMessageBox.critical(self,"错误","没有可备份的文件")
+            QMessageBox.critical(self, "错误", "没有可备份的文件")
             return
         try:
             BackupManager.send_multiple_vault_files(file_info_list, to_email, smtp_config)
         except Exception as e:
-            QMessageBox.critical(self,"错误",f"邮件发送失败，文件未被删除。\n错误信息: {e}")
+            QMessageBox.critical(self, "错误", f"邮件发送失败，文件未被删除。\n错误信息: {e}")
             return
         for entry in storage.get_all_entries():
             storage.remove_entry(entry['id'], destroy=True)
         storage.index = []
         storage._save_index()
         auth.reset_fail_count()
-        QMessageBox.critical(self,"紧急备份","所有加密文件已发送至您的邮箱，原始文件已被销毁。程序将退出。")
+        QMessageBox.critical(self, "紧急备份", "所有加密文件已发送至您的邮箱，原始文件已被销毁。程序将退出。")
         QApplication.quit()
 
 # ---------- SettingsDialog ----------
@@ -1018,6 +1021,7 @@ del "%~f0"
         btn_box=QDialogButtonBox(QDialogButtonBox.Close); btn_box.rejected.connect(dialog.accept); layout.addWidget(btn_box)
         dialog.setLayout(layout); dialog.exec_()
 
+    # ---------- 修改密码 ----------
     def change_password(self):
         if not self._verify_identity(): return
         pw,ok=QInputDialog.getText(self,"修改密码","输入新密码（至少8位）：",QLineEdit.Password)
@@ -1027,6 +1031,8 @@ del "%~f0"
         if not ok: return
         if pw!=confirm: QMessageBox.warning(self,"错误","两次密码不一致"); return
         self.auth.set_password(pw); QMessageBox.information(self,"成功","密码已更新")
+
+    # ---------- 修改安全问题 ----------
     def change_questions(self):
         if not self._verify_identity(): return
         dialog=QDialog(self); dialog.setWindowTitle("修改安全问题")
@@ -1048,53 +1054,103 @@ del "%~f0"
             QMessageBox.warning(self,"错误","请完整填写所有问题和答案"); return
         qa_list=[(q1.text(),a1.text()),(q2.text(),a2.text()),(q3.text(),a3.text())]
         self.auth.set_questions(qa_list); QMessageBox.information(self,"成功","安全问题已更新")
+
+    # ---------- 修改 TOTP（修复：先验证再保存） ----------
     def change_totp(self):
         if not self._verify_identity(): return
         reply=QMessageBox.question(self,"确认","重新生成 TOTP 密钥将导致之前的二维码失效，是否继续？",QMessageBox.Yes|QMessageBox.No)
         if reply!=QMessageBox.Yes: return
-        qr_data=self.auth.setup_totp()
-        pixmap=QPixmap(); pixmap.loadFromData(qr_data)
-        dialog=QDialog(self); dialog.setWindowTitle("TOTP 设置")
-        layout=QVBoxLayout()
+        # 生成临时密钥，不保存
+        temp_secret = self.auth.generate_totp_secret()
+        # 生成二维码
+        totp = pyotp.TOTP(temp_secret)
+        uri = totp.provisioning_uri(name="SecureVault", issuer_name="SecureApp")
+        qr_img = qrcode.make(uri)
+        qr_bytes = BytesIO()
+        qr_img.save(qr_bytes, format='PNG')
+        pixmap = QPixmap()
+        pixmap.loadFromData(qr_bytes.getvalue())
+        # 显示对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle("TOTP 设置")
+        layout = QVBoxLayout()
         layout.addWidget(QLabel("请使用 Authenticator 扫描以下二维码："))
-        img_label=QLabel(); img_label.setPixmap(pixmap.scaled(200,200,Qt.KeepAspectRatio)); layout.addWidget(img_label)
-        secret_label=QLabel(f"密钥：{self.auth.totp_secret}"); layout.addWidget(secret_label)
-        code_input=QLineEdit(); code_input.setPlaceholderText("输入动态码验证"); layout.addWidget(code_input)
-        btn_box=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        btn_box.accepted.connect(dialog.accept); btn_box.rejected.connect(dialog.reject)
-        layout.addWidget(btn_box); dialog.setLayout(layout)
-        if dialog.exec_()==QDialog.Accepted:
-            if not self.auth.verify_totp(code_input.text()):
-                QMessageBox.warning(self,"错误","验证码不正确"); return
-            QMessageBox.information(self,"成功","TOTP 已更新")
+        img_label = QLabel()
+        img_label.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio))
+        layout.addWidget(img_label)
+        secret_label = QLabel(f"临时密钥：{temp_secret}")
+        layout.addWidget(secret_label)
+        code_input = QLineEdit()
+        code_input.setPlaceholderText("输入动态码验证")
+        layout.addWidget(code_input)
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dialog.accept)
+        btn_box.rejected.connect(dialog.reject)
+        layout.addWidget(btn_box)
+        dialog.setLayout(layout)
+        if dialog.exec_() == QDialog.Accepted:
+            if self.auth.verify_totp_secret(temp_secret, code_input.text()):
+                self.auth.save_totp_secret(temp_secret)
+                QMessageBox.information(self, "成功", "TOTP 已更新")
+            else:
+                QMessageBox.warning(self, "错误", "验证码不正确，未保存")
+
+    # ---------- 修改邮箱配置（修复：先测试再保存） ----------
     def change_email(self):
         if not self._verify_identity(): return
-        dialog=QDialog(self); dialog.setWindowTitle("修改邮箱配置")
-        layout=QVBoxLayout()
-        smtp_server=QLineEdit(); smtp_server.setPlaceholderText("SMTP服务器"); smtp_server.setText(self.auth.email_config.get('smtp_server',''))
-        smtp_port=QLineEdit(); smtp_port.setPlaceholderText("端口"); smtp_port.setText(str(self.auth.email_config.get('port','')))
-        sender_email=QLineEdit(); sender_email.setPlaceholderText("发件邮箱"); sender_email.setText(self.auth.email_config.get('sender_email',''))
-        sender_password=QLineEdit(); sender_password.setEchoMode(QLineEdit.Password); sender_password.setPlaceholderText("授权码"); sender_password.setText(self.auth.email_config.get('password',''))
-        receiver_email=QLineEdit(); receiver_email.setPlaceholderText("收件邮箱"); receiver_email.setText(self.auth.email_config.get('receiver_email',''))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("修改邮箱配置")
+        layout = QVBoxLayout()
+        smtp_server = QLineEdit()
+        smtp_server.setPlaceholderText("SMTP服务器")
+        smtp_server.setText(self.auth.email_config.get('smtp_server', ''))
+        smtp_port = QLineEdit()
+        smtp_port.setPlaceholderText("端口")
+        smtp_port.setText(str(self.auth.email_config.get('port', '')))
+        sender_email = QLineEdit()
+        sender_email.setPlaceholderText("发件邮箱")
+        sender_email.setText(self.auth.email_config.get('sender_email', ''))
+        sender_password = QLineEdit()
+        sender_password.setEchoMode(QLineEdit.Password)
+        sender_password.setPlaceholderText("授权码")
+        sender_password.setText(self.auth.email_config.get('password', ''))
+        receiver_email = QLineEdit()
+        receiver_email.setPlaceholderText("收件邮箱")
+        receiver_email.setText(self.auth.email_config.get('receiver_email', ''))
         layout.addWidget(QLabel("SMTP服务器")); layout.addWidget(smtp_server)
         layout.addWidget(QLabel("端口")); layout.addWidget(smtp_port)
         layout.addWidget(QLabel("发件邮箱")); layout.addWidget(sender_email)
         layout.addWidget(QLabel("授权码/密码")); layout.addWidget(sender_password)
         layout.addWidget(QLabel("收件邮箱")); layout.addWidget(receiver_email)
-        btn_box=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        btn_box.accepted.connect(dialog.accept); btn_box.rejected.connect(dialog.reject)
-        layout.addWidget(btn_box); dialog.setLayout(layout)
-        if dialog.exec_()!=QDialog.Accepted: return
-        if not all([smtp_server.text(), smtp_port.text(), sender_email.text(), sender_password.text(), receiver_email.text()]):
-            QMessageBox.warning(self,"错误","请完整填写所有字段"); return
-        try: port=int(smtp_port.text())
-        except: QMessageBox.warning(self,"错误","端口必须为数字"); return
-        self.auth.set_email_config(smtp_server.text(), port, sender_email.text(), sender_password.text(), receiver_email.text())
-        code=self.auth.send_verification_code(receiver_email.text())
-        if not code: QMessageBox.warning(self,"错误","邮箱配置测试失败"); return
-        verify_code,ok=QInputDialog.getText(self,"验证邮箱",f"输入发送到 {receiver_email.text()} 的验证码")
-        if not ok or verify_code!=code: QMessageBox.warning(self,"错误","验证码错误"); return
-        QMessageBox.information(self,"成功","邮箱配置已更新")
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dialog.accept)
+        btn_box.rejected.connect(dialog.reject)
+        layout.addWidget(btn_box)
+        dialog.setLayout(layout)
+        if dialog.exec_() != QDialog.Accepted: return
+        # 获取输入
+        server = smtp_server.text()
+        try: port = int(smtp_port.text())
+        except: QMessageBox.warning(self, "错误", "端口必须为数字"); return
+        sender = sender_email.text()
+        pwd = sender_password.text()
+        receiver = receiver_email.text()
+        if not all([server, port, sender, pwd, receiver]):
+            QMessageBox.warning(self, "错误", "请完整填写所有字段"); return
+        # 先测试配置
+        ok, result = self.auth.test_email_config(server, port, sender, pwd, receiver)
+        if not ok:
+            QMessageBox.warning(self, "错误", f"配置测试失败: {result}")
+            return
+        # 发送验证码并验证
+        code = result  # test_email_config 返回 (True, code)
+        verify_code, ok = QInputDialog.getText(self, "验证邮箱", f"输入发送到 {receiver} 的验证码")
+        if not ok or verify_code != code:
+            QMessageBox.warning(self, "错误", "验证码错误")
+            return
+        # 保存新配置
+        self.auth.save_email_config(server, port, sender, pwd, receiver)
+        QMessageBox.information(self, "成功", "邮箱配置已更新")
 
 # ---------- MainWindow ----------
 class MainWindow(QMainWindow):

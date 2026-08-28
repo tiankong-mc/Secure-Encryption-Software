@@ -1,17 +1,15 @@
-import os
-import json
-import shutil
-import uuid
-import pickle
-import zipfile
-import tempfile
+import os, json, shutil, uuid, pickle, zipfile, tempfile, struct
 from crypto import encrypt_data, decrypt_data, generate_key
 from settings import SettingsManager
 from backup import BackupManager
 
+MAGIC = b'SVLT'          # 文件头魔术字
+VERSION = 1              # 格式版本
+
 class StorageManager:
     SECRET_DIR = r'C:\ProgramData\SecureVault'
     INDEX_PATH = os.path.join(SECRET_DIR, 'index.enc')
+    INDEX_BACKUP_PATH = os.path.join(SECRET_DIR, 'index.enc.bak')
 
     def __init__(self):
         self.settings = SettingsManager()
@@ -26,27 +24,66 @@ class StorageManager:
         self._ensure_tags_list()
 
     def _ensure_tags_list(self):
+        modified = False
         for entry in self.index:
             if 'tags' not in entry:
                 entry['tags'] = []
-        self._save_index()
+                modified = True
+        if modified:
+            self._save_index()
 
     def _load_index(self):
         if os.path.exists(self.INDEX_PATH):
-            with open(self.INDEX_PATH, 'rb') as f:
-                encrypted = f.read()
             try:
+                with open(self.INDEX_PATH, 'rb') as f:
+                    encrypted = f.read()
                 data = decrypt_data(encrypted, self.master_key)
                 return json.loads(data.decode('utf-8'))
-            except:
-                return []
+            except Exception as e:
+                if os.path.exists(self.INDEX_BACKUP_PATH):
+                    raise RuntimeError(f"索引文件损坏，但存在备份文件，请手动恢复或联系开发者。原始错误: {e}")
+                else:
+                    raise RuntimeError(f"保险库索引损坏，无法加载。错误: {e}")
         return []
 
     def _save_index(self):
         data = json.dumps(self.index).encode('utf-8')
         encrypted = encrypt_data(data, self.master_key)
-        with open(self.INDEX_PATH, 'wb') as f:
+        temp_path = self.INDEX_PATH + '.tmp'
+        with open(temp_path, 'wb') as f:
             f.write(encrypted)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(self.INDEX_PATH):
+            shutil.copy2(self.INDEX_PATH, self.INDEX_BACKUP_PATH)
+        os.replace(temp_path, self.INDEX_PATH)
+
+    def _serialize_vault(self, encrypted_file_key, encrypted_content):
+        """
+        自定义二进制格式：
+        MAGIC(4) + VERSION(1) + key_len(4) + encrypted_key + encrypted_content
+        """
+        return MAGIC + struct.pack('B', VERSION) + struct.pack('>I', len(encrypted_file_key)) + encrypted_file_key + encrypted_content
+
+    def _deserialize_vault(self, data):
+        """
+        解析自定义格式，返回 (encrypted_file_key, encrypted_content)
+        如果格式不匹配，抛出异常（用于兼容旧 pickle）
+        """
+        if len(data) < 4 + 1 + 4:
+            raise ValueError("数据太短，不是有效的新格式")
+        magic = data[:4]
+        if magic != MAGIC:
+            raise ValueError("无效的魔术字")
+        ver = data[4]
+        if ver != 1:
+            raise ValueError(f"不支持的版本: {ver}")
+        key_len = struct.unpack('>I', data[5:9])[0]
+        if len(data) < 9 + key_len:
+            raise ValueError("数据截断")
+        encrypted_file_key = data[9:9+key_len]
+        encrypted_content = data[9+key_len:]
+        return encrypted_file_key, encrypted_content
 
     def add_file(self, local_path, user_dest=None, is_advanced=False, second_auth_methods=None, tags=None):
         with open(local_path, 'rb') as f:
@@ -54,7 +91,8 @@ class StorageManager:
         file_key = generate_key()
         encrypted_content = encrypt_data(plain, file_key)
         encrypted_file_key = encrypt_data(file_key, self.master_key)
-        data_pack = pickle.dumps((encrypted_file_key, encrypted_content))
+        # 使用新格式序列化
+        data_pack = self._serialize_vault(encrypted_file_key, encrypted_content)
         uid = str(uuid.uuid4())
         secret_filename = uid + '.vault'
         secret_path = os.path.join(self.SECRET_DIR, secret_filename)
@@ -106,12 +144,21 @@ class StorageManager:
                     raise FileNotFoundError(f"文件不存在: {path}")
                 with open(path, 'rb') as f:
                     data_pack = f.read()
-                encrypted_file_key, encrypted_content = pickle.loads(data_pack)
+                # 先尝试新格式
+                try:
+                    encrypted_file_key, encrypted_content = self._deserialize_vault(data_pack)
+                except ValueError:
+                    # 回退到旧 pickle 格式（兼容已有文件）
+                    try:
+                        encrypted_file_key, encrypted_content = pickle.loads(data_pack)
+                    except Exception as e:
+                        raise RuntimeError(f"无法解析文件 {path}: {e}")
                 file_key = decrypt_data(encrypted_file_key, self.master_key)
                 plain = decrypt_data(encrypted_content, file_key)
                 return plain
         raise KeyError("记录不存在")
 
+    # 其他方法（get_all_entries, get_entry_by_id, remove_entry 等）与之前相同，省略（但需保留）
     def get_all_entries(self):
         return self.index
 
@@ -147,11 +194,16 @@ class StorageManager:
             raise FileNotFoundError("文件不存在")
         with open(vault_path, 'rb') as f:
             data_pack = f.read()
+        # 必须为新格式，禁止导入旧 pickle 格式
         try:
-            encrypted_file_key, encrypted_content = pickle.loads(data_pack)
+            encrypted_file_key, encrypted_content = self._deserialize_vault(data_pack)
+        except ValueError:
+            raise ValueError("不安全格式：此 .vault 文件为旧 pickle 格式，已被禁用。请使用迁移工具转换或重新加密。")
+        # 验证加密数据（尝试解密）
+        try:
             decrypt_data(encrypted_file_key, self.master_key)
-        except:
-            raise ValueError("无效的加密文件格式")
+        except Exception as e:
+            raise ValueError(f"无效的加密文件: {e}")
         uid = str(uuid.uuid4())
         secret_filename = uid + '.vault'
         secret_path = os.path.join(self.SECRET_DIR, secret_filename)
@@ -180,6 +232,7 @@ class StorageManager:
         self._save_index()
         return uid
 
+    # 其他方法（get_all_vault_paths_with_names, 标签管理, export_vault, import_vault）与之前相同，省略
     def get_all_vault_paths_with_names(self):
         result = []
         for entry in self.index:
@@ -191,7 +244,6 @@ class StorageManager:
                 result.append((vault_path, display_name))
         return result
 
-    # ---------- 标签管理 ----------
     def get_all_tags(self):
         tags = set()
         for entry in self.index:
@@ -217,28 +269,19 @@ class StorageManager:
     def get_entries_by_tag(self, tag):
         return [entry for entry in self.index if tag in entry.get('tags', [])]
 
-    # ---------- 保险库迁移（仅限同电脑备份恢复，不迁移验证信息） ----------
+    # 迁移导出/导入（与之前相同，不包含配置）
     def export_vault(self, export_path, password=None):
-        """
-        导出加密文件和索引，不包含 master.key 和 config.dat。
-        若 password 为空，使用普通 ZIP；否则使用 AES 加密。
-        此备份包仅适用于同一台电脑的恢复，跨电脑迁移请勿依赖。
-        """
         temp_dir = tempfile.mkdtemp()
         try:
-            # 复制所有 .vault 文件
             for entry in self.index:
                 src = entry['secret_path']
                 if os.path.exists(src):
                     dest = os.path.join(temp_dir, os.path.basename(src))
                     shutil.copy2(src, dest)
-            # 复制索引文件
             shutil.copy2(self.INDEX_PATH, os.path.join(temp_dir, 'index.enc'))
-            # 写入元数据（版本标记）
             meta = {'version': '2.0', 'timestamp': __import__('datetime').datetime.now().isoformat()}
             with open(os.path.join(temp_dir, 'meta.json'), 'w') as f:
                 json.dump(meta, f)
-
             if password:
                 import pyzipper
                 with pyzipper.AESZipFile(export_path, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
@@ -260,13 +303,8 @@ class StorageManager:
             shutil.rmtree(temp_dir)
 
     def import_vault(self, import_path, password=None):
-        """
-        导入备份包，恢复加密文件和索引。
-        注意：验证信息（密码、问题等）不会被恢复，导入后需重新配置。
-        """
         temp_dir = tempfile.mkdtemp()
         try:
-            # 尝试以加密方式打开，失败则尝试普通 ZIP
             try:
                 import pyzipper
                 with pyzipper.AESZipFile(import_path, 'r') as zf:
@@ -274,22 +312,16 @@ class StorageManager:
                         zf.setpassword(password.encode())
                     zf.extractall(temp_dir)
             except (RuntimeError, TypeError, pyzipper.BadPassword):
-                # 可能是普通 ZIP 或密码错误
                 import zipfile
                 with zipfile.ZipFile(import_path, 'r') as zf:
                     zf.extractall(temp_dir)
-
             meta_path = os.path.join(temp_dir, 'meta.json')
             if not os.path.exists(meta_path):
                 raise ValueError("无效的备份包：缺少 meta.json")
-
-            # 覆盖 .vault 文件
             for file in os.listdir(temp_dir):
                 if file.endswith('.vault'):
                     shutil.copy2(os.path.join(temp_dir, file), self.SECRET_DIR)
-            # 覆盖索引
             shutil.copy2(os.path.join(temp_dir, 'index.enc'), self.INDEX_PATH)
-            # 重新加载索引
             self.index = self._load_index()
             self._ensure_tags_list()
         finally:

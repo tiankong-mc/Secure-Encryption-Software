@@ -1,8 +1,4 @@
 import sys
-import os
-import json
-import tempfile
-import subprocess
 from PyQt5.QtWidgets import QApplication, QMessageBox, QWizard, QDialog
 from ui import MainWindow, LoginDialog, SetupWizard
 from storage import StorageManager
@@ -10,7 +6,8 @@ from auth import AuthManager
 from settings import SettingsManager
 from backup import BackupManager
 
-VERSION = "v2.4.2"  
+VERSION = "v2.4.3"
+
 def main():
     app = QApplication(sys.argv)
     settings = SettingsManager()
@@ -24,7 +21,7 @@ def main():
         auth.settings_dict = auth.settings.load_settings()
         auth._init_auth_data()
 
-    login = LoginDialog(auth)
+    login = LoginDialog(auth, storage)   # 传入 storage
     if login.exec_() != QDialog.Accepted:
         sys.exit(0)
 
