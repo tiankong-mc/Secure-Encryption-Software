@@ -4,7 +4,6 @@ import ctypes
 from ctypes import wintypes
 
 class DPAPI:
-    """Windows DPAPI 加密/解密（当前用户上下文）"""
     def __init__(self):
         self.crypt32 = ctypes.windll.crypt32
         self.kernel32 = ctypes.windll.kernel32

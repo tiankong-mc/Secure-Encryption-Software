@@ -1,4 +1,4 @@
-import sys,os,tempfile,shutil,json,threading,socket,webbrowser,subprocess,urllib3
+import sys,os,tempfile,shutil,json,threading,socket,webbrowser,subprocess,urllib3,time,psutil
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -13,8 +13,9 @@ from datetime import datetime
 import traceback,requests,qrcode
 from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, send_file
 from packaging.version import parse as parse_version
+import ctypes
 
-VERSION = "v2.4.3"
+VERSION = "v2.4.4"
 
 DARK_STYLE="""
 QMainWindow,QDialog{background:#2b2b2b;color:#f0f0f0}
@@ -45,6 +46,16 @@ QProgressBar::chunk{background:#5a8cbf}
 QToolTip{background:#3c3c3c;color:#f0f0f0;border:1px solid #555}
 """
 LIGHT_STYLE=""
+
+def set_window_display_affinity(hwnd, enable=True):
+    try:
+        if enable:
+            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+        else:
+            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0)
+        return True
+    except:
+        return False
 
 flask_app=Flask(__name__)
 flask_app.secret_key=os.urandom(24)
@@ -82,9 +93,11 @@ def web_login():
                 ok=True
                 session.pop('email_code',None)
         if ok:
+            web_storage.log("移动端登录成功")
             session['authenticated']=True
             return redirect(url_for('web_index'))
         else:
+            web_storage.log("移动端登录失败")
             return render_template_string(WEB_LOGIN_TEMPLATE, methods=questions, error="验证失败")
     return render_template_string(WEB_LOGIN_TEMPLATE, methods=questions, error=None)
 
@@ -92,7 +105,6 @@ def web_login():
 def web_view(entry_id):
     if 'authenticated' not in session or not session['authenticated']:
         return redirect(url_for('web_login'))
-    # 检查二次验证授权
     if not check_second_auth(entry_id):
         entry = web_storage.get_entry_by_id(entry_id)
         if entry and entry.get('is_advanced', False):
@@ -101,6 +113,7 @@ def web_view(entry_id):
         data=web_storage.get_file_data(entry_id)
         entry=web_storage.get_entry_by_id(entry_id)
         if not entry: return "文件不存在",404
+        web_storage.log(f"移动端查看文件: {entry['original_name']}")
         return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
     except Exception as e:
         return f"查看失败: {e}",500
@@ -132,11 +145,12 @@ def web_second_auth(entry_id):
                 ok=True
                 session.pop('email_code',None)
         if ok:
-            # 设置二次验证授权（1小时有效）
+            web_storage.log(f"移动端二次验证成功 (文件ID: {entry_id})")
             session.setdefault('second_auth', {})[entry_id] = datetime.now().timestamp() + 3600
             data=web_storage.get_file_data(entry_id)
             return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
         else:
+            web_storage.log(f"移动端二次验证失败 (文件ID: {entry_id})")
             return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error="验证失败")
     return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error=None)
 
@@ -147,11 +161,11 @@ def web_download(entry_id):
     entry=web_storage.get_entry_by_id(entry_id)
     if not entry:
         return "文件不存在",404
-    # 检查二次验证授权
     if entry.get('is_advanced', False) and not check_second_auth(entry_id):
         return redirect(url_for('web_second_auth', entry_id=entry_id))
     try:
         data=web_storage.get_file_data(entry_id)
+        web_storage.log(f"移动端下载文件: {entry['original_name']}")
         return send_file(BytesIO(data), as_attachment=True, download_name=entry['original_name'])
     except Exception as e:
         return f"下载失败: {e}",500
@@ -184,6 +198,7 @@ def send_code():
         server.quit()
     except Exception as e:
         return jsonify({'success':False,'message':f'邮件发送失败: {str(e)}'}),500
+    web_storage.log(f"移动端发送邮箱验证码至: {to_email}")
     session['email_code']=code
     return jsonify({'success':True,'message':'验证码已发送'})
 
@@ -419,15 +434,74 @@ class FileViewer(QDialog):
         if hasattr(self,'tmp_path') and self.tmp_path and os.path.exists(self.tmp_path):
             try: os.unlink(self.tmp_path)
             except: pass
+
+# ---------- LogDialog ----------
+class LogDialog(QDialog):
+    def __init__(self, parent, storage):
+        super().__init__(parent)
+        self.storage = storage
+        self.setWindowTitle("日志")
+        self.setModal(True)
+        self.resize(700, 500)
+        layout = QVBoxLayout()
+        info_layout = QHBoxLayout()
+        size = self.storage.get_log_size()
+        info_layout.addWidget(QLabel(f"日志文件大小：{size} MB"))
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.clicked.connect(self.refresh_log)
+        info_layout.addWidget(self.refresh_btn)
+        self.export_btn = QPushButton("导出为 .txt")
+        self.export_btn.clicked.connect(self.export_log)
+        info_layout.addWidget(self.export_btn)
+        self.clear_btn = QPushButton("清空日志")
+        self.clear_btn.clicked.connect(self.clear_log)
+        info_layout.addWidget(self.clear_btn)
+        layout.addLayout(info_layout)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.log_text)
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+        self.setLayout(layout)
+        self.refresh_log()
+
+    def refresh_log(self):
+        content = self.storage.get_log_content()
+        self.log_text.setPlainText(content)
+
+    def export_log(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出日志", "securevault_log.txt", "Text Files (*.txt)")
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(self.log_text.toPlainText())
+                QMessageBox.information(self, "成功", f"日志已导出到：{path}")
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"导出失败: {e}")
+
+    def clear_log(self):
+        reply = QMessageBox.question(self, "确认清空", "确定要清空所有日志吗？", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.storage.clear_log()
+            self.refresh_log()
+            QMessageBox.information(self, "提示", "日志已清空")
 # ---------- AuthDialog ----------
 class AuthDialog(QDialog):
-    def __init__(self,parent,auth_manager,allowed_methods,entry_id):
+    def __init__(self, parent, auth_manager, allowed_methods, entry_id, storage):
         super().__init__(parent)
-        self.auth=auth_manager; self.allowed_methods=allowed_methods; self.entry_id=entry_id
-        self.setWindowTitle("二次验证"); self.setModal(True); self.resize(400,300)
+        self.auth = auth_manager
+        self.allowed_methods = allowed_methods
+        self.entry_id = entry_id
+        self.storage = storage
+        self.setWindowTitle("二次验证")
+        self.setModal(True)
+        self.resize(400,300)
         layout=QVBoxLayout()
         layout.addWidget(QLabel("请通过以下任意一种方式验证："))
-        self.stack=QStackedWidget(); self.widgets={}
+        self.stack=QStackedWidget()
+        self.widgets={}
         for m in allowed_methods:
             if m=='password':
                 w=self.create_password_widget(); self.stack.addWidget(w); self.widgets['password']=w
@@ -443,8 +517,11 @@ class AuthDialog(QDialog):
         self.method_combo.currentIndexChanged.connect(self.stack.setCurrentIndex)
         layout.addWidget(self.method_combo)
         self.btn_box=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        self.btn_box.accepted.connect(self.accept); self.btn_box.rejected.connect(self.reject)
-        layout.addWidget(self.btn_box); self.setLayout(layout)
+        self.btn_box.accepted.connect(self.accept)
+        self.btn_box.rejected.connect(self.reject)
+        layout.addWidget(self.btn_box)
+        self.setLayout(layout)
+
     def create_password_widget(self):
         w=QWidget(); l=QVBoxLayout()
         l.addWidget(QLabel("输入密码：")); self.pw_input=QLineEdit(); self.pw_input.setEchoMode(QLineEdit.Password)
@@ -466,44 +543,71 @@ class AuthDialog(QDialog):
         self.email_code=self.auth.send_verification_code()
         if self.email_code: QMessageBox.information(self,"提示","验证码已发送至您的邮箱")
         else: QMessageBox.warning(self,"错误","邮件发送失败，请检查配置")
+
     def accept(self):
         method=self.method_combo.currentText()
         ok=False
-        if method=='password': ok=self.auth.verify_password(self.pw_input.text())
-        elif method=='question': ok=self.auth.verify_question(self.question_combo.currentText(),self.answer_input.text())
-        elif method=='totp': ok=self.auth.verify_totp(self.totp_input.text())
-        elif method=='email': ok=(self.email_code_input.text()==self.email_code)
+        if method=='password':
+            ok=self.auth.verify_password(self.pw_input.text())
+        elif method=='question':
+            ok=self.auth.verify_question(self.question_combo.currentText(), self.answer_input.text())
+        elif method=='totp':
+            ok=self.auth.verify_totp(self.totp_input.text())
+        elif method=='email':
+            ok=(self.email_code_input.text()==self.email_code)
         if ok:
-            self.auth.reset_fail_count(); super().accept()
+            self.auth.reset_fail_count()
+            self.storage.log(f"二次验证成功 (文件ID: {self.entry_id})")
+            super().accept()
         else:
             count=self.auth.increment_fail_count()
+            self.storage.log(f"二次验证失败 (文件ID: {self.entry_id})")
             QMessageBox.warning(self,"验证失败",f"失败 {count} 次")
             if count>=5:
-                self.trigger_emergency_backup(); super().reject()
+                self.trigger_emergency_backup()
+                super().reject()
+
     def trigger_emergency_backup(self):
         from PyQt5.QtWidgets import QApplication
         main_window=None
         for w in QApplication.topLevelWidgets():
-            if w.__class__.__name__=='MainWindow': main_window=w; break
-        if not main_window: QMessageBox.critical(self,"错误","无法找到主窗口"); return
-        storage=main_window.storage; auth=main_window.auth
+            if w.__class__.__name__=='MainWindow':
+                main_window=w
+                break
+        if not main_window:
+            QMessageBox.critical(self,"错误","无法找到主窗口")
+            return
+        storage=main_window.storage
+        auth=main_window.auth
         smtp_config=auth.email_config
-        if not smtp_config: QMessageBox.critical(self,"错误","未配置邮箱，无法执行紧急备份"); return
+        if not smtp_config:
+            QMessageBox.critical(self,"错误","未配置邮箱，无法执行紧急备份")
+            return
         to_email=smtp_config.get('receiver_email')
-        if not to_email: QMessageBox.critical(self,"错误","未设置收件邮箱"); return
+        if not to_email:
+            QMessageBox.critical(self,"错误","未设置收件邮箱")
+            return
         entry=storage.get_entry_by_id(self.entry_id)
-        if not entry: QMessageBox.critical(self,"错误","未找到该文件记录"); return
+        if not entry:
+            QMessageBox.critical(self,"错误","未找到该文件记录")
+            return
         vault_path=entry['secret_path']
-        if not os.path.exists(vault_path) and entry['user_path'] and os.path.exists(entry['user_path']): vault_path=entry['user_path']
-        if not os.path.exists(vault_path): QMessageBox.critical(self,"错误","加密文件不存在"); return
+        if not os.path.exists(vault_path) and entry['user_path'] and os.path.exists(entry['user_path']):
+            vault_path=entry['user_path']
+        if not os.path.exists(vault_path):
+            QMessageBox.critical(self,"错误","加密文件不存在")
+            return
         display_name=entry['original_name']+'.vault'
         try:
             BackupManager.send_vault_file(vault_path,to_email,smtp_config,display_name)
+            storage.log(f"紧急备份发送文件: {entry['original_name']}")
         except Exception as e:
+            storage.log(f"紧急备份发送失败: {entry['original_name']}")
             QMessageBox.critical(self,"错误",f"邮件发送失败，文件未被删除。\n错误信息: {e}")
             return
         storage.remove_entry(self.entry_id,destroy=True)
         auth.reset_fail_count()
+        storage.log(f"紧急备份销毁文件: {entry['original_name']}")
         QMessageBox.critical(self,"紧急备份",f"加密文件已发送至您的邮箱，原始文件已被销毁。程序将退出。")
         QApplication.quit()
 
@@ -693,15 +797,18 @@ class SetupWizard(QWizard):
 
 # ---------- LoginDialog ----------
 class LoginDialog(QDialog):
-    def __init__(self,auth_manager,storage):
+    def __init__(self, auth_manager, storage):
         super().__init__()
-        self.auth=auth_manager
-        self.storage=storage   # 直接传入 storage 用于紧急备份
-        self.recovery_accepted=False
-        self.setWindowTitle("SecureVault 登录"); self.setModal(True); self.resize(400,350)
+        self.auth = auth_manager
+        self.storage = storage
+        self.recovery_accepted = False
+        self.setWindowTitle("SecureVault 登录")
+        self.setModal(True)
+        self.resize(400,350)
         layout=QVBoxLayout()
         layout.addWidget(QLabel("请通过以下任一方式验证身份"))
-        self.stack=QStackedWidget(); self.methods=[]
+        self.stack=QStackedWidget()
+        self.methods=[]
         if self.auth.password_hash:
             w=self.create_password_widget(); self.stack.addWidget(w); self.methods.append('password')
         if self.auth.qa:
@@ -716,18 +823,21 @@ class LoginDialog(QDialog):
         self.method_combo.currentIndexChanged.connect(self.stack.setCurrentIndex)
         layout.addWidget(self.method_combo)
         self.btn_box=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        self.btn_box.accepted.connect(self.accept); self.btn_box.rejected.connect(self.reject)
+        self.btn_box.accepted.connect(self.accept)
+        self.btn_box.rejected.connect(self.reject)
         layout.addWidget(self.btn_box)
         self.recovery_btn=QPushButton("使用紧急恢复代码")
         self.recovery_btn.clicked.connect(self.recovery_login)
         layout.addWidget(self.recovery_btn)
         self.setLayout(layout)
+
     def recovery_login(self):
         code,ok=QInputDialog.getText(self,"紧急恢复","请输入紧急恢复代码（格式：XXXX-XXXX-XXXX-XXXX-XXXX）:")
         if not ok or not code: return
         if self.auth.verify_recovery_code(code):
             self.recovery_accepted=True; self.accept()
         else: QMessageBox.warning(self,"错误","恢复代码无效或已使用")
+
     def create_password_widget(self):
         w=QWidget(); l=QVBoxLayout()
         l.addWidget(QLabel("输入密码：")); self.pw_input=QLineEdit(); self.pw_input.setEchoMode(QLineEdit.Password)
@@ -749,64 +859,83 @@ class LoginDialog(QDialog):
         self.email_code=self.auth.send_verification_code()
         if self.email_code: QMessageBox.information(self,"提示","验证码已发送")
         else: QMessageBox.warning(self,"错误","发送失败")
+
     def accept(self):
-        if self.recovery_accepted: super().accept(); return
+        if self.recovery_accepted:
+            self.storage.log("登录成功 (恢复代码)")
+            super().accept()
+            return
         method=self.method_combo.currentText()
         ok=False
-        if method=='password': ok=self.auth.verify_password(self.pw_input.text())
-        elif method=='question': ok=self.auth.verify_question(self.question_combo.currentText(),self.answer_input.text())
-        elif method=='totp': ok=self.auth.verify_totp(self.totp_input.text())
-        elif method=='email': ok=(self.email_code_input.text()==self.email_code)
+        if method=='password':
+            ok=self.auth.verify_password(self.pw_input.text())
+        elif method=='question':
+            ok=self.auth.verify_question(self.question_combo.currentText(), self.answer_input.text())
+        elif method=='totp':
+            ok=self.auth.verify_totp(self.totp_input.text())
+        elif method=='email':
+            ok=(self.email_code_input.text()==self.email_code)
         if ok:
-            self.auth.reset_fail_count(); super().accept()
+            self.auth.reset_fail_count()
+            self.storage.log("登录成功")
+            super().accept()
         else:
             count=self.auth.increment_fail_count()
+            self.storage.log(f"登录失败 (尝试 {count})")
             QMessageBox.warning(self,"验证失败",f"失败 {count} 次")
             if count>=5:
-                self.trigger_emergency_backup(); super().reject()
+                self.trigger_emergency_backup()
+                super().reject()
+
     def trigger_emergency_backup(self):
-        from PyQt5.QtWidgets import QApplication
-        # 直接使用 self.storage
         storage = self.storage
         auth = self.auth
         smtp_config = auth.email_config
         if not smtp_config:
-            QMessageBox.critical(self, "错误", "未配置邮箱，无法执行紧急备份")
+            QMessageBox.critical(self,"错误","未配置邮箱，无法执行紧急备份")
             return
         to_email = smtp_config.get('receiver_email')
         if not to_email:
-            QMessageBox.critical(self, "错误", "未设置收件邮箱")
+            QMessageBox.critical(self,"错误","未设置收件邮箱")
             return
         file_info_list = storage.get_all_vault_paths_with_names()
         if not file_info_list:
-            QMessageBox.critical(self, "错误", "没有可备份的文件")
+            QMessageBox.critical(self,"错误","没有可备份的文件")
             return
         try:
             BackupManager.send_multiple_vault_files(file_info_list, to_email, smtp_config)
+            storage.log("紧急备份发送所有文件")
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"邮件发送失败，文件未被删除。\n错误信息: {e}")
+            storage.log("紧急备份发送失败")
+            QMessageBox.critical(self,"错误",f"邮件发送失败，文件未被删除。\n错误信息: {e}")
             return
         for entry in storage.get_all_entries():
             storage.remove_entry(entry['id'], destroy=True)
         storage.index = []
         storage._save_index()
         auth.reset_fail_count()
-        QMessageBox.critical(self, "紧急备份", "所有加密文件已发送至您的邮箱，原始文件已被销毁。程序将退出。")
+        storage.log("紧急备份销毁所有文件")
+        QMessageBox.critical(self,"紧急备份","所有加密文件已发送至您的邮箱，原始文件已被销毁。程序将退出。")
         QApplication.quit()
 
 # ---------- SettingsDialog ----------
 class SettingsDialog(QDialog):
-    def __init__(self,parent,auth_manager,is_recovery_login=False):
+    def __init__(self, parent, auth_manager, is_recovery_login=False):
         super().__init__(parent)
-        self.auth=auth_manager; self.is_recovery_login=is_recovery_login; self.parent_main=parent
-        self.web_thread=None
-        self.setWindowTitle("设置"); self.setModal(True); self.resize(600,550)
+        self.auth = auth_manager
+        self.is_recovery_login = is_recovery_login
+        self.parent_main = parent
+        self.web_thread = None
+        self.setWindowTitle("设置")
+        self.setModal(True)
+        self.resize(600,600)
         layout=QVBoxLayout()
         ver_layout=QHBoxLayout()
         ver_layout.addWidget(QLabel(f"当前版本：{VERSION}"))
         self.update_btn=QPushButton("检查更新")
         self.update_btn.clicked.connect(self.check_update)
-        ver_layout.addWidget(self.update_btn); ver_layout.addStretch()
+        ver_layout.addWidget(self.update_btn)
+        ver_layout.addStretch()
         layout.addLayout(ver_layout)
         info_label=QLabel("当前已启用的验证方式："); layout.addWidget(info_label)
         methods=[]
@@ -830,6 +959,22 @@ class SettingsDialog(QDialog):
         self.theme_combo.currentTextChanged.connect(self.on_theme_changed)
         theme_layout.addWidget(self.theme_combo)
         layout.addLayout(theme_layout)
+        screenshot_layout=QHBoxLayout()
+        screenshot_layout.addWidget(QLabel("截屏保护："))
+        self.screenshot_cb=QCheckBox()
+        self.screenshot_cb.setChecked(self.auth.settings_dict.get('screenshot_protection', False))
+        self.screenshot_cb.stateChanged.connect(self.toggle_screenshot_protection)
+        screenshot_layout.addWidget(self.screenshot_cb)
+        screenshot_layout.addStretch()
+        layout.addLayout(screenshot_layout)
+        log_layout=QHBoxLayout()
+        log_layout.addWidget(QLabel("日志记录："))
+        self.log_cb=QCheckBox()
+        self.log_cb.setChecked(self.auth.settings_dict.get('log_enabled', True))
+        self.log_cb.stateChanged.connect(self.toggle_log)
+        log_layout.addWidget(self.log_cb)
+        log_layout.addStretch()
+        layout.addLayout(log_layout)
         migrate_group=QGroupBox("保险库迁移")
         migrate_layout=QVBoxLayout()
         self.btn_export_vault=QPushButton("导出保险库（备份/迁移）"); self.btn_export_vault.clicked.connect(self.export_vault); migrate_layout.addWidget(self.btn_export_vault)
@@ -846,13 +991,15 @@ class SettingsDialog(QDialog):
         layout.addLayout(bottom_layout)
         btn_box=QDialogButtonBox(QDialogButtonBox.Close)
         btn_box.rejected.connect(self.reject)
-        layout.addWidget(btn_box); self.setLayout(layout)
+        layout.addWidget(btn_box)
+        self.setLayout(layout)
 
     def update_recovery_status(self):
         if self.auth.is_recovery_code_available():
             self.recovery_status.setText("状态：当前有一份有效的紧急恢复代码"); self.recovery_status.setStyleSheet("color: green;")
         else:
             self.recovery_status.setText("状态：当前没有有效的紧急恢复代码"); self.recovery_status.setStyleSheet("color: gray;")
+
     def _verify_identity(self):
         if self.is_recovery_login: return True
         methods=[]
@@ -863,10 +1010,12 @@ class SettingsDialog(QDialog):
         if not methods: QMessageBox.warning(self,"提示","没有可用的验证方式"); return False
         dialog=DeleteAuthDialog(self,self.auth,methods)
         return dialog.exec_()==QDialog.Accepted
+
     def generate_recovery(self):
         try:
             if not self.is_recovery_login and not self._verify_identity(): return
             code=self.auth.generate_recovery_code()
+            self.parent_main.storage.log("生成紧急恢复代码")
             dialog=QDialog(self); dialog.setWindowTitle("紧急恢复代码")
             layout=QVBoxLayout()
             layout.addWidget(QLabel("您的紧急恢复代码已生成，请妥善保管："))
@@ -888,9 +1037,28 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self,"提示","新的恢复代码已生成，旧代码已失效，邮件通知已发送。")
         except Exception as e:
             QMessageBox.critical(self,"错误",f"生成恢复代码失败: {e}"); traceback.print_exc()
+
     def on_theme_changed(self,theme):
         self.auth.settings_dict['theme']=theme; self.auth._save()
-        if self.parent_main: self.parent_main.apply_theme(theme)
+        if self.parent_main:
+            self.parent_main.apply_theme(theme)
+            self.parent_main.storage.log(f"切换主题为: {theme}")
+
+    def toggle_screenshot_protection(self,state):
+        enabled=(state==Qt.Checked)
+        self.auth.settings_dict['screenshot_protection']=enabled
+        self.auth._save()
+        if self.parent_main:
+            self.parent_main.screenshot_protection=enabled
+            self.parent_main.apply_screenshot_protection()
+            self.parent_main.storage.log(f"截屏保护: {'启用' if enabled else '禁用'}")
+
+    def toggle_log(self, state):
+        enabled = (state == Qt.Checked)
+        self.auth.settings_dict['log_enabled'] = enabled
+        self.auth._save()
+        self.parent_main.storage.log(f"日志记录: {'启用' if enabled else '禁用'}")
+
     def export_vault(self):
         try:
             if not self.is_recovery_login and not self._verify_identity(): return
@@ -903,10 +1071,12 @@ class SettingsDialog(QDialog):
             QApplication.setOverrideCursor(Qt.WaitCursor)
             storage.export_vault(path,pwd)
             QApplication.restoreOverrideCursor()
+            self.parent_main.storage.log(f"导出保险库: {os.path.basename(path)}")
             QMessageBox.information(self,"成功",f"保险库已导出到：{path}")
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self,"错误",f"导出失败: {e}"); traceback.print_exc()
+
     def import_vault(self):
         try:
             if not self.is_recovery_login and not self._verify_identity(): return
@@ -922,10 +1092,12 @@ class SettingsDialog(QDialog):
             storage.import_vault(path,pwd)
             QApplication.restoreOverrideCursor()
             self.parent_main.load_files()
+            self.parent_main.storage.log(f"导入保险库: {os.path.basename(path)}")
             QMessageBox.information(self,"成功","保险库导入成功，请重启程序以使所有设置生效。")
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self,"错误",f"导入失败: {e}"); traceback.print_exc()
+
     def check_update(self):
         try:
             headers={'User-Agent':'SecureVault'}
@@ -934,6 +1106,7 @@ class SettingsDialog(QDialog):
                 QMessageBox.warning(self,"错误","无法获取更新信息"); return
             data=resp.json()
             latest=data.get('tag_name','')
+            self.parent_main.storage.log(f"检查更新: 当前{VERSION}, 远程{latest}")
             if parse_version(latest) > parse_version(VERSION):
                 ret=QMessageBox.question(self,"发现新版本",f"最新版本：{latest}\n当前版本：{VERSION}\n是否下载并更新？",QMessageBox.Yes|QMessageBox.No)
                 if ret==QMessageBox.Yes: self.download_update(data)
@@ -941,8 +1114,11 @@ class SettingsDialog(QDialog):
                 QMessageBox.information(self,"已是最新",f"当前已是最新版本（{VERSION}）")
         except Exception as e:
             QMessageBox.critical(self,"错误",f"检查更新失败: {e}")
+
     def download_update(self,data):
         try:
+            latest = data.get('tag_name', '')
+            self.parent_main.storage.log(f"开始下载更新: {latest}")
             assets=data.get('assets',[]); exe_asset=None
             for a in assets:
                 if a.get('name','').lower()=='encryption.exe':
@@ -957,7 +1133,7 @@ class SettingsDialog(QDialog):
             block_size=8192
             temp_path=os.path.join(os.path.dirname(sys.executable),"SecureVault_update.exe")
             import hashlib
-            sha256 = hashlib.sha256()
+            sha256=hashlib.sha256()
             with open(temp_path,'wb') as f:
                 downloaded=0
                 for chunk in response.iter_content(chunk_size=block_size):
@@ -984,19 +1160,21 @@ class SettingsDialog(QDialog):
                     except: pass
                     return
             QMessageBox.information(self,"下载完成","准备重启并安装更新")
+            self.parent_main.storage.log("更新下载完成，准备重启")
             bat_path=os.path.join(os.path.dirname(sys.executable),"update.bat")
             with open(bat_path,'w') as f:
                 f.write(f"""@echo off
 timeout /t 2 > nul
 copy /Y "{temp_path}" "{sys.executable}"
 del "{temp_path}"
-start "" "{sys.executable}"
+start "" "{sys.executable}" --updated
 del "%~f0"
 """)
             subprocess.Popen([bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
             QApplication.quit()
         except Exception as e:
             QMessageBox.critical(self,"错误",f"更新失败: {e}")
+
     def show_web_qr(self):
         try:
             s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(0); s.connect(('8.8.8.8',1)); ip=s.getsockname()[0]; s.close()
@@ -1007,6 +1185,7 @@ del "%~f0"
             self.web_thread.start()
             self.web_status.setText(f"状态：已启动（{url}）")
             QTimer.singleShot(2000, lambda: self.web_status.setText(f"状态：运行中（{url}）"))
+            self.parent_main.storage.log(f"启动移动端Web服务，地址: {url}")
         qr=qrcode.make(url)
         qr_bytes=BytesIO(); qr.save(qr_bytes, format='PNG')
         pixmap=QPixmap(); pixmap.loadFromData(qr_bytes.getvalue())
@@ -1021,7 +1200,6 @@ del "%~f0"
         btn_box=QDialogButtonBox(QDialogButtonBox.Close); btn_box.rejected.connect(dialog.accept); layout.addWidget(btn_box)
         dialog.setLayout(layout); dialog.exec_()
 
-    # ---------- 修改密码 ----------
     def change_password(self):
         if not self._verify_identity(): return
         pw,ok=QInputDialog.getText(self,"修改密码","输入新密码（至少8位）：",QLineEdit.Password)
@@ -1030,9 +1208,10 @@ del "%~f0"
         confirm,ok=QInputDialog.getText(self,"修改密码","再次输入新密码：",QLineEdit.Password)
         if not ok: return
         if pw!=confirm: QMessageBox.warning(self,"错误","两次密码不一致"); return
-        self.auth.set_password(pw); QMessageBox.information(self,"成功","密码已更新")
+        self.auth.set_password(pw)
+        self.parent_main.storage.log("修改密码")
+        QMessageBox.information(self,"成功","密码已更新")
 
-    # ---------- 修改安全问题 ----------
     def change_questions(self):
         if not self._verify_identity(): return
         dialog=QDialog(self); dialog.setWindowTitle("修改安全问题")
@@ -1053,16 +1232,15 @@ del "%~f0"
         if not q1.text() or not a1.text() or not q2.text() or not a2.text() or not q3.text() or not a3.text():
             QMessageBox.warning(self,"错误","请完整填写所有问题和答案"); return
         qa_list=[(q1.text(),a1.text()),(q2.text(),a2.text()),(q3.text(),a3.text())]
-        self.auth.set_questions(qa_list); QMessageBox.information(self,"成功","安全问题已更新")
+        self.auth.set_questions(qa_list)
+        self.parent_main.storage.log("修改安全问题")
+        QMessageBox.information(self,"成功","安全问题已更新")
 
-    # ---------- 修改 TOTP（修复：先验证再保存） ----------
     def change_totp(self):
         if not self._verify_identity(): return
         reply=QMessageBox.question(self,"确认","重新生成 TOTP 密钥将导致之前的二维码失效，是否继续？",QMessageBox.Yes|QMessageBox.No)
         if reply!=QMessageBox.Yes: return
-        # 生成临时密钥，不保存
         temp_secret = self.auth.generate_totp_secret()
-        # 生成二维码
         totp = pyotp.TOTP(temp_secret)
         uri = totp.provisioning_uri(name="SecureVault", issuer_name="SecureApp")
         qr_img = qrcode.make(uri)
@@ -1070,7 +1248,6 @@ del "%~f0"
         qr_img.save(qr_bytes, format='PNG')
         pixmap = QPixmap()
         pixmap.loadFromData(qr_bytes.getvalue())
-        # 显示对话框
         dialog = QDialog(self)
         dialog.setWindowTitle("TOTP 设置")
         layout = QVBoxLayout()
@@ -1091,11 +1268,11 @@ del "%~f0"
         if dialog.exec_() == QDialog.Accepted:
             if self.auth.verify_totp_secret(temp_secret, code_input.text()):
                 self.auth.save_totp_secret(temp_secret)
+                self.parent_main.storage.log("修改 TOTP")
                 QMessageBox.information(self, "成功", "TOTP 已更新")
             else:
                 QMessageBox.warning(self, "错误", "验证码不正确，未保存")
 
-    # ---------- 修改邮箱配置（修复：先测试再保存） ----------
     def change_email(self):
         if not self._verify_identity(): return
         dialog = QDialog(self)
@@ -1128,7 +1305,6 @@ del "%~f0"
         layout.addWidget(btn_box)
         dialog.setLayout(layout)
         if dialog.exec_() != QDialog.Accepted: return
-        # 获取输入
         server = smtp_server.text()
         try: port = int(smtp_port.text())
         except: QMessageBox.warning(self, "错误", "端口必须为数字"); return
@@ -1137,19 +1313,17 @@ del "%~f0"
         receiver = receiver_email.text()
         if not all([server, port, sender, pwd, receiver]):
             QMessageBox.warning(self, "错误", "请完整填写所有字段"); return
-        # 先测试配置
         ok, result = self.auth.test_email_config(server, port, sender, pwd, receiver)
         if not ok:
             QMessageBox.warning(self, "错误", f"配置测试失败: {result}")
             return
-        # 发送验证码并验证
-        code = result  # test_email_config 返回 (True, code)
+        code = result
         verify_code, ok = QInputDialog.getText(self, "验证邮箱", f"输入发送到 {receiver} 的验证码")
         if not ok or verify_code != code:
             QMessageBox.warning(self, "错误", "验证码错误")
             return
-        # 保存新配置
         self.auth.save_email_config(server, port, sender, pwd, receiver)
+        self.parent_main.storage.log("修改邮箱配置")
         QMessageBox.information(self, "成功", "邮箱配置已更新")
 
 # ---------- MainWindow ----------
@@ -1158,6 +1332,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.storage=storage; self.auth=auth; self.is_recovery_login=is_recovery_login
         self.current_tag=None
+        self.screenshot_protection = self.auth.settings_dict.get('screenshot_protection', False)
         self.setWindowTitle(f"SecureVault {VERSION}")
         self.setGeometry(100,100,900,600)
         self.initUI()
@@ -1165,6 +1340,16 @@ class MainWindow(QMainWindow):
         theme=self.auth.settings_dict.get('theme','明亮')
         self.apply_theme(theme)
         self.setAcceptDrops(True)
+        self.apply_screenshot_protection()
+
+    def apply_theme(self,theme):
+        if theme=="暗黑": self.setStyleSheet(DARK_STYLE)
+        else: self.setStyleSheet(LIGHT_STYLE)
+
+    def apply_screenshot_protection(self):
+        hwnd = int(self.winId())
+        set_window_display_affinity(hwnd, self.screenshot_protection)
+
     def initUI(self):
         central=QWidget(); self.setCentralWidget(central)
         main_layout=QHBoxLayout()
@@ -1192,9 +1377,11 @@ class MainWindow(QMainWindow):
         self.refresh_btn=QPushButton("刷新")
         self.settings_btn=QPushButton("设置")
         self.delete_btn=QPushButton("删除")
+        self.log_btn=QPushButton("日志")
         top_bar.addWidget(self.upload_btn); top_bar.addWidget(self.import_btn)
         top_bar.addWidget(self.export_btn); top_bar.addWidget(self.refresh_btn)
         top_bar.addWidget(self.settings_btn); top_bar.addWidget(self.delete_btn)
+        top_bar.addWidget(self.log_btn)
         right_layout.addLayout(top_bar)
         self.file_list=QListWidget()
         self.file_list.setDragEnabled(True)
@@ -1211,19 +1398,24 @@ class MainWindow(QMainWindow):
         self.refresh_btn.clicked.connect(self.load_files)
         self.settings_btn.clicked.connect(self.open_settings)
         self.delete_btn.clicked.connect(self.delete_file)
+        self.log_btn.clicked.connect(self.open_log)
         self.setAcceptDrops(True)
-    def apply_theme(self,theme):
-        if theme=="暗黑": self.setStyleSheet(DARK_STYLE)
-        else: self.setStyleSheet(LIGHT_STYLE)
+
+    def open_log(self):
+        dialog = LogDialog(self, self.storage)
+        dialog.exec_()
+
     def load_tags(self):
         self.tag_list.clear(); self.tag_list.addItem("全部")
         for tag in self.storage.get_all_tags(): self.tag_list.addItem(tag)
         if self.current_tag:
             items=self.tag_list.findItems(self.current_tag, Qt.MatchExactly)
             if items: self.tag_list.setCurrentItem(items[0])
+
     def on_tag_clicked(self,item):
         self.current_tag=None if item.text()=="全部" else item.text()
         self.load_files()
+
     def create_tag(self):
         tag,ok=QInputDialog.getText(self,"创建标签","输入新标签名称：")
         if ok and tag and tag not in self.storage.get_all_tags():
@@ -1232,8 +1424,10 @@ class MainWindow(QMainWindow):
                 entry_id=selected.data(Qt.UserRole)
                 self.storage.add_tag_to_entry(entry_id, tag)
                 self.load_files(); self.load_tags()
+                self.storage.log(f"创建标签: {tag}")
             else:
                 QMessageBox.information(self,"提示","请先选择一个文件来添加标签。")
+
     def delete_tag(self):
         current=self.tag_list.currentItem()
         if not current or current.text()=="全部": return
@@ -1244,22 +1438,29 @@ class MainWindow(QMainWindow):
                 if tag in entry.get('tags',[]): entry['tags'].remove(tag)
             self.storage._save_index()
             self.load_tags(); self.load_files()
+            self.storage.log(f"删除标签: {tag}")
+
     def dragEnterEvent(self,event):
         if event.mimeData().hasUrls(): event.acceptProposedAction()
         else: event.ignore()
+
     def dropEvent(self,event):
         for url in event.mimeData().urls():
             file_path=url.toLocalFile()
             if os.path.isfile(file_path): self._do_upload(file_path)
         event.acceptProposedAction()
+
     def _do_upload(self,file_path):
         dialog=UploadDialog(self,file_path)
         if dialog.exec_():
             try:
                 uid=self.storage.add_file(file_path, dialog.user_dest, dialog.is_advanced, dialog.second_methods)
+                self.storage.log(f"加密文件: {os.path.basename(file_path)}")
                 QMessageBox.information(self,"成功",f"文件已加密保存，ID: {uid}")
                 self.load_files(); self.load_tags()
-            except Exception as e: QMessageBox.critical(self,"错误",f"加密失败: {e}")
+            except Exception as e:
+                QMessageBox.critical(self,"错误",f"加密失败: {e}")
+
     def load_files(self):
         self.file_list.clear()
         entries=self.storage.get_all_entries()
@@ -1271,9 +1472,11 @@ class MainWindow(QMainWindow):
             item=QListWidgetItem(item_text)
             item.setData(Qt.UserRole, entry['id'])
             self.file_list.addItem(item)
+
     def upload_file(self):
         file_path,_=QFileDialog.getOpenFileName(self,"选择要加密的文件")
         if file_path: self._do_upload(file_path)
+
     def import_vault_file(self):
         file_path,_=QFileDialog.getOpenFileName(self,"选择要导入的 .vault 加密文件","","Vault Files (*.vault)")
         if not file_path: return
@@ -1296,9 +1499,12 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(self,"提示","至少选一种"); return
         try:
             uid=self.storage.import_vault_file(file_path, is_advanced=is_advanced, second_auth_methods=second_methods)
+            self.storage.log(f"导入加密文件: {os.path.basename(file_path)}")
             QMessageBox.information(self,"成功",f"文件已导入，ID: {uid}")
             self.load_files(); self.load_tags()
-        except Exception as e: QMessageBox.critical(self,"错误",f"导入失败: {e}")
+        except Exception as e:
+            QMessageBox.critical(self,"错误",f"导入失败: {e}")
+
     def export_decrypted_file(self):
         current=self.file_list.currentItem()
         if not current: QMessageBox.warning(self,"提示","请先选择文件"); return
@@ -1308,7 +1514,7 @@ class MainWindow(QMainWindow):
         if entry['is_advanced']:
             methods=entry['second_auth_methods']
             if not methods: QMessageBox.warning(self,"提示","未设置二次验证"); return
-            auth_dialog=AuthDialog(self,self.auth,methods,entry_id)
+            auth_dialog=AuthDialog(self,self.auth,methods,entry_id,self.storage)
             if auth_dialog.exec_()!=QDialog.Accepted: return
         else:
             avail=self._get_available_auth_methods()
@@ -1320,8 +1526,11 @@ class MainWindow(QMainWindow):
         try:
             data=self.storage.get_file_data(entry_id)
             with open(save_path,'wb') as f: f.write(data)
+            self.storage.log(f"解密导出文件: {entry['original_name']}")
             QMessageBox.information(self,"成功",f"导出到：{save_path}")
-        except Exception as e: QMessageBox.critical(self,"错误",f"导出失败: {e}")
+        except Exception as e:
+            QMessageBox.critical(self,"错误",f"导出失败: {e}")
+
     def open_file(self,item):
         entry_id=item.data(Qt.UserRole)
         entry=self.storage.get_entry_by_id(entry_id)
@@ -1329,17 +1538,21 @@ class MainWindow(QMainWindow):
         if entry['is_advanced']:
             methods=entry['second_auth_methods']
             if not methods: QMessageBox.warning(self,"提示","未设置二次验证"); return
-            auth_dialog=AuthDialog(self,self.auth,methods,entry_id)
+            auth_dialog=AuthDialog(self,self.auth,methods,entry_id,self.storage)
             if auth_dialog.exec_()!=QDialog.Accepted: return
         try:
             data=self.storage.get_file_data(entry_id)
             viewer=FileViewer(self,data,entry['type'],entry['original_name'])
             viewer.exec_()
-        except Exception as e: QMessageBox.critical(self,"错误",f"打开失败: {e}")
+            self.storage.log(f"查看文件: {entry['original_name']}")
+        except Exception as e:
+            QMessageBox.critical(self,"错误",f"打开失败: {e}")
+
     def open_settings(self):
         dialog=SettingsDialog(self,self.auth,self.is_recovery_login)
         dialog.exec_()
         self.load_tags(); self.load_files()
+
     def delete_file(self):
         current=self.file_list.currentItem()
         if not current: QMessageBox.warning(self,"提示","请先选择文件"); return
@@ -1352,9 +1565,12 @@ class MainWindow(QMainWindow):
         if reply==QMessageBox.Yes:
             try:
                 self.storage.remove_entry(entry_id,destroy=False)
+                self.storage.log(f"删除文件: {entry['original_name']}")
                 self.load_files()
                 QMessageBox.information(self,"成功","已删除")
-            except Exception as e: QMessageBox.critical(self,"错误",f"删除失败: {e}")
+            except Exception as e:
+                QMessageBox.critical(self,"错误",f"删除失败: {e}")
+
     def _get_available_auth_methods(self):
         methods=[]
         if self.auth.password_hash: methods.append('password')

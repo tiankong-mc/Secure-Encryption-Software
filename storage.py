@@ -1,15 +1,16 @@
-import os, json, shutil, uuid, pickle, zipfile, tempfile, struct
+import os, json, shutil, uuid, pickle, zipfile, tempfile, struct, time
 from crypto import encrypt_data, decrypt_data, generate_key
 from settings import SettingsManager
 from backup import BackupManager
 
-MAGIC = b'SVLT'          # 文件头魔术字
-VERSION = 1              # 格式版本
+MAGIC = b'SVLT'
+VAULT_VERSION = 1
 
 class StorageManager:
     SECRET_DIR = r'C:\ProgramData\SecureVault'
     INDEX_PATH = os.path.join(SECRET_DIR, 'index.enc')
     INDEX_BACKUP_PATH = os.path.join(SECRET_DIR, 'index.enc.bak')
+    LOG_PATH = os.path.join(SECRET_DIR, 'securevault.log')
 
     def __init__(self):
         self.settings = SettingsManager()
@@ -23,6 +24,33 @@ class StorageManager:
         self.index = self._load_index()
         self._ensure_tags_list()
 
+    # ---------- 日志 ----------
+    def log(self, message):
+        if not self.settings.load_settings().get('log_enabled', True):
+            return
+        try:
+            with open(self.LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+        except:
+            pass
+
+    def get_log_content(self):
+        if os.path.exists(self.LOG_PATH):
+            with open(self.LOG_PATH, 'r', encoding='utf-8') as f:
+                return f.read()
+        return ""
+
+    def get_log_size(self):
+        if os.path.exists(self.LOG_PATH):
+            size = os.path.getsize(self.LOG_PATH)
+            return round(size / (1024 * 1024), 2)
+        return 0
+
+    def clear_log(self):
+        if os.path.exists(self.LOG_PATH):
+            os.remove(self.LOG_PATH)
+
+    # ---------- 索引管理 ----------
     def _ensure_tags_list(self):
         modified = False
         for entry in self.index:
@@ -58,18 +86,11 @@ class StorageManager:
             shutil.copy2(self.INDEX_PATH, self.INDEX_BACKUP_PATH)
         os.replace(temp_path, self.INDEX_PATH)
 
+    # ---------- 序列化/反序列化加密文件 ----------
     def _serialize_vault(self, encrypted_file_key, encrypted_content):
-        """
-        自定义二进制格式：
-        MAGIC(4) + VERSION(1) + key_len(4) + encrypted_key + encrypted_content
-        """
-        return MAGIC + struct.pack('B', VERSION) + struct.pack('>I', len(encrypted_file_key)) + encrypted_file_key + encrypted_content
+        return MAGIC + struct.pack('B', VAULT_VERSION) + struct.pack('>I', len(encrypted_file_key)) + encrypted_file_key + encrypted_content
 
     def _deserialize_vault(self, data):
-        """
-        解析自定义格式，返回 (encrypted_file_key, encrypted_content)
-        如果格式不匹配，抛出异常（用于兼容旧 pickle）
-        """
         if len(data) < 4 + 1 + 4:
             raise ValueError("数据太短，不是有效的新格式")
         magic = data[:4]
@@ -85,13 +106,13 @@ class StorageManager:
         encrypted_content = data[9+key_len:]
         return encrypted_file_key, encrypted_content
 
+    # ---------- 文件管理 ----------
     def add_file(self, local_path, user_dest=None, is_advanced=False, second_auth_methods=None, tags=None):
         with open(local_path, 'rb') as f:
             plain = f.read()
         file_key = generate_key()
         encrypted_content = encrypt_data(plain, file_key)
         encrypted_file_key = encrypt_data(file_key, self.master_key)
-        # 使用新格式序列化
         data_pack = self._serialize_vault(encrypted_file_key, encrypted_content)
         uid = str(uuid.uuid4())
         secret_filename = uid + '.vault'
@@ -144,11 +165,10 @@ class StorageManager:
                     raise FileNotFoundError(f"文件不存在: {path}")
                 with open(path, 'rb') as f:
                     data_pack = f.read()
-                # 先尝试新格式
                 try:
                     encrypted_file_key, encrypted_content = self._deserialize_vault(data_pack)
                 except ValueError:
-                    # 回退到旧 pickle 格式（兼容已有文件）
+                    # 回退旧 pickle 格式
                     try:
                         encrypted_file_key, encrypted_content = pickle.loads(data_pack)
                     except Exception as e:
@@ -158,7 +178,6 @@ class StorageManager:
                 return plain
         raise KeyError("记录不存在")
 
-    # 其他方法（get_all_entries, get_entry_by_id, remove_entry 等）与之前相同，省略（但需保留）
     def get_all_entries(self):
         return self.index
 
@@ -194,12 +213,11 @@ class StorageManager:
             raise FileNotFoundError("文件不存在")
         with open(vault_path, 'rb') as f:
             data_pack = f.read()
-        # 必须为新格式，禁止导入旧 pickle 格式
+        # 强制新格式
         try:
             encrypted_file_key, encrypted_content = self._deserialize_vault(data_pack)
         except ValueError:
             raise ValueError("不安全格式：此 .vault 文件为旧 pickle 格式，已被禁用。请使用迁移工具转换或重新加密。")
-        # 验证加密数据（尝试解密）
         try:
             decrypt_data(encrypted_file_key, self.master_key)
         except Exception as e:
@@ -232,7 +250,6 @@ class StorageManager:
         self._save_index()
         return uid
 
-    # 其他方法（get_all_vault_paths_with_names, 标签管理, export_vault, import_vault）与之前相同，省略
     def get_all_vault_paths_with_names(self):
         result = []
         for entry in self.index:
@@ -244,6 +261,7 @@ class StorageManager:
                 result.append((vault_path, display_name))
         return result
 
+    # ---------- 标签管理 ----------
     def get_all_tags(self):
         tags = set()
         for entry in self.index:
@@ -269,7 +287,7 @@ class StorageManager:
     def get_entries_by_tag(self, tag):
         return [entry for entry in self.index if tag in entry.get('tags', [])]
 
-    # 迁移导出/导入（与之前相同，不包含配置）
+    # ---------- 保险库迁移 ----------
     def export_vault(self, export_path, password=None):
         temp_dir = tempfile.mkdtemp()
         try:
