@@ -15,7 +15,7 @@ from flask import Flask, request, render_template_string, session, redirect, url
 from packaging.version import parse as parse_version
 import ctypes
 
-VERSION = "v2.4.4"
+VERSION = "v2.4.5"
 
 DARK_STYLE="""
 QMainWindow,QDialog{background:#2b2b2b;color:#f0f0f0}
@@ -1159,18 +1159,20 @@ class SettingsDialog(QDialog):
                     try: os.remove(temp_path)
                     except: pass
                     return
-            QMessageBox.information(self,"下载完成","准备重启并安装更新")
-            self.parent_main.storage.log("更新下载完成，准备重启")
-            bat_path=os.path.join(os.path.dirname(sys.executable),"update.bat")
-            with open(bat_path,'w') as f:
+            QMessageBox.information(self, "更新完成", 
+                f"新版本 {latest} 已下载并准备替换。\n\n"
+                "请手动关闭本程序，然后双击运行 SecureVault.exe 启动新版本。\n"
+                "（程序将在您点击确定后退出）")
+            bat_path = os.path.join(os.path.dirname(sys.executable), "update.bat")
+            with open(bat_path, 'w') as f:
                 f.write(f"""@echo off
 timeout /t 2 > nul
 copy /Y "{temp_path}" "{sys.executable}"
 del "{temp_path}"
-start "" "{sys.executable}" --updated
 del "%~f0"
 """)
             subprocess.Popen([bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
+            self.parent_main.storage.log("更新替换完成，用户手动启动")
             QApplication.quit()
         except Exception as e:
             QMessageBox.critical(self,"错误",f"更新失败: {e}")
