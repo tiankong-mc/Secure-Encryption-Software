@@ -21,6 +21,7 @@ from ui_utils import protect_window, apply_protection_to_all_windows
 from ui_dialogs import DeleteAuthDialog
 from i18n import tr
 from ui_styles import DARK_STYLE, LIGHT_STYLE
+from ui_settings_style import get_sidebar_qss, get_content_qss
 
 from ui_settings_pages.page_security import SecurityPage
 from ui_settings_pages.page_web import WebPage
@@ -40,21 +41,30 @@ class SettingsDialog(QDialog):
 
         self.setWindowTitle(tr("settings.title"))
         self.setModal(False)
-        self.resize(780, 560)
+        self.resize(820, 580)
 
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 侧边栏（样式在 apply_style 中设置）
+        # 侧边栏
         self.sidebar = QListWidget()
-        self.sidebar.setFixedWidth(160)
+        self.sidebar.setFixedWidth(180)
+        self.sidebar.setFocusPolicy(Qt.NoFocus)
         main_layout.addWidget(self.sidebar)
 
-        # 页面堆叠
+        # 内容区容器
+        self.content_wrapper = QWidget()
+        self.content_wrapper.setObjectName("SettingsPage")
+        wrapper_layout = QVBoxLayout(self.content_wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        wrapper_layout.setSpacing(0)
+
         self.stack = QStackedWidget()
-        self.stack.setStyleSheet("QStackedWidget{background:transparent;}")
-        main_layout.addWidget(self.stack, 1)
+        self.stack.setObjectName("Stack")
+        wrapper_layout.addWidget(self.stack)
+
+        main_layout.addWidget(self.content_wrapper, 1)
 
         # 创建页面
         self.pages = {
@@ -73,6 +83,7 @@ class SettingsDialog(QDialog):
 
         self._build_sidebar()
         self.sidebar.currentRowChanged.connect(self.on_sidebar_changed)
+        self.sidebar.setCurrentRow(0)
 
         # 首次应用样式
         self.apply_style()
@@ -82,22 +93,8 @@ class SettingsDialog(QDialog):
         theme = self.auth.settings_dict.get('theme', '明亮')
         base = DARK_STYLE if theme == "暗黑" else LIGHT_STYLE
         self.setStyleSheet(base)
-        self._update_sidebar_style(theme)
-
-    def _update_sidebar_style(self, theme):
-        if theme == "暗黑":
-            qss = (
-                "QListWidget{border:none;background:#262626;color:#ddd;padding:8px 0;}"
-                "QListWidget::item{padding:10px 16px;}"
-                "QListWidget::item:selected{background:#3a3a3a;color:#fff;}"
-            )
-        else:
-            qss = (
-                "QListWidget{border:none;background:#f3f3f3;color:#333;padding:8px 0;}"
-                "QListWidget::item{padding:10px 16px;}"
-                "QListWidget::item:selected{background:#d9d9d9;color:#000;}"
-            )
-        self.sidebar.setStyleSheet(qss)
+        self.sidebar.setStyleSheet(get_sidebar_qss(theme))
+        self.content_wrapper.setStyleSheet(get_content_qss(theme))
 
     # ---------- 侧边栏 ----------
     def _build_sidebar(self):
@@ -112,8 +109,9 @@ class SettingsDialog(QDialog):
             ('about', 'settings.sidebar.about'),
         ]
         for key, tk in items:
-            item = QListWidgetItem(tr(tk))
+            item = QListWidgetItem("  " + tr(tk))
             item.setData(Qt.UserRole, key)
+            item.setSizeHint(item.sizeHint().__class__(180, 42))
             self.sidebar.addItem(item)
 
     def on_sidebar_changed(self, row):
@@ -164,11 +162,7 @@ class SettingsDialog(QDialog):
     def _verify_identity(self):
         if self.is_recovery_login:
             return True
-        methods = []
-        if self.auth.password_hash: methods.append('password')
-        if self.auth.qa: methods.append('question')
-        if self.auth.totp_secret: methods.append('totp')
-        if self.auth.email_config: methods.append('email')
+        methods = self.auth.get_enabled_methods()
         if not methods:
             QMessageBox.warning(self, tr("common.warning"), "没有可用的验证方式")
             return False
@@ -221,7 +215,8 @@ class SettingsDialog(QDialog):
 
             def export_code():
                 try:
-                    path, _ = QFileDialog.getSaveFileName(self, "保存恢复代码", "recovery_code.txt", "Text Files (*.txt)")
+                    path, _ = QFileDialog.getSaveFileName(
+                        self, "保存恢复代码", "recovery_code.txt", "Text Files (*.txt)")
                     if path:
                         with open(path, 'w') as f:
                             f.write(f"紧急恢复代码：{code}\n\n生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -283,7 +278,6 @@ class SettingsDialog(QDialog):
             exe_dir = os.path.dirname(sys.executable)
             temp_path = os.path.join(exe_dir, "SecureVault_update.exe")
 
-            # 上次失败可能残留，先清理一次以从零开始
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
@@ -313,7 +307,6 @@ class SettingsDialog(QDialog):
             progress.setValue(100)
             progress.close()
 
-            # SHA-256 校验
             if expected_sha:
                 if not updater.verify_sha256(temp_path, expected_sha):
                     QMessageBox.critical(self, tr("common.error"), "SHA-256 校验失败")
@@ -353,6 +346,7 @@ class SettingsDialog(QDialog):
         self.auth.set_password(pw)
         self.storage.log("修改密码")
         QMessageBox.information(self, tr("common.success"), "密码已更新")
+        self._refresh_security_page()
 
     def change_questions(self):
         if not self._verify_identity(): return
@@ -373,6 +367,7 @@ class SettingsDialog(QDialog):
         self.auth.set_questions([(q1.text(), a1.text()), (q2.text(), a2.text()), (q3.text(), a3.text())])
         self.storage.log("修改安全问题")
         QMessageBox.information(self, tr("common.success"), "安全问题已更新")
+        self._refresh_security_page()
 
     def change_totp(self):
         if not self._verify_identity(): return
@@ -401,6 +396,7 @@ class SettingsDialog(QDialog):
                 self.auth.save_totp_secret(temp_secret)
                 self.storage.log("修改 TOTP")
                 QMessageBox.information(self, tr("common.success"), "TOTP 已更新")
+                self._refresh_security_page()
             else:
                 QMessageBox.warning(self, tr("common.error"), "验证码不正确")
 
@@ -437,3 +433,14 @@ class SettingsDialog(QDialog):
         self.auth.save_email_config(smtp.text(), port_i, sender.text(), pwd.text(), recv.text())
         self.storage.log("修改邮箱配置")
         QMessageBox.information(self, tr("common.success"), "邮箱配置已更新")
+        self._refresh_security_page()
+
+    # ---------- 内部辅助 ----------
+    def _refresh_security_page(self):
+        """在修改/新增了某个验证方式后，通知安全页刷新状态。"""
+        page = self.pages.get('security')
+        if page and hasattr(page, 'on_config_changed'):
+            try:
+                page.on_config_changed()
+            except Exception:
+                pass

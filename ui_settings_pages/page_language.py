@@ -1,31 +1,34 @@
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-                              QPushButton, QFileDialog, QMessageBox)
+from PyQt5.QtWidgets import QComboBox, QPushButton, QFileDialog, QMessageBox
 from i18n import tr, get_manager
+from ui_settings_style import (SettingsPage, make_page_title, make_section_title,
+                                make_card, make_hline, make_setting_row)
 
 
-class LanguagePage(QWidget):
+class LanguagePage(SettingsPage):
     def __init__(self, settings_dialog):
         super().__init__()
         self.settings_dialog = settings_dialog
-        layout = QVBoxLayout(self)
-        title = QLabel(tr("language.title"))
-        title.setStyleSheet("font-size: 14pt; font-weight: bold;")
-        layout.addWidget(title)
+        self._codes = []
 
-        row = QHBoxLayout()
-        self.lang_label = QLabel(tr("language.select"))
-        row.addWidget(self.lang_label)
+        self.layout().addWidget(make_page_title(tr("language.title")))
+
+        self.layout().addWidget(make_section_title(tr("language.select")))
+        card, c = make_card()
+
         self.lang_combo = QComboBox()
         self._reload_languages()
         self.lang_combo.currentIndexChanged.connect(self.on_language_changed)
-        row.addWidget(self.lang_combo)
-        row.addStretch()
-        layout.addLayout(row)
+        row, _ = make_setting_row(tr("language.select"), self.lang_combo)
+        c.addWidget(row)
+        c.addWidget(make_hline())
 
         self.import_btn = QPushButton(tr("language.import"))
         self.import_btn.clicked.connect(self.import_pack)
-        layout.addWidget(self.import_btn)
-        layout.addStretch()
+        row2, _ = make_setting_row(tr("language.import"), self.import_btn)
+        c.addWidget(row2)
+
+        self.layout().addWidget(card)
+        self.layout().addStretch()
 
     def _reload_languages(self):
         m = get_manager()
@@ -65,5 +68,4 @@ class LanguagePage(QWidget):
             QMessageBox.warning(self, tr("common.error"), tr("language.import_failed") + str(e))
 
     def retranslate(self):
-        self.lang_label.setText(tr("language.select"))
-        self.import_btn.setText(tr("language.import"))
+        self._reload_languages()

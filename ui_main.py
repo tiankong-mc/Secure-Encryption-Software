@@ -31,6 +31,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.apply_screenshot_protection()
 
+    # ---------- 主题 / 截屏防护 ----------
     def apply_theme(self, theme):
         if theme == "暗黑":
             self.setStyleSheet(DARK_STYLE)
@@ -40,10 +41,12 @@ class MainWindow(QMainWindow):
     def apply_screenshot_protection(self):
         protect_window(self, self.screenshot_protection)
 
+    # ---------- UI ----------
     def initUI(self):
         central = QWidget(); self.setCentralWidget(central)
         main_layout = QHBoxLayout()
 
+        # ===== 左侧标签面板 =====
         left_panel = QWidget(); left_panel.setFixedWidth(200)
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("标签分类"))
@@ -62,6 +65,7 @@ class MainWindow(QMainWindow):
         left_panel.setLayout(left_layout)
         main_layout.addWidget(left_panel)
 
+        # ===== 右侧文件区 =====
         right_panel = QWidget()
         right_layout = QVBoxLayout()
         top_bar = QHBoxLayout()
@@ -77,6 +81,7 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.settings_btn); top_bar.addWidget(self.delete_btn)
         top_bar.addWidget(self.log_btn)
         right_layout.addLayout(top_bar)
+
         self.file_list = QListWidget()
         self.file_list.setDragEnabled(True)
         self.file_list.setAcceptDrops(True)
@@ -87,6 +92,8 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(right_panel)
 
         central.setLayout(main_layout)
+
+        # ===== 信号 =====
         self.upload_btn.clicked.connect(self.upload_file)
         self.import_btn.clicked.connect(self.import_vault_file)
         self.export_btn.clicked.connect(self.export_decrypted_file)
@@ -96,10 +103,12 @@ class MainWindow(QMainWindow):
         self.log_btn.clicked.connect(self.open_log)
         self.setAcceptDrops(True)
 
+    # ---------- 日志窗口 ----------
     def open_log(self):
         dialog = LogDialog(self, self.storage)
-        dialog.show()  # 非模态
+        dialog.show()
 
+    # ---------- 标签 ----------
     def load_tags(self):
         self.tag_list.clear(); self.tag_list.addItem("全部")
         for tag in self.storage.get_all_tags():
@@ -140,6 +149,7 @@ class MainWindow(QMainWindow):
             self.load_tags(); self.load_files()
             self.storage.log(f"删除标签: {tag}")
 
+    # ---------- 拖拽上传 ----------
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -165,6 +175,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"加密失败: {e}")
 
+    # ---------- 文件列表 ----------
     def load_files(self):
         self.file_list.clear()
         entries = self.storage.get_all_entries()
@@ -182,11 +193,15 @@ class MainWindow(QMainWindow):
         if file_path:
             self._do_upload(file_path)
 
+    # ---------- 导入加密文件 ----------
     def import_vault_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择要导入的 .vault 加密文件", "", "Vault Files (*.vault)")
-        if not file_path: return
-        is_advanced = QMessageBox.question(self, "高级文件", "是否标记为高级文件？",
-                                            QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择要导入的 .vault 加密文件", "", "Vault Files (*.vault)")
+        if not file_path:
+            return
+        is_advanced = QMessageBox.question(
+            self, "高级文件", "是否标记为高级文件？",
+            QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
         second_methods = []
         if is_advanced:
             dialog = QDialog(self); dialog.setWindowTitle("选择二次验证方式")
@@ -214,6 +229,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导入失败: {e}")
 
+    # ---------- 导出解密 ----------
     def export_decrypted_file(self):
         current = self.file_list.currentItem()
         if not current:
@@ -222,6 +238,7 @@ class MainWindow(QMainWindow):
         entry = self.storage.get_entry_by_id(entry_id)
         if not entry:
             QMessageBox.warning(self, "错误", "记录不存在"); return
+
         if entry['is_advanced']:
             methods = entry['second_auth_methods']
             if not methods:
@@ -234,8 +251,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "提示", "无可用验证方式"); return
             auth_dialog = DeleteAuthDialog(self, self.auth, avail)
             if auth_dialog.exec_() != QDialog.Accepted: return
-        save_path, _ = QFileDialog.getSaveFileName(self, "导出解密文件", entry['original_name'], "All Files (*.*)")
-        if not save_path: return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "导出解密文件", entry['original_name'], "All Files (*.*)")
+        if not save_path:
+            return
         try:
             data = self.storage.get_file_data(entry_id)
             with open(save_path, 'wb') as f:
@@ -245,30 +265,35 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败: {e}")
 
+    # ---------- 打开文件 ----------
     def open_file(self, item):
         entry_id = item.data(Qt.UserRole)
         entry = self.storage.get_entry_by_id(entry_id)
-        if not entry: return
+        if not entry:
+            return
         if entry['is_advanced']:
             methods = entry['second_auth_methods']
             if not methods:
                 QMessageBox.warning(self, "提示", "未设置二次验证"); return
             auth_dialog = AuthDialog(self, self.auth, methods, entry_id, self.storage)
-            if auth_dialog.exec_() != QDialog.Accepted: return
+            if auth_dialog.exec_() != QDialog.Accepted:
+                return
         try:
             data = self.storage.get_file_data(entry_id)
             viewer = FileViewer(self, data, entry['type'], entry['original_name'])
             viewer.setAttribute(Qt.WA_DeleteOnClose)
-            viewer.show()  # 非模态
+            viewer.show()
             self.storage.log(f"查看文件: {entry['original_name']}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开失败: {e}")
 
+    # ---------- 设置 ----------
     def open_settings(self):
         dialog = SettingsDialog(self, self.auth, self.is_recovery_login)
         dialog.setAttribute(Qt.WA_DeleteOnClose)
-        dialog.show()  # 非模态
+        dialog.show()
 
+    # ---------- 删除文件 ----------
     def delete_file(self):
         current = self.file_list.currentItem()
         if not current:
@@ -279,7 +304,8 @@ class MainWindow(QMainWindow):
         if not avail:
             QMessageBox.warning(self, "提示", "无可用验证方式"); return
         auth_dialog = DeleteAuthDialog(self, self.auth, avail)
-        if auth_dialog.exec_() != QDialog.Accepted: return
+        if auth_dialog.exec_() != QDialog.Accepted:
+            return
         reply = QMessageBox.question(self, "确认删除", "确定永久删除该文件？",
                                       QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
@@ -291,10 +317,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"删除失败: {e}")
 
+    # ---------- 获取已启用的验证方式 ----------
     def _get_available_auth_methods(self):
-        methods = []
-        if self.auth.password_hash: methods.append('password')
-        if self.auth.qa: methods.append('question')
-        if self.auth.totp_secret: methods.append('totp')
-        if self.auth.email_config: methods.append('email')
-        return methods
+        """返回当前已配置且已启用的验证方式。"""
+        return self.auth.get_enabled_methods()

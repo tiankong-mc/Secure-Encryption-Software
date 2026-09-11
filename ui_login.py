@@ -8,7 +8,6 @@ from PyQt5.QtGui import QPixmap
 
 
 class LoginDialog(QDialog):
-    """主登录对话框（已移除5次自毁功能）"""
     def __init__(self, auth_manager, storage):
         super().__init__()
         self.auth = auth_manager
@@ -21,14 +20,21 @@ class LoginDialog(QDialog):
         layout.addWidget(QLabel("请通过以下任一方式验证身份"))
         self.stack = QStackedWidget()
         self.methods = []
-        if self.auth.password_hash:
+
+        enabled = self.auth.get_enabled_methods()
+
+        if 'password' in enabled:
             w = self.create_password_widget(); self.stack.addWidget(w); self.methods.append('password')
-        if self.auth.qa:
+        if 'question' in enabled:
             w = self.create_question_widget(); self.stack.addWidget(w); self.methods.append('question')
-        if self.auth.totp_secret:
+        if 'totp' in enabled:
             w = self.create_totp_widget(); self.stack.addWidget(w); self.methods.append('totp')
-        if self.auth.email_config:
+        if 'email' in enabled:
             w = self.create_email_widget(); self.stack.addWidget(w); self.methods.append('email')
+
+        if not self.methods:
+            QMessageBox.critical(self, "错误", "没有已启用的验证方式，请检查设置。")
+
         layout.addWidget(self.stack)
         self.method_combo = QComboBox()
         self.method_combo.addItems(self.methods)
@@ -45,8 +51,7 @@ class LoginDialog(QDialog):
 
     def recovery_login(self):
         code, ok = QInputDialog.getText(self, "紧急恢复", "请输入紧急恢复代码（格式：XXXX-XXXX-XXXX-XXXX-XXXX）:")
-        if not ok or not code:
-            return
+        if not ok or not code: return
         if self.auth.verify_recovery_code(code):
             self.recovery_accepted = True
             self.accept()
@@ -87,22 +92,24 @@ class LoginDialog(QDialog):
 
     def send_email_code(self):
         self.email_code = self.auth.send_verification_code()
-        if self.email_code:
-            QMessageBox.information(self, "提示", "验证码已发送")
-        else:
-            QMessageBox.warning(self, "错误", "发送失败")
+        if self.email_code: QMessageBox.information(self, "提示", "验证码已发送")
+        else: QMessageBox.warning(self, "错误", "发送失败")
 
     def accept(self):
         if self.recovery_accepted:
             self.storage.log("登录成功 (恢复代码)")
             super().accept()
             return
+        if not self.methods:
+            QMessageBox.critical(self, "错误", "没有可用的验证方式")
+            return
         method = self.method_combo.currentText()
         ok = False
         if method == 'password':
             ok = self.auth.verify_password(self.pw_input.text())
         elif method == 'question':
-            ok = self.auth.verify_question(self.question_combo.currentText(), self.answer_input.text())
+            ok = self.auth.verify_question(self.question_combo.currentText(),
+                                            self.answer_input.text())
         elif method == 'totp':
             ok = self.auth.verify_totp(self.totp_input.text())
         elif method == 'email':
@@ -122,7 +129,7 @@ class LoginDialog(QDialog):
 
 
 class SetupWizard(QWizard):
-    """首次运行设置向导"""
+    """首次运行设置向导（安全问题可跳过）"""
     def __init__(self, auth_manager):
         super().__init__()
         self.auth = auth_manager
@@ -131,18 +138,37 @@ class SetupWizard(QWizard):
         self._build_pages()
 
     def _build_pages(self):
-        p1 = QWizardPage(); p1.setTitle("欢迎"); p1.setSubTitle("配置安全设置以保护您的文件")
-        l = QVBoxLayout(); l.addWidget(QLabel("请依次设置以下安全选项，至少需要配置一种验证方式。")); p1.setLayout(l); self.addPage(p1)
-        p2 = QWizardPage(); p2.setTitle("密码验证"); p2.setSubTitle("（可选）设置登录密码")
+        # 页1：欢迎
+        p1 = QWizardPage()
+        p1.setTitle("欢迎")
+        p1.setSubTitle("配置安全设置以保护您的文件")
         l = QVBoxLayout()
-        self.pw_enable = QCheckBox("启用密码验证"); l.addWidget(self.pw_enable)
+        l.addWidget(QLabel("请依次设置以下安全选项，至少需要配置一种验证方式。"))
+        p1.setLayout(l); self.addPage(p1)
+
+        # 页2：密码（可选）
+        p2 = QWizardPage()
+        p2.setTitle("密码验证")
+        p2.setSubTitle("（可选）设置登录密码")
+        l = QVBoxLayout()
+        self.pw_enable = QCheckBox("启用密码验证")
+        l.addWidget(self.pw_enable)
         self.pw_input = QLineEdit(); self.pw_input.setEchoMode(QLineEdit.Password)
-        self.pw_input.setPlaceholderText("输入密码（至少8位）"); l.addWidget(self.pw_input)
+        self.pw_input.setPlaceholderText("输入密码（至少8位）")
+        l.addWidget(self.pw_input)
         self.pw_confirm = QLineEdit(); self.pw_confirm.setEchoMode(QLineEdit.Password)
-        self.pw_confirm.setPlaceholderText("确认密码"); l.addWidget(self.pw_confirm)
+        self.pw_confirm.setPlaceholderText("确认密码")
+        l.addWidget(self.pw_confirm)
         p2.setLayout(l); self.addPage(p2)
-        p3 = QWizardPage(); p3.setTitle("安全问题"); p3.setSubTitle("设置三个安全问题和答案")
+
+        # 页3：安全问题（可选）
+        p3 = QWizardPage()
+        p3.setTitle("安全问题")
+        p3.setSubTitle("（可选）设置三个安全问题和答案")
         l = QVBoxLayout()
+        self.qa_enable = QCheckBox("启用安全问题")
+        self.qa_enable.setChecked(True)
+        l.addWidget(self.qa_enable)
         self.q1 = QLineEdit(); self.q1.setPlaceholderText("问题1")
         self.a1 = QLineEdit(); self.a1.setEchoMode(QLineEdit.Password); self.a1.setPlaceholderText("答案1")
         self.q2 = QLineEdit(); self.q2.setPlaceholderText("问题2")
@@ -153,25 +179,52 @@ class SetupWizard(QWizard):
         l.addWidget(QLabel("问题2")); l.addWidget(self.q2); l.addWidget(self.a2)
         l.addWidget(QLabel("问题3")); l.addWidget(self.q3); l.addWidget(self.a3)
         p3.setLayout(l); self.addPage(p3)
-        p4 = QWizardPage(); p4.setTitle("TOTP 验证"); p4.setSubTitle("使用 Microsoft Authenticator 等应用扫描二维码")
+
+        # 页4：TOTP
+        p4 = QWizardPage()
+        p4.setTitle("TOTP 验证")
+        p4.setSubTitle("使用 Microsoft Authenticator 等应用扫描二维码")
         l = QVBoxLayout()
-        self.totp_enable = QCheckBox("启用 TOTP"); l.addWidget(self.totp_enable)
-        self.qr_label = QLabel(); self.qr_label.setAlignment(Qt.AlignCenter); l.addWidget(self.qr_label)
-        self.totp_code = QLineEdit(); self.totp_code.setPlaceholderText("输入当前动态码以验证"); l.addWidget(self.totp_code)
-        self.totp_secret_label = QLabel(); l.addWidget(self.totp_secret_label)
-        p4.setLayout(l); self.totp_secret = None; self.totp_setup_done = False; self.addPage(p4)
-        p5 = QWizardPage(); p5.setTitle("邮箱验证"); p5.setSubTitle("配置SMTP发送验证码")
+        self.totp_enable = QCheckBox("启用 TOTP")
+        l.addWidget(self.totp_enable)
+        self.qr_label = QLabel(); self.qr_label.setAlignment(Qt.AlignCenter)
+        l.addWidget(self.qr_label)
+        self.totp_code = QLineEdit(); self.totp_code.setPlaceholderText("输入当前动态码以验证")
+        l.addWidget(self.totp_code)
+        self.totp_secret_label = QLabel()
+        l.addWidget(self.totp_secret_label)
+        p4.setLayout(l)
+        self.totp_secret = None
+        self.totp_setup_done = False
+        self.addPage(p4)
+
+        # 页5：邮箱
+        p5 = QWizardPage()
+        p5.setTitle("邮箱验证")
+        p5.setSubTitle("配置SMTP发送验证码")
         l = QVBoxLayout()
-        self.email_enable = QCheckBox("启用邮箱验证"); l.addWidget(self.email_enable)
-        self.smtp_server = QLineEdit(); self.smtp_server.setPlaceholderText("SMTP服务器 (如 smtp.qq.com)"); l.addWidget(self.smtp_server)
-        self.smtp_port = QLineEdit(); self.smtp_port.setPlaceholderText("端口 (如 587)"); l.addWidget(self.smtp_port)
-        self.sender_email = QLineEdit(); self.sender_email.setPlaceholderText("发件邮箱"); l.addWidget(self.sender_email)
+        self.email_enable = QCheckBox("启用邮箱验证")
+        l.addWidget(self.email_enable)
+        self.smtp_server = QLineEdit(); self.smtp_server.setPlaceholderText("SMTP服务器 (如 smtp.qq.com)")
+        l.addWidget(self.smtp_server)
+        self.smtp_port = QLineEdit(); self.smtp_port.setPlaceholderText("端口 (如 587)")
+        l.addWidget(self.smtp_port)
+        self.sender_email = QLineEdit(); self.sender_email.setPlaceholderText("发件邮箱")
+        l.addWidget(self.sender_email)
         self.sender_password = QLineEdit(); self.sender_password.setEchoMode(QLineEdit.Password)
-        self.sender_password.setPlaceholderText("授权码或密码"); l.addWidget(self.sender_password)
-        self.receiver_email = QLineEdit(); self.receiver_email.setPlaceholderText("收件邮箱（用于接收验证码）"); l.addWidget(self.receiver_email)
+        self.sender_password.setPlaceholderText("授权码或密码")
+        l.addWidget(self.sender_password)
+        self.receiver_email = QLineEdit(); self.receiver_email.setPlaceholderText("收件邮箱（用于接收验证码）")
+        l.addWidget(self.receiver_email)
         p5.setLayout(l); self.addPage(p5)
-        p6 = QWizardPage(); p6.setTitle("完成"); p6.setSubTitle("设置已保存，点击完成启动程序")
-        l = QVBoxLayout(); l.addWidget(QLabel("所有设置将加密存储，请牢记您的安全信息。")); p6.setLayout(l); self.addPage(p6)
+
+        # 页6：完成
+        p6 = QWizardPage()
+        p6.setTitle("完成")
+        p6.setSubTitle("设置已保存，点击完成启动程序")
+        l = QVBoxLayout()
+        l.addWidget(QLabel("所有设置将加密存储，请牢记您的安全信息。"))
+        p6.setLayout(l); self.addPage(p6)
 
     def initializePage(self, id):
         if id == 3:
@@ -184,26 +237,42 @@ class SetupWizard(QWizard):
                 self.totp_setup_done = True
 
     def accept(self):
-        if self.pw_enable.isChecked():
+        # ---------- 密码 ----------
+        pw_enabled = self.pw_enable.isChecked()
+        if pw_enabled:
             pw = self.pw_input.text()
             if len(pw) < 8:
                 QMessageBox.warning(self, "错误", "密码长度至少8位"); return
             if pw != self.pw_confirm.text():
                 QMessageBox.warning(self, "错误", "两次密码输入不一致"); return
             self.auth.set_password(pw)
-        qa_list = []
-        for q, a in [(self.q1.text(), self.a1.text()), (self.q2.text(), self.a2.text()), (self.q3.text(), self.a3.text())]:
-            if not q or not a:
-                QMessageBox.warning(self, "错误", "请完整填写所有安全问题和答案"); return
-            qa_list.append((q, a))
-        self.auth.set_questions(qa_list)
-        if self.totp_enable.isChecked():
+
+        # ---------- 安全问题（可跳过） ----------
+        qa_enabled = self.qa_enable.isChecked()
+        if qa_enabled:
+            qa_list = []
+            for q, a in [(self.q1.text(), self.a1.text()),
+                         (self.q2.text(), self.a2.text()),
+                         (self.q3.text(), self.a3.text())]:
+                if not q or not a:
+                    QMessageBox.warning(self, "错误", "请完整填写所有安全问题和答案"); return
+                qa_list.append((q, a))
+            self.auth.set_questions(qa_list)
+
+        # ---------- TOTP ----------
+        totp_enabled = self.totp_enable.isChecked()
+        if totp_enabled:
             code = self.totp_code.text()
             if not self.auth.verify_totp(code):
                 QMessageBox.warning(self, "错误", "TOTP验证码不正确，请重新输入"); return
         else:
+            # 取消勾选：删除配置，并移除启用标记
             self.auth.settings_dict.pop('totp_secret', None)
-        if self.email_enable.isChecked():
+            self.auth.totp_secret = None
+
+        # ---------- 邮箱 ----------
+        email_enabled = self.email_enable.isChecked()
+        if email_enabled:
             server = self.smtp_server.text()
             try:
                 port = int(self.smtp_port.text())
@@ -212,17 +281,36 @@ class SetupWizard(QWizard):
             sender = self.sender_email.text()
             pw = self.sender_password.text()
             receiver = self.receiver_email.text()
-            if not all([server, port, sender, pw, receiver]):
+            if not all([server, sender, pw, receiver]):
                 QMessageBox.warning(self, "错误", "请完整填写邮箱配置"); return
             self.auth.set_email_config(server, port, sender, pw, receiver)
             code = self.auth.send_verification_code(receiver)
             if not code:
                 QMessageBox.warning(self, "错误", "邮箱配置测试失败，请检查设置"); return
-            verify_code, ok = QInputDialog.getText(self, "验证邮箱", f"输入发送到 {receiver} 的验证码")
+            verify_code, ok = QInputDialog.getText(self, "验证邮箱",
+                                                    f"输入发送到 {receiver} 的验证码")
             if not ok or verify_code != code:
                 QMessageBox.warning(self, "错误", "验证码错误"); return
         else:
             self.auth.email_config = {}
+            self.auth.settings_dict.pop('email', None)
+
+        # ---------- 至少一种验证方式 ----------
+        # 重新加载状态
+        self.auth._init_auth_data()
+        configured = self.auth.get_configured_methods()
+        if not configured:
+            QMessageBox.warning(self, "错误", "至少需要配置一种验证方式。")
+            return
+
+        # 记录每个方法的启用状态
+        enabled_map = {}
+        if pw_enabled: enabled_map['password'] = True
+        if qa_enabled: enabled_map['question'] = True
+        if totp_enabled: enabled_map['totp'] = True
+        if email_enabled: enabled_map['email'] = True
+        self.auth.settings_dict['method_enabled'] = enabled_map
+
         self.auth.settings_dict['initialized'] = True
         self.auth._save()
         super().accept()

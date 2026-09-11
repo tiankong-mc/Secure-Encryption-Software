@@ -2,6 +2,7 @@ import bcrypt, pyotp, qrcode, smtplib, random, string, base64, os
 from io import BytesIO
 from email.mime.text import MIMEText
 
+
 class AuthManager:
     def __init__(self, settings_manager):
         self.settings = settings_manager
@@ -17,37 +18,80 @@ class AuthManager:
         self.initialized = self.settings_dict.get('initialized', False)
         self.recovery_code_encrypted_b64 = self.settings_dict.get('recovery_code_encrypted_b64', None)
         self.recovery_code_used = self.settings_dict.get('recovery_code_used', True)
+        self.method_enabled = self.settings_dict.get('method_enabled', {})
 
     def _save(self):
         self.settings.save_settings(self.settings_dict)
 
-    # ---------- 密码 ----------
+    # ================= 启用状态管理 =================
+    def get_configured_methods(self):
+        result = []
+        if self.password_hash: result.append('password')
+        if self.qa: result.append('question')
+        if self.totp_secret: result.append('totp')
+        if self.email_config: result.append('email')
+        return result
+
+    def is_method_enabled(self, name):
+        return self.settings_dict.get('method_enabled', {}).get(name, True)
+
+    def get_enabled_methods(self):
+        enabled = self.settings_dict.get('method_enabled', {})
+        result = []
+        if self.password_hash and enabled.get('password', True):
+            result.append('password')
+        if self.qa and enabled.get('question', True):
+            result.append('question')
+        if self.totp_secret and enabled.get('totp', True):
+            result.append('totp')
+        if self.email_config and enabled.get('email', True):
+            result.append('email')
+        return result
+
+    def set_method_enabled(self, name, value):
+        """返回 True 表示成功，False 表示拒绝（不能禁用最后一个）。"""
+        enabled = dict(self.settings_dict.get('method_enabled', {}))
+        enabled[name] = value
+        # 检查是否至少还有一个启用
+        configured = self.get_configured_methods()
+        active = [m for m in configured if enabled.get(m, True)]
+        if not active:
+            return False
+        self.settings_dict['method_enabled'] = enabled
+        self._save()
+        return True
+
+    # ================= 密码 =================
     def set_password(self, password):
         self.password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         self.settings_dict['password_hash'] = self.password_hash
         self._save()
 
     def verify_password(self, password):
-        if not self.password_hash:
-            return False
+        if not self.password_hash: return False
         return bcrypt.checkpw(password.encode(), self.password_hash.encode())
 
-    # ---------- 安全问题 ----------
+    # ================= 安全问题 =================
     def set_questions(self, qa_list):
+        self.qa = {}
         for q, a in qa_list:
             self.qa[q] = bcrypt.hashpw(a.encode(), bcrypt.gensalt()).decode()
         self.settings_dict['qa'] = self.qa
         self._save()
 
     def verify_question(self, question, answer):
-        if question not in self.qa:
-            return False
+        if question not in self.qa: return False
         return bcrypt.checkpw(answer.encode(), self.qa[question].encode())
 
     def get_questions(self):
         return list(self.qa.keys())
 
-    # ---------- TOTP ----------
+    def clear_questions(self):
+        self.qa = {}
+        self.settings_dict['qa'] = {}
+        self._save()
+
+    # ================= TOTP =================
     def setup_totp(self):
         self.totp_secret = pyotp.random_base32()
         self.settings_dict['totp_secret'] = self.totp_secret
@@ -60,32 +104,26 @@ class AuthManager:
         return buf.getvalue()
 
     def verify_totp(self, code):
-        if not self.totp_secret:
-            return False
-        totp = pyotp.TOTP(self.totp_secret)
-        return totp.verify(code)
+        if not self.totp_secret: return False
+        return pyotp.TOTP(self.totp_secret).verify(code)
 
     def generate_totp_secret(self):
-        """生成临时 TOTP 密钥（不保存）"""
         return pyotp.random_base32()
 
     def verify_totp_secret(self, secret, code):
-        totp = pyotp.TOTP(secret)
-        return totp.verify(code)
+        return pyotp.TOTP(secret).verify(code)
 
     def save_totp_secret(self, secret):
         self.totp_secret = secret
         self.settings_dict['totp_secret'] = secret
         self._save()
 
-    # ---------- 邮箱验证码 ----------
+    # ================= 邮箱 =================
     def set_email_config(self, smtp_server, port, sender_email, password, receiver_email):
         self.email_config = {
-            'smtp_server': smtp_server,
-            'port': port,
-            'sender_email': sender_email,
-            'password': password,
-            'receiver_email': receiver_email
+            'smtp_server': smtp_server, 'port': port,
+            'sender_email': sender_email, 'password': password,
+            'receiver_email': receiver_email,
         }
         self.settings_dict['email'] = self.email_config
         self._save()
@@ -93,8 +131,7 @@ class AuthManager:
     def send_verification_code(self, to_email=None):
         if not to_email:
             to_email = self.email_config.get('receiver_email')
-        if not to_email:
-            return None
+        if not to_email: return None
         code = str(random.randint(100000, 999999))
         msg = MIMEText(f'您的SecureVault验证码是：{code}')
         msg['Subject'] = 'SecureVault验证码'
@@ -112,7 +149,6 @@ class AuthManager:
             return None
 
     def test_email_config(self, smtp_server, port, sender_email, password, receiver_email):
-        """测试邮箱配置是否可用，不保存"""
         try:
             server = smtplib.SMTP(smtp_server, port)
             server.starttls()
@@ -133,17 +169,9 @@ class AuthManager:
             return False, str(e)
 
     def save_email_config(self, smtp_server, port, sender_email, password, receiver_email):
-        self.email_config = {
-            'smtp_server': smtp_server,
-            'port': port,
-            'sender_email': sender_email,
-            'password': password,
-            'receiver_email': receiver_email
-        }
-        self.settings_dict['email'] = self.email_config
-        self._save()
+        self.set_email_config(smtp_server, port, sender_email, password, receiver_email)
 
-    # ---------- 失败计数 ----------
+    # ================= 失败计数 =================
     def increment_fail_count(self):
         self.fail_count += 1
         self.settings_dict['fail_count'] = self.fail_count
@@ -155,7 +183,7 @@ class AuthManager:
         self.settings_dict['fail_count'] = 0
         self._save()
 
-    # ---------- 紧急恢复代码 ----------
+    # ================= 恢复代码 =================
     def generate_recovery_code(self):
         chars = string.ascii_uppercase + string.digits
         raw = ''.join(random.choice(chars) for _ in range(20))
@@ -170,11 +198,8 @@ class AuthManager:
 
     def verify_recovery_code(self, input_code):
         encrypted_b64 = self.settings_dict.get('recovery_code_encrypted_b64')
-        if not encrypted_b64:
-            return False
-        used = self.settings_dict.get('recovery_code_used', True)
-        if used:
-            return False
+        if not encrypted_b64: return False
+        if self.settings_dict.get('recovery_code_used', True): return False
         try:
             encrypted = base64.b64decode(encrypted_b64)
             stored_code = self.settings.dpapi.unprotect(encrypted).decode()
@@ -189,11 +214,9 @@ class AuthManager:
 
     def _send_recovery_email(self, generated=True):
         smtp_config = self.email_config
-        if not smtp_config:
-            return
+        if not smtp_config: return
         to_email = smtp_config.get('receiver_email')
-        if not to_email:
-            return
+        if not to_email: return
         if generated:
             subject = '紧急恢复代码已生成'
             body = '您的SecureVault紧急恢复代码已生成，旧代码已失效。\n\n请登录软件，在“设置”中查看并妥善保管新的紧急恢复代码。'
@@ -215,7 +238,5 @@ class AuthManager:
 
     def is_recovery_code_available(self):
         encrypted_b64 = self.settings_dict.get('recovery_code_encrypted_b64')
-        if not encrypted_b64:
-            return False
-        used = self.settings_dict.get('recovery_code_used', True)
-        return not used
+        if not encrypted_b64: return False
+        return not self.settings_dict.get('recovery_code_used', True)
