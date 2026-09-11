@@ -1,1 +1,1 @@
-python -m PyInstaller --onefile --windowed --name Encryption --icon=myicon_1.ico main.py
+python -m PyInstaller --onefile --windowed --name Encryption --icon=myicon_1.ico --add-data "lang;lang" main.py

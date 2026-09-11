@@ -1,0 +1,71 @@
+{
+  "language_name": "简体中文",
+  "language_code": "zh_CN",
+  "translations": {
+    "settings.title": "设置",
+    "settings.sidebar.security": "安全",
+    "settings.sidebar.web": "网页端",
+    "settings.sidebar.appearance": "个性化",
+    "settings.sidebar.language": "语言",
+    "settings.sidebar.feedback": "反馈",
+    "settings.sidebar.update": "检查更新",
+    "settings.sidebar.about": "关于",
+
+    "security.locked_hint": "为了保证安全请验证身份后设置",
+    "security.verify_button": "验证",
+    "security.title": "安全设置",
+    "security.password": "修改密码",
+    "security.questions": "修改安全问题",
+    "security.totp": "修改 TOTP 设置",
+    "security.email": "修改邮箱配置",
+    "security.recovery": "生成紧急恢复代码",
+    "security.screenshot": "截屏保护",
+    "security.log": "日志记录",
+
+    "web.title": "网页端",
+    "web.status": "状态：",
+    "web.status_running": "运行中",
+    "web.status_stopped": "未启动",
+    "web.start": "启动",
+    "web.stop": "停止",
+    "web.url": "网址：",
+    "web.url_none": "无",
+    "web.qr_hint": "手机扫码访问",
+    "web.http_warning": "⚠️ Web服务使用明文HTTP，仅限可信局域网，公共网络下请勿启用。",
+
+    "appearance.title": "个性化",
+    "appearance.theme": "主题",
+    "appearance.theme_light": "明亮",
+    "appearance.theme_dark": "暗黑",
+
+    "language.title": "语言",
+    "language.select": "选择语言",
+    "language.import": "导入语言包",
+    "language.import_success": "语言包已导入：",
+    "language.import_failed": "导入失败：",
+    "language.restart_tip": "已切换语言，部分界面将在下次启动时更新。",
+
+    "update.title": "检查更新",
+    "update.current": "当前版本",
+    "update.check": "检查更新",
+    "update.checking": "检查中...",
+    "update.up_to_date": "已是最新版本",
+    "update.new_available": "发现新版本",
+    "update.download": "下载并更新",
+
+    "about.title": "关于",
+
+    "feedback.vpn_tip": "如果打不开请使用 VPN 或加速器，确认后将打开浏览器。",
+    "feedback.opening": "正在打开 GitHub Issues 页面...",
+
+    "common.ok": "确定",
+    "common.cancel": "取消",
+    "common.close": "关闭",
+    "common.yes": "是",
+    "common.no": "否",
+    "common.success": "成功",
+    "common.error": "错误",
+    "common.warning": "警告",
+    "common.info": "提示"
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "language_name": "日本語",
+  "language_code": "ja_JP",
+  "translations": {
+    "settings.title": "設定",
+    "settings.sidebar.security": "セキュリティ",
+    "settings.sidebar.web": "ウェブ",
+    "settings.sidebar.appearance": "外観",
+    "settings.sidebar.language": "言語",
+    "settings.sidebar.feedback": "フィードバック",
+    "settings.sidebar.update": "更新確認",
+    "settings.sidebar.about": "情報",
+
+    "security.locked_hint": "セキュリティのため本人確認をしてください",
+    "security.verify_button": "認証",
+    "security.title": "セキュリティ設定",
+    "security.password": "パスワード変更",
+    "security.questions": "秘密の質問変更",
+    "security.totp": "TOTP変更",
+    "security.email": "メール設定変更",
+    "security.recovery": "緊急復旧コード生成",
+    "security.screenshot": "スクリーンショット保護",
+    "security.log": "ログ記録",
+
+    "web.title": "ウェブ",
+    "web.status": "状態：",
+    "web.status_running": "実行中",
+    "web.status_stopped": "停止中",
+    "web.start": "開始",
+    "web.stop": "停止",
+    "web.url": "URL：",
+    "web.url_none": "なし",
+    "web.qr_hint": "QRコードをスキャン",
+    "web.http_warning": "⚠️ 平文HTTPを使用しています。信頼できるLANでのみ使用してください。",
+
+    "appearance.title": "外観",
+    "appearance.theme": "テーマ",
+    "appearance.theme_light": "ライト",
+    "appearance.theme_dark": "ダーク",
+
+    "language.title": "言語",
+    "language.select": "言語を選択",
+    "language.import": "言語パックをインポート",
+    "language.import_success": "言語パックをインポートしました：",
+    "language.import_failed": "インポート失敗：",
+    "language.restart_tip": "言語を変更しました。次回起動時に反映されます。",
+
+    "update.title": "更新確認",
+    "update.current": "現在のバージョン",
+    "update.check": "更新を確認",
+    "update.checking": "確認中...",
+    "update.up_to_date": "最新版です",
+    "update.new_available": "新しいバージョンがあります",
+    "update.download": "ダウンロードして更新",
+
+    "about.title": "情報",
+
+    "feedback.vpn_tip": "開けない場合はVPNをご利用ください。",
+    "feedback.opening": "GitHub Issuesを開いています...",
+
+    "common.ok": "OK",
+    "common.cancel": "キャンセル",
+    "common.close": "閉じる",
+    "common.yes": "はい",
+    "common.no": "いいえ",
+    "common.success": "成功",
+    "common.error": "エラー",
+    "common.warning": "警告",
+    "common.info": "情報"
+  }
+}

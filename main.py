@@ -7,7 +7,7 @@ from auth import AuthManager
 from settings import SettingsManager
 from backup import BackupManager
 
-VERSION = "v2.4.5"
+VERSION = "v2.4.6"
 
 def main():
     # 检查是否为更新后首次启动

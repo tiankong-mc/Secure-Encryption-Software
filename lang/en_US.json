@@ -1,0 +1,71 @@
+{
+  "language_name": "English",
+  "language_code": "en_US",
+  "translations": {
+    "settings.title": "Settings",
+    "settings.sidebar.security": "Security",
+    "settings.sidebar.web": "Web",
+    "settings.sidebar.appearance": "Appearance",
+    "settings.sidebar.language": "Language",
+    "settings.sidebar.feedback": "Feedback",
+    "settings.sidebar.update": "Update",
+    "settings.sidebar.about": "About",
+
+    "security.locked_hint": "For security, please verify your identity",
+    "security.verify_button": "Verify",
+    "security.title": "Security Settings",
+    "security.password": "Change Password",
+    "security.questions": "Change Security Questions",
+    "security.totp": "Change TOTP",
+    "security.email": "Change Email Config",
+    "security.recovery": "Generate Recovery Code",
+    "security.screenshot": "Screenshot Protection",
+    "security.log": "Logging",
+
+    "web.title": "Web",
+    "web.status": "Status: ",
+    "web.status_running": "Running",
+    "web.status_stopped": "Stopped",
+    "web.start": "Start",
+    "web.stop": "Stop",
+    "web.url": "URL: ",
+    "web.url_none": "N/A",
+    "web.qr_hint": "Scan the QR code",
+    "web.http_warning": "⚠️ Web uses plain HTTP. Use only on trusted LAN.",
+
+    "appearance.title": "Appearance",
+    "appearance.theme": "Theme",
+    "appearance.theme_light": "Light",
+    "appearance.theme_dark": "Dark",
+
+    "language.title": "Language",
+    "language.select": "Select Language",
+    "language.import": "Import Language Pack",
+    "language.import_success": "Language pack imported: ",
+    "language.import_failed": "Import failed: ",
+    "language.restart_tip": "Language changed. Some interfaces update on next start.",
+
+    "update.title": "Update",
+    "update.current": "Current Version",
+    "update.check": "Check for Updates",
+    "update.checking": "Checking...",
+    "update.up_to_date": "Up to date",
+    "update.new_available": "New version available",
+    "update.download": "Download and Update",
+
+    "about.title": "About",
+
+    "feedback.vpn_tip": "If it doesn't open, please use a VPN. Confirm to continue.",
+    "feedback.opening": "Opening GitHub Issues page...",
+
+    "common.ok": "OK",
+    "common.cancel": "Cancel",
+    "common.close": "Close",
+    "common.yes": "Yes",
+    "common.no": "No",
+    "common.success": "Success",
+    "common.error": "Error",
+    "common.warning": "Warning",
+    "common.info": "Info"
+  }
+}
