@@ -143,7 +143,6 @@ class SettingsDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # 无论开启还是关闭，都同步一次当前设置窗口的截屏保护状态
         enabled = getattr(self.parent_main, 'screenshot_protection', False)
         protect_window(self, enabled)
 
@@ -180,7 +179,7 @@ class SettingsDialog(QDialog):
     def on_theme_changed(self, theme):
         self.auth.settings_dict['theme'] = theme
         self.auth._save()
-        self.apply_style()  # 更新设置窗口 + 侧边栏样式
+        self.apply_style()
         if self.parent_main:
             self.parent_main.apply_theme(theme)
             self.storage.log(f"切换主题为: {theme}")
@@ -193,7 +192,6 @@ class SettingsDialog(QDialog):
             self.parent_main.screenshot_protection = enabled
             self.parent_main.apply_screenshot_protection()
             self.storage.log(f"截屏保护: {'启用' if enabled else '禁用'}")
-        # 同步更新所有已打开的窗口（设置窗口、预览窗口等）
         apply_protection_to_all_windows(enabled)
 
     def toggle_log(self, state):
@@ -241,24 +239,18 @@ class SettingsDialog(QDialog):
 
     # ---------- 检查更新 ----------
     def check_update(self):
+        import updater
+
         update_page = self.pages.get('update')
         if update_page:
             update_page.set_result(tr("update.checking"), "#888888")
         QApplication.processEvents()
 
         try:
-            headers = {'User-Agent': 'SecureVault'}
-            resp = requests.get(
-                "https://api.github.com/repos/tiankong-mc/Secure-Encryption-Software/releases/latest",
-                timeout=10, headers=headers, verify=False)
-            if resp.status_code != 200:
-                if update_page:
-                    update_page.set_result(f"{tr('common.error')}: HTTP {resp.status_code}", "#ff4444")
-                return
-            data = resp.json()
+            data = updater.get_latest_release(timeout=15)
             latest = data.get('tag_name', '')
             self.storage.log(f"检查更新: 当前{VERSION}, 远程{latest}")
-            if parse_version(latest) > parse_version(VERSION):
+            if updater.is_newer(latest):
                 if update_page:
                     update_page.set_result(f"{tr('update.new_available')}: {latest}", "#5a8cbf")
                 ret = QMessageBox.question(
@@ -275,61 +267,76 @@ class SettingsDialog(QDialog):
                 update_page.set_result(f"{tr('common.error')}: {e}", "#ff4444")
 
     def download_update(self, data):
+        import updater
+        import subprocess as sp
+
         try:
             latest = data.get('tag_name', '')
+            asset = updater.find_exe_asset(data)
+            if not asset:
+                QMessageBox.warning(self, tr("common.error"), "未找到可执行文件")
+                return
+            url = asset['browser_download_url']
+            expected_sha = updater.extract_sha256(data)
+
             self.storage.log(f"开始下载更新: {latest}")
-            assets = data.get('assets', []); exe_asset = None
-            for a in assets:
-                if a.get('name', '').lower() == 'encryption.exe':
-                    exe_asset = a; break
-            if not exe_asset:
-                QMessageBox.warning(self, tr("common.error"), "未找到可执行文件"); return
-            url = exe_asset['browser_download_url']
+            exe_dir = os.path.dirname(sys.executable)
+            temp_path = os.path.join(exe_dir, "SecureVault_update.exe")
+
+            # 上次失败可能残留，先清理一次以从零开始
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
             progress = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
-            progress.setWindowModality(Qt.WindowModal); progress.show()
-            response = requests.get(url, stream=True, verify=False)
-            total_size = int(response.headers.get('content-length', 0))
-            block_size = 8192
-            temp_path = os.path.join(os.path.dirname(sys.executable), "SecureVault_update.exe")
-            sha256 = hashlib.sha256()
-            with open(temp_path, 'wb') as f:
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=block_size):
-                    if chunk:
-                        f.write(chunk); downloaded += len(chunk)
-                        sha256.update(chunk)
-                        if total_size:
-                            progress.setValue(int(downloaded / total_size * 100))
-                        QApplication.processEvents()
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+
+            def on_progress(done, total):
+                if total:
+                    progress.setValue(int(done / total * 100))
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    raise KeyboardInterrupt
+
+            try:
+                updater.download_file(url, temp_path, progress_callback=on_progress)
+            except KeyboardInterrupt:
+                try: os.remove(temp_path)
+                except: pass
+                progress.close()
+                QMessageBox.information(self, tr("common.info"), "已取消下载")
+                return
+
             progress.setValue(100)
-            body = data.get('body', '')
-            match = re.search(r'sha256[:\s]*([a-fA-F0-9]{64})', body)
-            if match:
-                if sha256.hexdigest().lower() != match.group(1).lower():
+            progress.close()
+
+            # SHA-256 校验
+            if expected_sha:
+                if not updater.verify_sha256(temp_path, expected_sha):
                     QMessageBox.critical(self, tr("common.error"), "SHA-256 校验失败")
                     try: os.remove(temp_path)
                     except: pass
                     return
             else:
-                if QMessageBox.question(self, tr("common.warning"), "未提供 SHA-256，继续？",
+                if QMessageBox.question(self, tr("common.warning"),
+                                        "未提供 SHA-256，继续？",
                                         QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
                     try: os.remove(temp_path)
                     except: pass
                     return
+
             QMessageBox.information(self, "更新完成",
                 f"新版本 {latest} 已下载并准备替换。\n\n"
                 "请手动关闭本程序，然后双击运行 SecureVault.exe 启动新版本。")
-            bat_path = os.path.join(os.path.dirname(sys.executable), "update.bat")
-            with open(bat_path, 'w') as f:
-                f.write(f"""@echo off
-timeout /t 2 > nul
-copy /Y "{temp_path}" "{sys.executable}"
-del "{temp_path}"
-del "%~f0"
-""")
-            subprocess.Popen([bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+            bat_path = updater.write_update_bat(exe_dir, temp_path, sys.executable)
+            sp.Popen([bat_path], creationflags=sp.CREATE_NEW_CONSOLE)
             self.storage.log("更新替换完成，用户手动启动")
             QApplication.quit()
+
         except Exception as e:
             QMessageBox.critical(self, tr("common.error"), f"更新失败: {e}")
 
