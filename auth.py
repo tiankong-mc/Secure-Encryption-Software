@@ -1,4 +1,4 @@
-import bcrypt, pyotp, qrcode, smtplib, random, string, base64, os
+import bcrypt, pyotp, qrcode, smtplib, secrets, string, base64, hmac
 from io import BytesIO
 from email.mime.text import MIMEText
 
@@ -132,17 +132,16 @@ class AuthManager:
         if not to_email:
             to_email = self.email_config.get('receiver_email')
         if not to_email: return None
-        code = str(random.randint(100000, 999999))
+        code = ''.join(secrets.choice(string.digits) for _ in range(6))
         msg = MIMEText(f'您的SecureVault验证码是：{code}')
         msg['Subject'] = 'SecureVault验证码'
         msg['From'] = self.email_config['sender_email']
         msg['To'] = to_email
         try:
-            server = smtplib.SMTP(self.email_config['smtp_server'], self.email_config['port'])
-            server.starttls()
-            server.login(self.email_config['sender_email'], self.email_config['password'])
-            server.sendmail(self.email_config['sender_email'], [to_email], msg.as_string())
-            server.quit()
+            with smtplib.SMTP(self.email_config['smtp_server'], self.email_config['port'], timeout=20) as server:
+                server.starttls()
+                server.login(self.email_config['sender_email'], self.email_config['password'])
+                server.sendmail(self.email_config['sender_email'], [to_email], msg.as_string())
             return code
         except Exception as e:
             print(f"邮件发送失败: {e}")
@@ -150,20 +149,15 @@ class AuthManager:
 
     def test_email_config(self, smtp_server, port, sender_email, password, receiver_email):
         try:
-            server = smtplib.SMTP(smtp_server, port)
-            server.starttls()
-            server.login(sender_email, password)
-            server.quit()
-            code = ''.join(random.choices('0123456789', k=6))
+            code = ''.join(secrets.choice(string.digits) for _ in range(6))
             msg = MIMEText(f'测试邮件，验证码：{code}')
             msg['Subject'] = 'SecureVault 邮箱配置测试'
             msg['From'] = sender_email
             msg['To'] = receiver_email
-            server = smtplib.SMTP(smtp_server, port)
-            server.starttls()
-            server.login(sender_email, password)
-            server.sendmail(sender_email, [receiver_email], msg.as_string())
-            server.quit()
+            with smtplib.SMTP(smtp_server, port, timeout=20) as server:
+                server.starttls()
+                server.login(sender_email, password)
+                server.sendmail(sender_email, [receiver_email], msg.as_string())
             return True, code
         except Exception as e:
             return False, str(e)
@@ -186,7 +180,7 @@ class AuthManager:
     # ================= 恢复代码 =================
     def generate_recovery_code(self):
         chars = string.ascii_uppercase + string.digits
-        raw = ''.join(random.choice(chars) for _ in range(20))
+        raw = ''.join(secrets.choice(chars) for _ in range(20))
         formatted = '-'.join(raw[i:i+4] for i in range(0, 20, 4))
         encrypted = self.settings.dpapi.protect(formatted.encode())
         encrypted_b64 = base64.b64encode(encrypted).decode()
@@ -201,11 +195,12 @@ class AuthManager:
         if not encrypted_b64: return False
         if self.settings_dict.get('recovery_code_used', True): return False
         try:
-            encrypted = base64.b64decode(encrypted_b64)
+            encrypted = base64.b64decode(encrypted_b64, validate=True)
             stored_code = self.settings.dpapi.unprotect(encrypted).decode()
         except Exception:
             return False
-        if stored_code == input_code:
+        normalized = input_code.strip().upper()
+        if hmac.compare_digest(stored_code, normalized):
             self.settings_dict['recovery_code_used'] = True
             self._save()
             self._send_recovery_email(generated=False)
@@ -228,11 +223,10 @@ class AuthManager:
         msg['From'] = smtp_config['sender_email']
         msg['To'] = to_email
         try:
-            server = smtplib.SMTP(smtp_config['smtp_server'], smtp_config['port'])
-            server.starttls()
-            server.login(smtp_config['sender_email'], smtp_config['password'])
-            server.sendmail(smtp_config['sender_email'], [to_email], msg.as_string())
-            server.quit()
+            with smtplib.SMTP(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
+                server.starttls()
+                server.login(smtp_config['sender_email'], smtp_config['password'])
+                server.sendmail(smtp_config['sender_email'], [to_email], msg.as_string())
         except Exception as e:
             print(f"紧急恢复邮件发送失败: {e}")
 

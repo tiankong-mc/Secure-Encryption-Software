@@ -50,6 +50,8 @@ class LanguagePage(SettingsPage):
         m = get_manager()
         if m and code != m.current_code:
             m.load(code)
+            self.settings_dialog.auth.settings_dict['language'] = code
+            self.settings_dialog.auth._save()
             self.settings_dialog.storage.log(f"切换语言为: {code}")
             QMessageBox.information(self, tr("common.info"), tr("language.restart_tip"))
             self.settings_dialog.retranslate_all()

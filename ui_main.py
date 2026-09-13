@@ -208,6 +208,11 @@ class MainWindow(QMainWindow):
             layout = QVBoxLayout()
             cb_totp = QCheckBox("TOTP"); cb_email = QCheckBox("邮箱")
             cb_question = QCheckBox("问题"); cb_password = QCheckBox("密码")
+            enabled = set(self._get_available_auth_methods())
+            for method, checkbox in (
+                    ('totp', cb_totp), ('email', cb_email),
+                    ('question', cb_question), ('password', cb_password)):
+                checkbox.setEnabled(method in enabled)
             layout.addWidget(cb_totp); layout.addWidget(cb_email)
             layout.addWidget(cb_question); layout.addWidget(cb_password)
             btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -240,7 +245,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "错误", "记录不存在"); return
 
         if entry['is_advanced']:
-            methods = entry['second_auth_methods']
+            methods = self._get_entry_auth_methods(entry)
             if not methods:
                 QMessageBox.warning(self, "提示", "未设置二次验证"); return
             auth_dialog = AuthDialog(self, self.auth, methods, entry_id, self.storage)
@@ -272,7 +277,7 @@ class MainWindow(QMainWindow):
         if not entry:
             return
         if entry['is_advanced']:
-            methods = entry['second_auth_methods']
+            methods = self._get_entry_auth_methods(entry)
             if not methods:
                 QMessageBox.warning(self, "提示", "未设置二次验证"); return
             auth_dialog = AuthDialog(self, self.auth, methods, entry_id, self.storage)
@@ -321,3 +326,8 @@ class MainWindow(QMainWindow):
     def _get_available_auth_methods(self):
         """返回当前已配置且已启用的验证方式。"""
         return self.auth.get_enabled_methods()
+
+    def _get_entry_auth_methods(self, entry):
+        """只返回文件允许且当前仍启用的二次验证方式。"""
+        enabled = set(self._get_available_auth_methods())
+        return [m for m in entry.get('second_auth_methods', []) if m in enabled]

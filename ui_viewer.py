@@ -101,7 +101,7 @@ class FileViewer(QDialog):
                 elif ext in ['.pdf']:
                     pdf_reader = PyPDF2.PdfReader(BytesIO(data))
                     for page in pdf_reader.pages:
-                        text_content += page.extract_text() + "\n"
+                        text_content += (page.extract_text() or "") + "\n"
                 else:
                     text_content = "此文档格式暂不支持预览"
             except Exception as e:

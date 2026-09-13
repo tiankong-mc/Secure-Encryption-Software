@@ -51,7 +51,7 @@ class SecurityPage(SettingsPage):
             self.stack.setCurrentIndex(1)
 
     # ============================================================
-    #  解锁视图构建（可被 on_config_changed 重新调用）
+    #  解锁视图
     # ============================================================
     def _build_unlocked_view(self):
         unlocked = QWidget()
@@ -66,14 +66,13 @@ class SecurityPage(SettingsPage):
         card1, c1 = make_card()
 
         self.method_rows = {}
-        ordered = ['password', 'question', 'totp', 'email']
-        for i, key in enumerate(ordered):
+        for i, key in enumerate(['password', 'question', 'totp', 'email']):
             row = self._build_method_row(key)
             self.method_rows[key] = row
             c1.addWidget(row)
             c1.addWidget(make_hline())
 
-        # 紧急恢复代码（独立行，不参与启用开关）
+        # 紧急恢复代码
         recovery_row = QWidget()
         rl = QHBoxLayout(recovery_row)
         rl.setContentsMargins(10, 8, 10, 8)
@@ -84,12 +83,15 @@ class SecurityPage(SettingsPage):
         recovery_btn.clicked.connect(self.settings_dialog.generate_recovery)
         rl.addWidget(recovery_btn)
         c1.addWidget(recovery_row)
-
         ul.addWidget(card1)
 
-        # ---------- 防护与日志 ----------
+        # ---------- 存储位置 ----------
+        ul.addWidget(make_section_title("存储位置"))
+        ul.addWidget(self._build_storage_card())
+
+        # ---------- 安全防护 ----------
         ul.addWidget(make_section_title("安全防护"))
-        card2, c2 = make_card()
+        card3, c3 = make_card()
 
         self.screenshot_cb = QCheckBox()
         self.screenshot_cb.setChecked(
@@ -97,19 +99,63 @@ class SecurityPage(SettingsPage):
         self.screenshot_cb.stateChanged.connect(
             self.settings_dialog.toggle_screenshot_protection)
         row1, _ = make_setting_row(tr("security.screenshot"), self.screenshot_cb)
-        c2.addWidget(row1)
-        c2.addWidget(make_hline())
+        c3.addWidget(row1)
+        c3.addWidget(make_hline())
 
         self.log_cb = QCheckBox()
         self.log_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('log_enabled', True))
         self.log_cb.stateChanged.connect(self.settings_dialog.toggle_log)
         row2, _ = make_setting_row(tr("security.log"), self.log_cb)
-        c2.addWidget(row2)
+        c3.addWidget(row2)
+        ul.addWidget(card3)
 
-        ul.addWidget(card2)
+        # ---------- 保险库备份 ----------
+        ul.addWidget(make_section_title("保险库备份"))
+        card4, c4 = make_card()
+        export_btn = QPushButton("导出备份")
+        export_btn.setMinimumWidth(100)
+        export_btn.clicked.connect(self.settings_dialog.export_vault_backup)
+        row3, _ = make_setting_row("导出加密文件与索引", export_btn)
+        c4.addWidget(row3)
+        c4.addWidget(make_hline())
+        import_btn = QPushButton("导入备份")
+        import_btn.setMinimumWidth(100)
+        import_btn.clicked.connect(self.settings_dialog.import_vault_backup)
+        row4, _ = make_setting_row("与当前保险库合并", import_btn)
+        c4.addWidget(row4)
+        ul.addWidget(card4)
+
         ul.addStretch()
         return unlocked
+
+    # ============================================================
+    #  存储位置卡片（只显示加密文件目录）
+    # ============================================================
+    def _build_storage_card(self):
+        card, c = make_card()
+
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(10, 8, 10, 8)
+
+        label = QLabel("加密文件目录")
+        label.setObjectName("SettingLabel")
+        rl.addWidget(label)
+
+        path_text = self.settings_dialog.storage.SECRET_DIR
+        self.secret_dir_label = QLabel(path_text)
+        self.secret_dir_label.setStyleSheet("color: #888; font-size: 9pt;")
+        self.secret_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        rl.addWidget(self.secret_dir_label, 1)
+
+        btn = QPushButton("修改")
+        btn.setMinimumWidth(80)
+        btn.clicked.connect(self.settings_dialog.change_secret_dir)
+        rl.addWidget(btn)
+
+        c.addWidget(row)
+        return card
 
     # ============================================================
     #  单行验证方式
@@ -136,13 +182,13 @@ class SecurityPage(SettingsPage):
         rl.addStretch()
 
         enable_cb = QCheckBox("启用")
-        enable_cb.setChecked(auth.is_method_enabled(method_name))
+        enable_cb.setChecked(configured and auth.is_method_enabled(method_name))
         enable_cb.setEnabled(configured)
         enable_cb.stateChanged.connect(
             lambda s, k=method_name: self._on_enable_changed(k, s))
         rl.addWidget(enable_cb)
 
-        action_btn = QPushButton("修改")
+        action_btn = QPushButton("修改" if configured else "设置")
         action_btn.setMinimumWidth(80)
         if key == 'password':
             action_btn.clicked.connect(self.settings_dialog.change_password)
@@ -162,7 +208,6 @@ class SecurityPage(SettingsPage):
         enabled = (state == Qt.Checked)
         ok = self.settings_dialog.auth.set_method_enabled(method_name, enabled)
         if not ok:
-            # 被拒绝（最后一个启用的方法不能禁用），把复选框恢复
             self.settings_dialog.auth.set_method_enabled(method_name, True)
             self.refresh_rows()
             QMessageBox.warning(self, "提示", "至少需要保留一种启用的验证方式。")
@@ -171,7 +216,6 @@ class SecurityPage(SettingsPage):
         self.settings_dialog.storage.log(f"验证方式 {method_name}: {state_str}")
 
     def refresh_rows(self):
-        """更新每行的复选框状态（不重建视图）。"""
         auth = self.settings_dialog.auth
         for key, row in self.method_rows.items():
             for child in row.findChildren(QCheckBox):
@@ -182,22 +226,15 @@ class SecurityPage(SettingsPage):
                 child.blockSignals(False)
 
     # ============================================================
-    #  外部调用：当某个验证方式被修改后刷新整页
+    #  外部调用：刷新整页
     # ============================================================
     def on_config_changed(self):
-        """当密码/问题/TOTP/邮箱被修改后，重建解锁视图以刷新状态。"""
-        # 保存当前显示状态
         was_unlocked = (self.stack.currentIndex() == 1)
-
-        # 移除旧的解锁视图
         if self.stack.count() >= 2:
             old = self.stack.widget(1)
             self.stack.removeWidget(old)
             old.deleteLater()
-
-        # 构建新的解锁视图
         self.stack.addWidget(self._build_unlocked_view())
-
         if was_unlocked or getattr(self.settings_dialog, 'is_recovery_login', False):
             self.stack.setCurrentIndex(1)
 

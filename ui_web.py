@@ -1,4 +1,4 @@
-import os, random, smtplib, threading
+import os, secrets, smtplib, threading, time, ipaddress
 from datetime import datetime
 from email.mime.text import MIMEText
 from io import BytesIO
@@ -8,10 +8,77 @@ from constants import VERSION, WEB_PORT
 
 flask_app = Flask(__name__)
 flask_app.secret_key = os.urandom(24)
+flask_app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+)
 web_storage = None
 web_auth = None
 _server = None
 _server_thread = None
+EMAIL_CODE_TTL = 600
+EMAIL_CODE_COOLDOWN = 60
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCK_SECONDS = 60
+_rate_lock = threading.Lock()
+_login_rates = {}
+_email_rates = {}
+
+
+@flask_app.before_request
+def restrict_to_local_network():
+    """即使端口被意外暴露，也拒绝公网来源地址。"""
+    try:
+        address = ipaddress.ip_address(request.remote_addr or '')
+        mapped = getattr(address, 'ipv4_mapped', None)
+        if mapped:
+            address = mapped
+    except ValueError:
+        return "拒绝访问", 403
+    if not (address.is_private or address.is_loopback or address.is_link_local):
+        return "仅允许局域网访问", 403
+    origin = request.headers.get('Origin')
+    if request.method == 'POST' and origin:
+        expected = request.host_url.rstrip('/')
+        if origin.rstrip('/') != expected:
+            return "请求来源无效", 403
+
+
+def _enabled_methods():
+    return web_auth.get_enabled_methods() if web_auth else []
+
+
+def _email_code_matches(value):
+    code = session.get('email_code')
+    expiry = session.get('email_code_expires', 0)
+    session.pop('email_code', None)
+    session.pop('email_code_expires', None)
+    return bool(code and expiry >= time.time()
+                and secrets.compare_digest(value, code))
+
+
+def _login_lock_remaining(client):
+    with _rate_lock:
+        state = _login_rates.get(client)
+        if not state:
+            return 0
+        remaining = state.get('lock_until', 0) - time.time()
+        if remaining <= 0 and state.get('lock_until'):
+            _login_rates.pop(client, None)
+            return 0
+        return max(0, int(remaining))
+
+
+def _record_login_result(client, succeeded):
+    with _rate_lock:
+        if succeeded:
+            _login_rates.pop(client, None)
+            return
+        state = _login_rates.setdefault(client, {'failures': 0, 'lock_until': 0})
+        state['failures'] += 1
+        if state['failures'] >= LOGIN_MAX_ATTEMPTS:
+            state['failures'] = 0
+            state['lock_until'] = time.time() + LOGIN_LOCK_SECONDS
 
 
 @flask_app.template_filter('b64encode')
@@ -31,11 +98,20 @@ def web_index():
 @flask_app.route('/login', methods=['GET', 'POST'])
 def web_login():
     questions = web_auth.get_questions() if web_auth else []
+    methods = _enabled_methods()
     if request.method == 'POST':
+        client = request.remote_addr or 'unknown'
+        wait_seconds = _login_lock_remaining(client)
+        if wait_seconds:
+            return render_template_string(WEB_LOGIN_TEMPLATE, methods=methods,
+                                          questions=questions,
+                                          error=f"尝试次数过多，请等待 {wait_seconds} 秒"), 429
         method = request.form.get('method', 'password')
         inp = request.form.get('input', '')
         ok = False
-        if method == 'password':
+        if method not in methods:
+            ok = False
+        elif method == 'password':
             ok = web_auth.verify_password(inp) if web_auth else False
         elif method == 'question':
             q = request.form.get('question', '')
@@ -43,18 +119,19 @@ def web_login():
         elif method == 'totp':
             ok = web_auth.verify_totp(inp) if web_auth else False
         elif method == 'email':
-            stored_code = session.get('email_code')
-            if stored_code and inp == stored_code:
-                ok = True
-                session.pop('email_code', None)
+            ok = _email_code_matches(inp)
         if ok:
             web_storage.log("移动端登录成功")
+            _record_login_result(client, True)
             session['authenticated'] = True
             return redirect(url_for('web_index'))
         else:
             web_storage.log("移动端登录失败")
-            return render_template_string(WEB_LOGIN_TEMPLATE, methods=questions, error="验证失败")
-    return render_template_string(WEB_LOGIN_TEMPLATE, methods=questions, error=None)
+            _record_login_result(client, False)
+            return render_template_string(WEB_LOGIN_TEMPLATE, methods=methods,
+                                          questions=questions, error="验证失败")
+    return render_template_string(WEB_LOGIN_TEMPLATE, methods=methods,
+                                  questions=questions, error=None)
 
 
 @flask_app.route('/view/<entry_id>')
@@ -73,7 +150,8 @@ def web_view(entry_id):
         web_storage.log(f"移动端查看文件: {entry['original_name']}")
         return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
     except Exception as e:
-        return f"查看失败: {e}", 500
+        web_storage.log(f"移动端查看失败 (文件ID: {entry_id}): {e}")
+        return "查看失败", 500
 
 
 @flask_app.route('/second_auth/<entry_id>', methods=['GET', 'POST'])
@@ -83,9 +161,19 @@ def web_second_auth(entry_id):
     entry = web_storage.get_entry_by_id(entry_id)
     if not entry:
         return "文件不存在", 404
-    allowed_methods = entry.get('second_auth_methods', [])
+    enabled = set(_enabled_methods())
+    allowed_methods = [m for m in entry.get('second_auth_methods', []) if m in enabled]
     questions = web_auth.get_questions() if web_auth else []
+    if not allowed_methods:
+        return "此文件没有可用的二次验证方式", 403
     if request.method == 'POST':
+        client = request.remote_addr or 'unknown'
+        wait_seconds = _login_lock_remaining(client)
+        if wait_seconds:
+            return render_template_string(
+                WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods,
+                questions=questions,
+                error=f"尝试次数过多，请等待 {wait_seconds} 秒"), 429
         method = request.form.get('method', 'password')
         if method not in allowed_methods:
             return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error="不允许的验证方式"), 400
@@ -99,17 +187,18 @@ def web_second_auth(entry_id):
         elif method == 'totp':
             ok = web_auth.verify_totp(inp) if web_auth else False
         elif method == 'email':
-            stored_code = session.get('email_code')
-            if stored_code and inp == stored_code:
-                ok = True
-                session.pop('email_code', None)
+            ok = _email_code_matches(inp)
         if ok:
             web_storage.log(f"移动端二次验证成功 (文件ID: {entry_id})")
-            session.setdefault('second_auth', {})[entry_id] = datetime.now().timestamp() + 3600
+            _record_login_result(client, True)
+            second_auth = dict(session.get('second_auth', {}))
+            second_auth[entry_id] = datetime.now().timestamp() + 3600
+            session['second_auth'] = second_auth
             data = web_storage.get_file_data(entry_id)
             return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
         else:
             web_storage.log(f"移动端二次验证失败 (文件ID: {entry_id})")
+            _record_login_result(client, False)
             return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error="验证失败")
     return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error=None)
 
@@ -128,7 +217,8 @@ def web_download(entry_id):
         web_storage.log(f"移动端下载文件: {entry['original_name']}")
         return send_file(BytesIO(data), as_attachment=True, download_name=entry['original_name'])
     except Exception as e:
-        return f"下载失败: {e}", 500
+        web_storage.log(f"移动端下载失败 (文件ID: {entry_id}): {e}")
+        return "下载失败", 500
 
 
 def check_second_auth(entry_id):
@@ -139,9 +229,15 @@ def check_second_auth(entry_id):
 
 @flask_app.route('/send_code', methods=['POST'])
 def send_code():
-    if not web_auth or not web_auth.email_config:
-        return jsonify({'success': False, 'message': '邮箱未配置'}), 400
-    code = ''.join(random.choices('0123456789', k=6))
+    if 'email' not in _enabled_methods() or not web_auth.email_config:
+        return jsonify({'success': False, 'message': '邮箱未配置或未启用'}), 400
+    now = time.time()
+    client = request.remote_addr or 'unknown'
+    with _rate_lock:
+        last_sent = _email_rates.get(client, 0)
+        if now - last_sent < EMAIL_CODE_COOLDOWN:
+            return jsonify({'success': False, 'message': '发送过于频繁，请稍后再试'}), 429
+    code = ''.join(secrets.choice('0123456789') for _ in range(6))
     config = web_auth.email_config
     to_email = config.get('receiver_email')
     if not to_email:
@@ -151,15 +247,20 @@ def send_code():
     msg['From'] = config['sender_email']
     msg['To'] = to_email
     try:
-        server = smtplib.SMTP(config['smtp_server'], config['port'])
-        server.starttls()
-        server.login(config['sender_email'], config['password'])
-        server.sendmail(config['sender_email'], [to_email], msg.as_string())
-        server.quit()
+        with smtplib.SMTP(config['smtp_server'], config['port'], timeout=20) as server:
+            server.starttls()
+            server.login(config['sender_email'], config['password'])
+            server.sendmail(config['sender_email'], [to_email], msg.as_string())
     except Exception as e:
-        return jsonify({'success': False, 'message': f'邮件发送失败: {str(e)}'}), 500
+        if web_storage:
+            web_storage.log(f"移动端邮箱验证码发送失败: {e}")
+        return jsonify({'success': False, 'message': '邮件发送失败，请检查桌面端日志'}), 500
     web_storage.log(f"移动端发送邮箱验证码至: {to_email}")
     session['email_code'] = code
+    session['email_code_expires'] = now + EMAIL_CODE_TTL
+    session['email_code_sent_at'] = now
+    with _rate_lock:
+        _email_rates[client] = now
     return jsonify({'success': True, 'message': '验证码已发送'})
 
 
@@ -169,14 +270,18 @@ def start_web_server(storage, auth):
     web_storage = storage
     web_auth = auth
     if _server is not None:
-        return  # 已在运行
+        return True  # 已在运行
     try:
         print("\n⚠️ 警告：Web服务使用明文HTTP，仅限可信局域网，公共网络下请勿启用。")
         _server = make_server('0.0.0.0', WEB_PORT, flask_app)
         _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
         _server_thread.start()
+        return True
     except Exception as e:
+        _server = None
+        _server_thread = None
         print(f"Web server error: {e}")
+        return False
 
 
 def stop_web_server():
@@ -234,14 +339,11 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 <h2>SecureVault 登录</h2>
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 <select id="method" name="method">
-<option value="password">密码</option>
-<option value="question">安全问题</option>
-<option value="totp">TOTP</option>
-<option value="email">邮箱验证码</option>
+{% for m in methods %}<option value="{{ m }}">{{ {'password':'密码','question':'安全问题','totp':'TOTP','email':'邮箱验证码'}.get(m, m) }}</option>{% endfor %}
 </select>
 <div id="question_div" style="display:none;">
 <select name="question">
-{% for q in methods %}<option value="{{ q }}">{{ q }}</option>{% endfor %}
+{% for q in questions %}<option value="{{ q }}">{{ q }}</option>{% endfor %}
 </select>
 </div>
 <div id="email_div" style="display:none;">

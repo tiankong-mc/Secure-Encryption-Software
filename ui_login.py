@@ -1,10 +1,14 @@
-import base64
+from io import BytesIO
+import os
+import pyotp, qrcode
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                               QPushButton, QComboBox, QStackedWidget, QDialogButtonBox,
                               QMessageBox, QWidget, QCheckBox, QInputDialog,
-                              QWizard, QWizardPage)
+                              QWizard, QWizardPage, QFileDialog)
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap
+
+from settings import DEFAULT_SECRET_DIR
 
 
 class LoginDialog(QDialog):
@@ -138,7 +142,33 @@ class SetupWizard(QWizard):
         self._build_pages()
 
     def _build_pages(self):
-        # 页1：欢迎
+        # ---------- 页0：加密文件存储位置 ----------
+        p0 = QWizardPage()
+        p0.setTitle("加密文件存储位置")
+        p0.setSubTitle("选择加密后 .vault 文件的保存位置（可保持默认）")
+        l = QVBoxLayout()
+        l.addWidget(QLabel("加密文件目录："))
+        row = QHBoxLayout()
+        self.secret_dir_input = QLineEdit(DEFAULT_SECRET_DIR)
+        self.secret_dir_input.setReadOnly(True)
+        row.addWidget(self.secret_dir_input)
+        btn = QPushButton("浏览...")
+        btn.setFixedWidth(80)
+        btn.clicked.connect(self._choose_secret_dir)
+        row.addWidget(btn)
+        l.addLayout(row)
+
+        l.addSpacing(20)
+        tip = QLabel("提示：仅需设置一次，后续可在“设置 → 安全”中修改。\n"
+                     "配置文件和密钥固定保存在系统默认位置，以保证安全。")
+        tip.setStyleSheet("color: #888;")
+        tip.setWordWrap(True)
+        l.addWidget(tip)
+        l.addStretch()
+        p0.setLayout(l)
+        self.addPage(p0)
+
+        # ---------- 页1：欢迎 ----------
         p1 = QWizardPage()
         p1.setTitle("欢迎")
         p1.setSubTitle("配置安全设置以保护您的文件")
@@ -146,7 +176,7 @@ class SetupWizard(QWizard):
         l.addWidget(QLabel("请依次设置以下安全选项，至少需要配置一种验证方式。"))
         p1.setLayout(l); self.addPage(p1)
 
-        # 页2：密码（可选）
+        # ---------- 页2：密码 ----------
         p2 = QWizardPage()
         p2.setTitle("密码验证")
         p2.setSubTitle("（可选）设置登录密码")
@@ -161,7 +191,7 @@ class SetupWizard(QWizard):
         l.addWidget(self.pw_confirm)
         p2.setLayout(l); self.addPage(p2)
 
-        # 页3：安全问题（可选）
+        # ---------- 页3：安全问题 ----------
         p3 = QWizardPage()
         p3.setTitle("安全问题")
         p3.setSubTitle("（可选）设置三个安全问题和答案")
@@ -180,7 +210,7 @@ class SetupWizard(QWizard):
         l.addWidget(QLabel("问题3")); l.addWidget(self.q3); l.addWidget(self.a3)
         p3.setLayout(l); self.addPage(p3)
 
-        # 页4：TOTP
+        # ---------- 页4：TOTP ----------
         p4 = QWizardPage()
         p4.setTitle("TOTP 验证")
         p4.setSubTitle("使用 Microsoft Authenticator 等应用扫描二维码")
@@ -198,7 +228,7 @@ class SetupWizard(QWizard):
         self.totp_setup_done = False
         self.addPage(p4)
 
-        # 页5：邮箱
+        # ---------- 页5：邮箱 ----------
         p5 = QWizardPage()
         p5.setTitle("邮箱验证")
         p5.setSubTitle("配置SMTP发送验证码")
@@ -218,7 +248,7 @@ class SetupWizard(QWizard):
         l.addWidget(self.receiver_email)
         p5.setLayout(l); self.addPage(p5)
 
-        # 页6：完成
+        # ---------- 页6：完成 ----------
         p6 = QWizardPage()
         p6.setTitle("完成")
         p6.setSubTitle("设置已保存，点击完成启动程序")
@@ -226,28 +256,38 @@ class SetupWizard(QWizard):
         l.addWidget(QLabel("所有设置将加密存储，请牢记您的安全信息。"))
         p6.setLayout(l); self.addPage(p6)
 
+    def _choose_secret_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择加密文件目录",
+                                              self.secret_dir_input.text())
+        if d:
+            self.secret_dir_input.setText(d)
+
     def initializePage(self, id):
-        if id == 3:
+        # 页索引从 0 开始：0=路径, 1=欢迎, 2=密码, 3=安全问题, 4=TOTP, 5=邮箱, 6=完成
+        if id == 4:
             if not self.totp_setup_done:
-                self.totp_secret = self.auth.setup_totp()
-                qr_data = self.auth.setup_totp()
-                pixmap = QPixmap(); pixmap.loadFromData(qr_data)
+                self.totp_secret = self.auth.generate_totp_secret()
+                totp = pyotp.TOTP(self.totp_secret)
+                uri = totp.provisioning_uri(name="SecureVault", issuer_name="SecureApp")
+                image = qrcode.make(uri)
+                buffer = BytesIO()
+                image.save(buffer, format='PNG')
+                pixmap = QPixmap(); pixmap.loadFromData(buffer.getvalue())
                 self.qr_label.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio))
-                self.totp_secret_label.setText(f"密钥：{self.auth.totp_secret}")
+                self.totp_secret_label.setText(f"密钥：{self.totp_secret}")
                 self.totp_setup_done = True
 
     def accept(self):
-        # ---------- 密码 ----------
+        # 1) 密码
         pw_enabled = self.pw_enable.isChecked()
         if pw_enabled:
-            pw = self.pw_input.text()
-            if len(pw) < 8:
+            login_password = self.pw_input.text()
+            if len(login_password) < 8:
                 QMessageBox.warning(self, "错误", "密码长度至少8位"); return
-            if pw != self.pw_confirm.text():
+            if login_password != self.pw_confirm.text():
                 QMessageBox.warning(self, "错误", "两次密码输入不一致"); return
-            self.auth.set_password(pw)
 
-        # ---------- 安全问题（可跳过） ----------
+        # 2) 安全问题
         qa_enabled = self.qa_enable.isChecked()
         if qa_enabled:
             qa_list = []
@@ -257,20 +297,15 @@ class SetupWizard(QWizard):
                 if not q or not a:
                     QMessageBox.warning(self, "错误", "请完整填写所有安全问题和答案"); return
                 qa_list.append((q, a))
-            self.auth.set_questions(qa_list)
 
-        # ---------- TOTP ----------
+        # 3) TOTP
         totp_enabled = self.totp_enable.isChecked()
         if totp_enabled:
             code = self.totp_code.text()
-            if not self.auth.verify_totp(code):
+            if not self.totp_secret or not self.auth.verify_totp_secret(self.totp_secret, code):
                 QMessageBox.warning(self, "错误", "TOTP验证码不正确，请重新输入"); return
-        else:
-            # 取消勾选：删除配置，并移除启用标记
-            self.auth.settings_dict.pop('totp_secret', None)
-            self.auth.totp_secret = None
 
-        # ---------- 邮箱 ----------
+        # 4) 邮箱
         email_enabled = self.email_enable.isChecked()
         if email_enabled:
             server = self.smtp_server.text()
@@ -279,37 +314,57 @@ class SetupWizard(QWizard):
             except:
                 QMessageBox.warning(self, "错误", "端口必须为数字"); return
             sender = self.sender_email.text()
-            pw = self.sender_password.text()
+            email_password = self.sender_password.text()
             receiver = self.receiver_email.text()
-            if not all([server, sender, pw, receiver]):
+            if not all([server, sender, email_password, receiver]):
                 QMessageBox.warning(self, "错误", "请完整填写邮箱配置"); return
-            self.auth.set_email_config(server, port, sender, pw, receiver)
-            code = self.auth.send_verification_code(receiver)
-            if not code:
-                QMessageBox.warning(self, "错误", "邮箱配置测试失败，请检查设置"); return
+            success, result = self.auth.test_email_config(
+                server, port, sender, email_password, receiver)
+            if not success:
+                QMessageBox.warning(self, "错误", f"邮箱配置测试失败：{result}"); return
             verify_code, ok = QInputDialog.getText(self, "验证邮箱",
                                                     f"输入发送到 {receiver} 的验证码")
-            if not ok or verify_code != code:
+            if not ok or verify_code != result:
                 QMessageBox.warning(self, "错误", "验证码错误"); return
+
+        # 5) 至少一种验证方式
+        if not any((pw_enabled, qa_enabled, totp_enabled, email_enabled)):
+            QMessageBox.warning(self, "错误", "至少需要配置一种验证方式。")
+            return
+
+        # 6) 保存验证信息
+        if pw_enabled:
+            self.auth.set_password(login_password)
+        if qa_enabled:
+            self.auth.set_questions(qa_list)
+        if totp_enabled:
+            self.auth.save_totp_secret(self.totp_secret)
+        else:
+            self.auth.settings_dict.pop('totp_secret', None)
+            self.auth.totp_secret = None
+        if email_enabled:
+            self.auth.save_email_config(server, port, sender, email_password, receiver)
         else:
             self.auth.email_config = {}
             self.auth.settings_dict.pop('email', None)
 
-        # ---------- 至少一种验证方式 ----------
-        # 重新加载状态
-        self.auth._init_auth_data()
-        configured = self.auth.get_configured_methods()
-        if not configured:
-            QMessageBox.warning(self, "错误", "至少需要配置一种验证方式。")
-            return
-
-        # 记录每个方法的启用状态
         enabled_map = {}
         if pw_enabled: enabled_map['password'] = True
         if qa_enabled: enabled_map['question'] = True
         if totp_enabled: enabled_map['totp'] = True
         if email_enabled: enabled_map['email'] = True
         self.auth.settings_dict['method_enabled'] = enabled_map
+
+        # 7) 处理加密文件目录
+        new_dir = self.secret_dir_input.text().strip()
+        if new_dir and os.path.normcase(os.path.abspath(new_dir)) != \
+                os.path.normcase(os.path.abspath(DEFAULT_SECRET_DIR)):
+            try:
+                os.makedirs(new_dir, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法创建目录：{e}")
+                return
+            self.auth.settings.set_secret_dir(new_dir)
 
         self.auth.settings_dict['initialized'] = True
         self.auth._save()

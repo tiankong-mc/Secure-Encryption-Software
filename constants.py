@@ -1,6 +1,6 @@
 import os
 
-VERSION = "v2.4.7"
+VERSION = "v2.4.8"
 WEB_PORT = 8080
 ISSUES_URL = "https://github.com/tiankong-mc/Secure-Encryption-Software/issues"
 LANG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lang")
@@ -8,8 +8,9 @@ LANG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lang")
 ABOUT_TEXT = """SecureVault —— 一个专注于本地安全的加密文件保险库。
 
 我希望这个软件能成为你数字生活中一个小小的"保险柜"：
-它不联网、不上传、不记录你的密码或密钥。
-所有加密、验证、备份都发生在你自己的电脑上。
+文件加密与解密在本机完成，不会上传明文文件。
+仅在你主动使用邮箱验证、检查更新或局域网页面时联网。
+验证配置与主密钥由 Windows DPAPI 加密后保存在本机。
 
 本项目github链接为：github.com/tiankong-mc/Secure-Encryption-Software
 作者B站主页为：space.bilibili.com/1974438557

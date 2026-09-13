@@ -9,6 +9,7 @@ class BackupManager:
     def send_vault_file(cls, file_path, to_email, smtp_config, display_name=None):
         if display_name is None:
             display_name = os.path.basename(file_path)
+        display_name = os.path.basename(display_name).replace('\r', '_').replace('\n', '_')
         msg = MIMEMultipart()
         msg['Subject'] = 'SecureVault 紧急备份 - 加密文件'
         msg['From'] = smtp_config['sender_email']
@@ -19,11 +20,10 @@ class BackupManager:
             encoders.encode_base64(part)
             part.add_header('Content-Disposition', f'attachment; filename={display_name}')
             msg.attach(part)
-        server = smtplib.SMTP(smtp_config['smtp_server'], smtp_config['port'])
-        server.starttls()
-        server.login(smtp_config['sender_email'], smtp_config['password'])
-        server.sendmail(smtp_config['sender_email'], [to_email], msg.as_string())
-        server.quit()
+        with smtplib.SMTP(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
+            server.starttls()
+            server.login(smtp_config['sender_email'], smtp_config['password'])
+            server.sendmail(smtp_config['sender_email'], [to_email], msg.as_string())
 
     @classmethod
     def send_multiple_vault_files(cls, file_info_list, to_email, smtp_config):

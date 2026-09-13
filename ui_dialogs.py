@@ -2,7 +2,6 @@ import os
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                               QPushButton, QComboBox, QStackedWidget, QDialogButtonBox,
                               QMessageBox, QWidget, QCheckBox, QGroupBox, QFileDialog)
-from backup import BackupManager
 
 
 class AuthDialog(QDialog):
@@ -10,7 +9,8 @@ class AuthDialog(QDialog):
     def __init__(self, parent, auth_manager, allowed_methods, entry_id, storage):
         super().__init__(parent)
         self.auth = auth_manager
-        self.allowed_methods = allowed_methods
+        enabled = set(auth_manager.get_enabled_methods())
+        self.allowed_methods = [m for m in allowed_methods if m in enabled]
         self.entry_id = entry_id
         self.storage = storage
         self.setWindowTitle("二次验证")
@@ -20,7 +20,7 @@ class AuthDialog(QDialog):
         layout.addWidget(QLabel("请通过以下任意一种方式验证："))
         self.stack = QStackedWidget()
         self.widgets = {}
-        for m in allowed_methods:
+        for m in self.allowed_methods:
             if m == 'password':
                 w = self.create_password_widget(); self.stack.addWidget(w); self.widgets['password'] = w
             elif m == 'question':
@@ -100,7 +100,7 @@ class AuthDialog(QDialog):
             QMessageBox.warning(self, "验证失败", f"失败 {count} 次")
             if count >= 5:
                 self.storage.log(f"二次验证错误次数过多，已拒绝 (文件ID: {self.entry_id})")
-                QMessageBox.critical(self, "验证失败", "错误次数过多，程序将退出。")
+                QMessageBox.critical(self, "验证失败", "错误次数过多，本次验证已关闭。")
                 super().reject()
 
 
@@ -221,6 +221,13 @@ class UploadDialog(QDialog):
         self.email_cb = QCheckBox("邮箱验证码")
         self.question_cb = QCheckBox("安全问题")
         self.password_cb = QCheckBox("密码")
+        enabled = set(parent.auth.get_enabled_methods()) if hasattr(parent, 'auth') else set()
+        for method, checkbox in (
+                ('totp', self.totp_cb), ('email', self.email_cb),
+                ('question', self.question_cb), ('password', self.password_cb)):
+            checkbox.setEnabled(method in enabled)
+            if method not in enabled:
+                checkbox.setToolTip("此验证方式尚未配置或未启用")
         ml.addWidget(self.totp_cb); ml.addWidget(self.email_cb)
         ml.addWidget(self.question_cb); ml.addWidget(self.password_cb)
         self.method_group.setLayout(ml)

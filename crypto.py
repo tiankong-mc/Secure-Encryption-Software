@@ -11,6 +11,10 @@ def encrypt_data(data: bytes, key: bytes) -> bytes:
 
 def decrypt_data(encrypted: bytes, key: bytes) -> bytes:
     """解密数据，输入格式同上"""
+    if len(key) != 32:
+        raise ValueError("无效的 AES-256 密钥长度")
+    if len(encrypted) < 28:
+        raise ValueError("加密数据已截断")
     nonce = encrypted[:12]
     tag = encrypted[-16:]
     ciphertext = encrypted[12:-16]

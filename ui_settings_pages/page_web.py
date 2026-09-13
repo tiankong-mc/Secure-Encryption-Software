@@ -68,7 +68,8 @@ class WebPage(SettingsPage):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0)
-            s.connect(('8.8.8.8', 1))
+            # 仅用于让系统选择本机局域网网卡，不向公网发请求
+            s.connect(('10.255.255.255', 1))
             ip = s.getsockname()[0]
             s.close()
             return ip
@@ -97,8 +98,11 @@ class WebPage(SettingsPage):
             stop_web_server()
             self.settings_dialog.storage.log("停止移动端Web服务")
         else:
-            start_web_server(self.settings_dialog.storage, self.settings_dialog.auth)
-            self.settings_dialog.storage.log("启动移动端Web服务")
+            if start_web_server(self.settings_dialog.storage, self.settings_dialog.auth):
+                self.settings_dialog.storage.log("启动移动端Web服务")
+            else:
+                QMessageBox.warning(self, tr("common.error"),
+                                    f"无法启动 Web 服务，请检查端口 {WEB_PORT} 是否被占用。")
             QTimer.singleShot(800, self.refresh_state)
         self.refresh_state()
 

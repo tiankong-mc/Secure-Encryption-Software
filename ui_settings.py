@@ -1,9 +1,5 @@
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-import os, sys, re, threading, socket, subprocess, hashlib
+import os, sys, shutil
 from io import BytesIO
-import requests
 import qrcode
 import pyotp
 from datetime import datetime
@@ -12,9 +8,8 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                               QCheckBox, QGroupBox, QFileDialog, QInputDialog,
                               QApplication, QProgressDialog, QListWidget, QListWidgetItem,
                               QStackedWidget, QWidget)
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap
-from packaging.version import parse as parse_version
 
 from constants import VERSION, WEB_PORT, ISSUES_URL
 from ui_utils import protect_window, apply_protection_to_all_windows
@@ -29,6 +24,18 @@ from ui_settings_pages.page_appearance import AppearancePage
 from ui_settings_pages.page_language import LanguagePage
 from ui_settings_pages.page_update import UpdatePage
 from ui_settings_pages.page_about import AboutPage
+
+
+def _is_subpath(child, parent):
+    """child 是否等于 parent 或在 parent 之下。"""
+    try:
+        child = os.path.normcase(os.path.abspath(child))
+        parent = os.path.normcase(os.path.abspath(parent))
+        if child == parent:
+            return True
+        return os.path.commonpath([child, parent]) == parent
+    except ValueError:
+        return False
 
 
 class SettingsDialog(QDialog):
@@ -47,13 +54,11 @@ class SettingsDialog(QDialog):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 侧边栏
         self.sidebar = QListWidget()
         self.sidebar.setFixedWidth(180)
         self.sidebar.setFocusPolicy(Qt.NoFocus)
         main_layout.addWidget(self.sidebar)
 
-        # 内容区容器
         self.content_wrapper = QWidget()
         self.content_wrapper.setObjectName("SettingsPage")
         wrapper_layout = QVBoxLayout(self.content_wrapper)
@@ -66,7 +71,6 @@ class SettingsDialog(QDialog):
 
         main_layout.addWidget(self.content_wrapper, 1)
 
-        # 创建页面
         self.pages = {
             'security': SecurityPage(self),
             'web': WebPage(self),
@@ -85,7 +89,6 @@ class SettingsDialog(QDialog):
         self.sidebar.currentRowChanged.connect(self.on_sidebar_changed)
         self.sidebar.setCurrentRow(0)
 
-        # 首次应用样式
         self.apply_style()
 
     # ---------- 样式 ----------
@@ -232,6 +235,63 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"生成恢复代码失败: {e}")
 
+    # ---------- 保险库备份 ----------
+    def export_vault_backup(self):
+        if not self._verify_identity():
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出保险库", "SecureVault_Backup.vaultbk",
+            "SecureVault Backup (*.vaultbk)")
+        if not path:
+            return
+        if not path.lower().endswith('.vaultbk'):
+            path += '.vaultbk'
+        portable = QMessageBox.question(
+            self, "跨电脑备份",
+            "是否设置备份密码？\n\n设置密码后可在其他电脑迁移；不设置则只能由当前 Windows 用户账户恢复。",
+            QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+        password = None
+        if portable:
+            password, ok = QInputDialog.getText(
+                self, "备份密码", "输入备份密码（至少8位）：", QLineEdit.Password)
+            if not ok:
+                return
+            if len(password) < 8:
+                QMessageBox.warning(self, tr("common.error"), "备份密码长度至少8位")
+                return
+            confirm, ok = QInputDialog.getText(
+                self, "确认密码", "再次输入备份密码：", QLineEdit.Password)
+            if not ok or confirm != password:
+                QMessageBox.warning(self, tr("common.error"), "两次密码不一致")
+                return
+        try:
+            self.storage.export_vault(path, password)
+            self.storage.log("导出保险库备份")
+            QMessageBox.information(self, tr("common.success"), f"备份已保存到：{path}")
+        except Exception as e:
+            QMessageBox.critical(self, tr("common.error"), f"导出失败：{e}")
+
+    def import_vault_backup(self):
+        if not self._verify_identity():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入保险库", "", "SecureVault Backup (*.vaultbk);;All Files (*.*)")
+        if not path:
+            return
+        password, ok = QInputDialog.getText(
+            self, "备份密码", "输入备份密码；无密码备份请留空：", QLineEdit.Password)
+        if not ok:
+            return
+        try:
+            self.storage.import_vault(path, password or None)
+            self.storage.log("导入保险库备份")
+            if self.parent_main:
+                self.parent_main.load_files()
+                self.parent_main.load_tags()
+            QMessageBox.information(self, tr("common.success"), "备份已合并到当前保险库")
+        except Exception as e:
+            QMessageBox.critical(self, tr("common.error"), f"导入失败：{e}")
+
     # ---------- 检查更新 ----------
     def check_update(self):
         import updater
@@ -245,6 +305,13 @@ class SettingsDialog(QDialog):
             data = updater.get_latest_release(timeout=15)
             latest = data.get('tag_name', '')
             self.storage.log(f"检查更新: 当前{VERSION}, 远程{latest}")
+
+            # 若 SSL 被降级，显示一次警告
+            if getattr(updater.SSLTrustState, 'degraded', False) and update_page:
+                update_page.set_result(
+                    "⚠ " + updater.SSLTrustState.degraded_reason, "#ffaa00")
+                QApplication.processEvents()
+
             if updater.is_newer(latest):
                 if update_page:
                     update_page.set_result(f"{tr('update.new_available')}: {latest}", "#5a8cbf")
@@ -266,6 +333,11 @@ class SettingsDialog(QDialog):
         import subprocess as sp
 
         try:
+            if not getattr(sys, 'frozen', False):
+                QMessageBox.warning(
+                    self, tr("common.warning"),
+                    "源码运行时不能自动替换程序，请到 GitHub 手动下载新版本。")
+                return
             latest = data.get('tag_name', '')
             asset = updater.find_exe_asset(data)
             if not asset:
@@ -435,9 +507,142 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, tr("common.success"), "邮箱配置已更新")
         self._refresh_security_page()
 
+    # ============================================================
+    #  修改加密文件目录
+    # ============================================================
+    def change_secret_dir(self):
+        if not self._verify_identity():
+            return
+
+        current = self.storage.SECRET_DIR
+        new_dir = QFileDialog.getExistingDirectory(self, "选择新的加密文件目录", current)
+        if not new_dir:
+            return
+        new_dir = os.path.abspath(new_dir)
+
+        if os.path.normcase(new_dir) == os.path.normcase(os.path.abspath(current)):
+            QMessageBox.information(self, "提示", "路径未改变")
+            return
+
+        # 不能互相嵌套
+        if _is_subpath(new_dir, current) or _is_subpath(current, new_dir):
+            QMessageBox.warning(self, "错误", "新目录不能与当前目录相同或嵌套")
+            return
+
+        # 目标目录必须为空（或不存在）
+        if os.path.exists(new_dir) and os.listdir(new_dir):
+            QMessageBox.warning(self, "错误", f"目标目录不为空：\n{new_dir}")
+            return
+
+        n = len(self.storage.index)
+        reply = QMessageBox.question(
+            self, "确认迁移",
+            f"将把加密文件目录迁移到：\n{new_dir}\n\n"
+            f"共 {n} 个文件将被移动，完成后需要重启程序。是否继续？",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._do_migrate_secret_dir(current, new_dir)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "迁移失败",
+                                 f"迁移过程中出错，请检查文件是否完整：\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        self.storage.log(f"迁移加密文件目录到: {new_dir}")
+        try:
+            self.parent_main.load_files()
+        except Exception:
+            pass
+        QMessageBox.information(
+            self, "成功",
+            f"加密文件目录已迁移到：\n{new_dir}\n\n请立即重启程序以完成迁移。")
+
+    def _do_migrate_secret_dir(self, old_dir, new_dir):
+        """把加密文件从 old_dir 迁到 new_dir，并更新索引。"""
+        os.makedirs(new_dir, exist_ok=True)
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(new_dir, 2)
+        except Exception:
+            pass
+
+        # 收集所有要复制的旧文件
+        tasks = []   # (old_path, new_path, entry, key)
+        for entry in self.storage.index:
+            for key in ('secret_path', 'user_path'):
+                old_path = entry.get(key)
+                if not old_path or not os.path.exists(old_path):
+                    continue
+                # 已经在目标目录里的不复制
+                if os.path.normcase(os.path.dirname(old_path)) == os.path.normcase(new_dir):
+                    continue
+                base = os.path.basename(old_path)
+                new_path = os.path.join(new_dir, base)
+                if os.path.exists(new_path):
+                    stem, ext = os.path.splitext(base)
+                    counter = 1
+                    while os.path.exists(new_path):
+                        new_path = os.path.join(new_dir, f"{stem}_{counter}{ext}")
+                        counter += 1
+                tasks.append((old_path, new_path, entry, key))
+
+        # 复制
+        copied = []
+        try:
+            for old_path, new_path, entry, key in tasks:
+                shutil.copy2(old_path, new_path)
+                copied.append((old_path, new_path, entry, key))
+        except Exception:
+            # 回滚已复制的
+            for _, new_path, _, _ in copied:
+                try:
+                    if os.path.exists(new_path):
+                        os.remove(new_path)
+                except OSError:
+                    pass
+            raise
+
+        # 复制索引和日志（可选，如果存在）
+        for name in ('index.enc', 'index.enc.bak', 'securevault.log'):
+            src = os.path.join(old_dir, name)
+            dst = os.path.join(new_dir, name)
+            if os.path.exists(src) and not os.path.exists(dst):
+                try:
+                    shutil.copy2(src, dst)
+                except OSError:
+                    pass
+
+        # 切换 storage 的路径
+        self.storage.SECRET_DIR = new_dir
+        self.storage.INDEX_PATH = os.path.join(new_dir, 'index.enc')
+        self.storage.INDEX_BACKUP_PATH = os.path.join(new_dir, 'index.enc.bak')
+        self.storage.LOG_PATH = os.path.join(new_dir, 'securevault.log')
+
+        # 更新索引路径
+        for _, new_path, entry, key in copied:
+            entry[key] = new_path
+
+        # 更新 settings
+        self.storage.settings.set_secret_dir(new_dir)
+
+        # 保存索引（写新目录）
+        self.storage._save_index()
+
+        # 尽力删除旧文件（失败不影响主流程）
+        for old_path, _, _, _ in copied:
+            try:
+                if os.path.normcase(os.path.dirname(old_path)) != os.path.normcase(new_dir):
+                    os.remove(old_path)
+            except OSError:
+                pass
+
     # ---------- 内部辅助 ----------
     def _refresh_security_page(self):
-        """在修改/新增了某个验证方式后，通知安全页刷新状态。"""
         page = self.pages.get('security')
         if page and hasattr(page, 'on_config_changed'):
             try:

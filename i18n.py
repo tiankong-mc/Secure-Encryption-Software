@@ -1,31 +1,46 @@
-import os, json, shutil
+import os, json, re
 
 class I18nManager:
     def __init__(self, lang_dir):
         self.lang_dir = lang_dir
+        appdata = os.environ.get('APPDATA')
+        self.user_lang_dir = (os.path.join(appdata, 'SecureVault', 'lang')
+                              if appdata else lang_dir)
         self.current_code = "zh_CN"
         self.translations = {}
         self.available = {}
-        os.makedirs(lang_dir, exist_ok=True)
+        self.paths = {}
+        os.makedirs(self.user_lang_dir, exist_ok=True)
         self.scan()
         self.load("zh_CN")
 
     def scan(self):
         self.available = {}
-        for f in os.listdir(self.lang_dir):
-            if f.endswith('.json'):
-                try:
-                    with open(os.path.join(self.lang_dir, f), 'r', encoding='utf-8') as fp:
-                        data = json.load(fp)
-                    code = data.get('language_code', os.path.splitext(f)[0])
-                    name = data.get('language_name', code)
-                    self.available[code] = name
-                except Exception:
-                    pass
+        self.paths = {}
+        directories = [self.lang_dir]
+        if os.path.normcase(self.user_lang_dir) != os.path.normcase(self.lang_dir):
+            directories.append(self.user_lang_dir)
+        for directory in directories:
+            if not os.path.isdir(directory):
+                continue
+            for f in os.listdir(directory):
+                if f.endswith('.json'):
+                    try:
+                        path = os.path.join(directory, f)
+                        with open(path, 'r', encoding='utf-8') as fp:
+                            data = json.load(fp)
+                        code = data.get('language_code', os.path.splitext(f)[0])
+                        name = data.get('language_name', code)
+                        if not self._valid_pack(data):
+                            continue
+                        self.available[code] = name
+                        self.paths[code] = path
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        pass
 
     def load(self, code):
-        path = os.path.join(self.lang_dir, f"{code}.json")
-        if not os.path.exists(path):
+        path = self.paths.get(code)
+        if not path or not os.path.exists(path):
             return False
         with open(path, 'r', encoding='utf-8') as fp:
             data = json.load(fp)
@@ -36,13 +51,39 @@ class I18nManager:
     def import_pack(self, src_path):
         with open(src_path, 'r', encoding='utf-8') as fp:
             data = json.load(fp)
-        code = data.get('language_code')
-        if not code:
-            raise ValueError("语言包缺少 language_code 字段")
-        dest = os.path.join(self.lang_dir, f"{code}.json")
-        shutil.copy2(src_path, dest)
+        if not self._valid_pack(data):
+            raise ValueError("语言包格式无效")
+        code = data['language_code']
+        dest = os.path.join(self.user_lang_dir, f"{code}.json")
+        temp_path = dest + '.tmp'
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as fp:
+                json.dump(data, fp, ensure_ascii=False, indent=2)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(temp_path, dest)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
         self.scan()
         return code, data.get('language_name', code)
+
+    @staticmethod
+    def _valid_pack(data):
+        if not isinstance(data, dict):
+            return False
+        code = data.get('language_code')
+        name = data.get('language_name')
+        translations = data.get('translations')
+        return (isinstance(code, str)
+                and re.fullmatch(r'[A-Za-z0-9_-]{2,32}', code) is not None
+                and isinstance(name, str) and 0 < len(name) <= 100
+                and isinstance(translations, dict)
+                and all(isinstance(k, str) and isinstance(v, str)
+                        for k, v in translations.items()))
 
     def tr(self, key, default=None):
         if key in self.translations:
