@@ -1,12 +1,25 @@
 import sys
 import os
+import ctypes
 from PyQt5.QtWidgets import QApplication, QMessageBox, QDialog
+from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import QTimer
 from ui import MainWindow, LoginDialog, SetupWizard, get_manager
 from storage import StorageManager
 from auth import AuthManager
 from settings import SettingsManager
 from single_instance import SingleInstanceServer, try_send_to_existing_instance
+
+
+def _get_icon_path():
+    """获取图标路径，兼容源码运行与 PyInstaller 打包后的路径"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，资源会被解压到 sys._MEIPASS
+        base_path = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    else:
+        # 源码运行
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, 'myicon_1.ico')
 
 
 def _parse_encrypt_arg():
@@ -20,7 +33,19 @@ def _parse_encrypt_arg():
 
 def main():
     pending_encrypt_path = _parse_encrypt_arg()
+
+    # Windows 任务栏图标分组：告诉系统这是一个独立应用，否则任务栏可能显示 Python 图标
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("tiankong.SecureVault")
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+
+    # 设置全局应用图标（影响窗口左上角、任务栏、Alt+Tab 等）
+    icon_path = _get_icon_path()
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
     # 如果本进程由右键菜单启动（带 --encrypt），
     # 且已有主实例在运行，则把请求转发给主实例后本进程直接退出，
