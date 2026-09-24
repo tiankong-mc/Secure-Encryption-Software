@@ -47,7 +47,8 @@ class SecurityPage(SettingsPage):
         # ----- 解锁视图 -----
         self.stack.addWidget(self._build_unlocked_view())
 
-        if getattr(settings_dialog, 'is_recovery_login', False):
+        # 若本次设置窗口会话已解锁（含恢复登录），直接显示解锁视图
+        if getattr(settings_dialog, '_unlocked', False):
             self.stack.setCurrentIndex(1)
 
     # ============================================================
@@ -116,7 +117,7 @@ class SecurityPage(SettingsPage):
         export_btn = QPushButton("导出备份")
         export_btn.setMinimumWidth(100)
         export_btn.clicked.connect(self.settings_dialog.export_vault_backup)
-        row3, _ = make_setting_row("导出加密文件与索引", export_btn)
+        row3, _ = make_setting_row("导出保险库", export_btn)
         c4.addWidget(row3)
         c4.addWidget(make_hline())
         import_btn = QPushButton("导入备份")
@@ -235,13 +236,14 @@ class SecurityPage(SettingsPage):
             self.stack.removeWidget(old)
             old.deleteLater()
         self.stack.addWidget(self._build_unlocked_view())
-        if was_unlocked or getattr(self.settings_dialog, 'is_recovery_login', False):
+        if was_unlocked or getattr(self.settings_dialog, '_unlocked', False):
             self.stack.setCurrentIndex(1)
 
     # ============================================================
     #  验证入口
     # ============================================================
     def do_verify(self):
+        """首次点击验证按钮：通过后由 _verify_identity 内部置 _unlocked=True。"""
         if self.settings_dialog._verify_identity():
             self.stack.setCurrentIndex(1)
 

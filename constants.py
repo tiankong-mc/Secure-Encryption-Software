@@ -1,6 +1,6 @@
 import os
 
-VERSION = "v2.4.8"
+VERSION = "v2.4.9"
 WEB_PORT = 8080
 ISSUES_URL = "https://github.com/tiankong-mc/Secure-Encryption-Software/issues"
 LANG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lang")

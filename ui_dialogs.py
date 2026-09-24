@@ -201,9 +201,10 @@ class UploadDialog(QDialog):
         self.user_dest = None
         self.is_advanced = False
         self.second_methods = []
+        self.delete_source = False
         self.setWindowTitle("上传加密选项")
         self.setModal(True)
-        self.resize(400, 300)
+        self.resize(420, 380)
         layout = QVBoxLayout()
         layout.addWidget(QLabel(f"文件：{os.path.basename(file_path)}"))
         self.dest_btn = QPushButton("选择用户存储位置（可选）")
@@ -214,6 +215,9 @@ class UploadDialog(QDialog):
         self.advanced_cb = QCheckBox("标记为高级文件（需二次验证）")
         self.advanced_cb.toggled.connect(self.toggle_advanced)
         layout.addWidget(self.advanced_cb)
+        # 新增：加密成功后删除原文件
+        self.delete_source_cb = QCheckBox("加密成功后删除原文件")
+        layout.addWidget(self.delete_source_cb)
         self.method_group = QGroupBox("二次验证方式（高级文件时可用）")
         self.method_group.setEnabled(False)
         ml = QVBoxLayout()
@@ -249,6 +253,7 @@ class UploadDialog(QDialog):
 
     def accept(self):
         self.is_advanced = self.advanced_cb.isChecked()
+        self.delete_source = self.delete_source_cb.isChecked()
         if self.is_advanced:
             self.second_methods = []
             if self.totp_cb.isChecked(): self.second_methods.append('totp')

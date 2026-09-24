@@ -27,7 +27,6 @@ from ui_settings_pages.page_about import AboutPage
 
 
 def _is_subpath(child, parent):
-    """child 是否等于 parent 或在 parent 之下。"""
     try:
         child = os.path.normcase(os.path.abspath(child))
         parent = os.path.normcase(os.path.abspath(parent))
@@ -45,6 +44,10 @@ class SettingsDialog(QDialog):
         self.is_recovery_login = is_recovery_login
         self.parent_main = parent
         self.storage = parent.storage
+
+        # 会话级解锁标记：本次设置窗口内通过一次身份验证后，
+        # 所有敏感操作都不再重复要求验证。
+        self._unlocked = bool(is_recovery_login)
 
         self.setWindowTitle(tr("settings.title"))
         self.setModal(False)
@@ -163,14 +166,17 @@ class SettingsDialog(QDialog):
 
     # ---------- 权限验证 ----------
     def _verify_identity(self):
-        if self.is_recovery_login:
+        if self._unlocked:
             return True
         methods = self.auth.get_enabled_methods()
         if not methods:
             QMessageBox.warning(self, tr("common.warning"), "没有可用的验证方式")
             return False
         dialog = DeleteAuthDialog(self, self.auth, methods)
-        return dialog.exec_() == QDialog.Accepted
+        if dialog.exec_() == QDialog.Accepted:
+            self._unlocked = True
+            return True
+        return False
 
     # ---------- 主题/开关 ----------
     def on_theme_changed(self, theme):
@@ -197,10 +203,31 @@ class SettingsDialog(QDialog):
         self.auth._save()
         self.storage.log(f"日志记录: {'启用' if enabled else '禁用'}")
 
+    def toggle_context_menu(self, enabled):
+        """启用/禁用资源管理器右键菜单。"""
+        from context_menu import register_context_menu, unregister_context_menu
+        if enabled:
+            ok, msg = register_context_menu()
+        else:
+            ok, msg = unregister_context_menu()
+        if not ok:
+            QMessageBox.warning(self, tr("common.error"), msg)
+            # 回滚勾选状态
+            try:
+                page = self.pages.get('appearance')
+                if page and hasattr(page, 'context_menu_cb'):
+                    page.context_menu_cb.blockSignals(True)
+                    page.context_menu_cb.setChecked(not enabled)
+                    page.context_menu_cb.blockSignals(False)
+            except Exception:
+                pass
+        else:
+            self.storage.log(f"右键菜单: {'启用' if enabled else '禁用'}")
+
     # ---------- 恢复代码 ----------
     def generate_recovery(self):
         try:
-            if not self.is_recovery_login and not self._verify_identity():
+            if not self._verify_identity():
                 return
             code = self.auth.generate_recovery_code()
             self.storage.log("生成紧急恢复代码")
@@ -246,27 +273,26 @@ class SettingsDialog(QDialog):
             return
         if not path.lower().endswith('.vaultbk'):
             path += '.vaultbk'
-        portable = QMessageBox.question(
-            self, "跨电脑备份",
-            "是否设置备份密码？\n\n设置密码后可在其他电脑迁移；不设置则只能由当前 Windows 用户账户恢复。",
-            QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
-        password = None
-        if portable:
-            password, ok = QInputDialog.getText(
-                self, "备份密码", "输入备份密码（至少8位）：", QLineEdit.Password)
-            if not ok:
-                return
-            if len(password) < 8:
-                QMessageBox.warning(self, tr("common.error"), "备份密码长度至少8位")
-                return
-            confirm, ok = QInputDialog.getText(
-                self, "确认密码", "再次输入备份密码：", QLineEdit.Password)
-            if not ok or confirm != password:
-                QMessageBox.warning(self, tr("common.error"), "两次密码不一致")
-                return
+
+        password, ok = QInputDialog.getText(
+            self, "备份密码",
+            "输入备份密码（至少 8 位，用于跨设备迁移）：",
+            QLineEdit.Password)
+        if not ok:
+            return
+        if len(password) < 8:
+            QMessageBox.warning(self, tr("common.error"), "备份密码长度至少 8 位")
+            return
+        confirm, ok = QInputDialog.getText(
+            self, "确认密码", "再次输入备份密码：", QLineEdit.Password)
+        if not ok or confirm != password:
+            QMessageBox.warning(self, tr("common.error"), "两次密码不一致")
+            return
+
         try:
-            self.storage.export_vault(path, password)
-            self.storage.log("导出保险库备份")
+            auth_settings = self.auth.export_auth_settings()
+            self.storage.export_vault(path, password, auth_settings=auth_settings)
+            self.storage.log("导出保险库备份（含验证信息）")
             QMessageBox.information(self, tr("common.success"), f"备份已保存到：{path}")
         except Exception as e:
             QMessageBox.critical(self, tr("common.error"), f"导出失败：{e}")
@@ -279,18 +305,41 @@ class SettingsDialog(QDialog):
         if not path:
             return
         password, ok = QInputDialog.getText(
-            self, "备份密码", "输入备份密码；无密码备份请留空：", QLineEdit.Password)
+            self, "备份密码", "输入备份密码：", QLineEdit.Password)
         if not ok:
             return
         try:
-            self.storage.import_vault(path, password or None)
-            self.storage.log("导入保险库备份")
-            if self.parent_main:
-                self.parent_main.load_files()
-                self.parent_main.load_tags()
-            QMessageBox.information(self, tr("common.success"), "备份已合并到当前保险库")
+            result = self.storage.import_vault(path, password or None)
         except Exception as e:
             QMessageBox.critical(self, tr("common.error"), f"导入失败：{e}")
+            return
+
+        auth_settings = result.get('auth_settings') if isinstance(result, dict) else None
+        if auth_settings:
+            reply = QMessageBox.question(
+                self, "恢复验证信息",
+                "备份包中包含验证信息（密码 / 安全问题 / TOTP / 邮箱等）。\n\n"
+                "是否使用备份中的配置覆盖当前验证方式？\n"
+                "选择“否”仅导入文件，验证方式保持不变。",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                try:
+                    if self.auth.import_auth_settings(auth_settings):
+                        self.storage.log("从备份恢复验证信息")
+                        QMessageBox.information(
+                            self, tr("common.success"),
+                            "验证信息已从备份恢复。\n部分更改可能需要重新登录后完全生效。")
+                        self._refresh_security_page()
+                except Exception as e:
+                    QMessageBox.warning(
+                        self, tr("common.error"),
+                        f"恢复验证信息失败：{e}\n文件已导入，但验证方式未变。")
+
+        if self.parent_main:
+            self.parent_main.load_files()
+            self.parent_main.load_tags()
+        self.storage.log("导入保险库备份")
+        QMessageBox.information(self, tr("common.success"), "备份已合并到当前保险库")
 
     # ---------- 检查更新 ----------
     def check_update(self):
@@ -306,7 +355,6 @@ class SettingsDialog(QDialog):
             latest = data.get('tag_name', '')
             self.storage.log(f"检查更新: 当前{VERSION}, 远程{latest}")
 
-            # 若 SSL 被降级，显示一次警告
             if getattr(updater.SSLTrustState, 'degraded', False) and update_page:
                 update_page.set_result(
                     "⚠ " + updater.SSLTrustState.degraded_reason, "#ffaa00")
@@ -408,10 +456,14 @@ class SettingsDialog(QDialog):
     # ---------- 修改验证信息 ----------
     def change_password(self):
         if not self._verify_identity(): return
-        pw, ok = QInputDialog.getText(self, "修改密码", "输入新密码（至少8位）：", QLineEdit.Password)
+        pw, ok = QInputDialog.getText(
+            self, "修改密码",
+            "输入新密码（6-8 位，支持大小写字母、数字、符号）：",
+            QLineEdit.Password)
         if not ok: return
-        if len(pw) < 8:
-            QMessageBox.warning(self, tr("common.error"), "密码长度至少8位"); return
+        if not (6 <= len(pw) <= 8):
+            QMessageBox.warning(self, tr("common.error"), "密码长度必须为 6-8 位")
+            return
         confirm, ok = QInputDialog.getText(self, "修改密码", "再次输入新密码：", QLineEdit.Password)
         if not ok or pw != confirm:
             QMessageBox.warning(self, tr("common.error"), "两次密码不一致"); return
@@ -524,12 +576,10 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "提示", "路径未改变")
             return
 
-        # 不能互相嵌套
         if _is_subpath(new_dir, current) or _is_subpath(current, new_dir):
             QMessageBox.warning(self, "错误", "新目录不能与当前目录相同或嵌套")
             return
 
-        # 目标目录必须为空（或不存在）
         if os.path.exists(new_dir) and os.listdir(new_dir):
             QMessageBox.warning(self, "错误", f"目标目录不为空：\n{new_dir}")
             return
@@ -563,7 +613,6 @@ class SettingsDialog(QDialog):
             f"加密文件目录已迁移到：\n{new_dir}\n\n请立即重启程序以完成迁移。")
 
     def _do_migrate_secret_dir(self, old_dir, new_dir):
-        """把加密文件从 old_dir 迁到 new_dir，并更新索引。"""
         os.makedirs(new_dir, exist_ok=True)
         try:
             import ctypes
@@ -571,14 +620,12 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-        # 收集所有要复制的旧文件
-        tasks = []   # (old_path, new_path, entry, key)
+        tasks = []
         for entry in self.storage.index:
             for key in ('secret_path', 'user_path'):
                 old_path = entry.get(key)
                 if not old_path or not os.path.exists(old_path):
                     continue
-                # 已经在目标目录里的不复制
                 if os.path.normcase(os.path.dirname(old_path)) == os.path.normcase(new_dir):
                     continue
                 base = os.path.basename(old_path)
@@ -591,14 +638,12 @@ class SettingsDialog(QDialog):
                         counter += 1
                 tasks.append((old_path, new_path, entry, key))
 
-        # 复制
         copied = []
         try:
             for old_path, new_path, entry, key in tasks:
                 shutil.copy2(old_path, new_path)
                 copied.append((old_path, new_path, entry, key))
         except Exception:
-            # 回滚已复制的
             for _, new_path, _, _ in copied:
                 try:
                     if os.path.exists(new_path):
@@ -607,7 +652,6 @@ class SettingsDialog(QDialog):
                     pass
             raise
 
-        # 复制索引和日志（可选，如果存在）
         for name in ('index.enc', 'index.enc.bak', 'securevault.log'):
             src = os.path.join(old_dir, name)
             dst = os.path.join(new_dir, name)
@@ -617,23 +661,17 @@ class SettingsDialog(QDialog):
                 except OSError:
                     pass
 
-        # 切换 storage 的路径
         self.storage.SECRET_DIR = new_dir
         self.storage.INDEX_PATH = os.path.join(new_dir, 'index.enc')
         self.storage.INDEX_BACKUP_PATH = os.path.join(new_dir, 'index.enc.bak')
         self.storage.LOG_PATH = os.path.join(new_dir, 'securevault.log')
 
-        # 更新索引路径
         for _, new_path, entry, key in copied:
             entry[key] = new_path
 
-        # 更新 settings
         self.storage.settings.set_secret_dir(new_dir)
-
-        # 保存索引（写新目录）
         self.storage._save_index()
 
-        # 尽力删除旧文件（失败不影响主流程）
         for old_path, _, _, _ in copied:
             try:
                 if os.path.normcase(os.path.dirname(old_path)) != os.path.normcase(new_dir):

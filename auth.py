@@ -234,3 +234,40 @@ class AuthManager:
         encrypted_b64 = self.settings_dict.get('recovery_code_encrypted_b64')
         if not encrypted_b64: return False
         return not self.settings_dict.get('recovery_code_used', True)
+
+    # ================= 保险库备份：导出 / 恢复验证信息 =================
+    # 只包含可跨设备迁移的验证字段。
+    # 不包含 recovery_code_encrypted_b64 等由 DPAPI 加密、与本机
+    # Windows 用户账户绑定的数据，以及 theme / language 等个性化偏好。
+    BACKUP_AUTH_KEYS = ('password_hash', 'qa', 'totp_secret', 'email', 'method_enabled')
+
+    def export_auth_settings(self):
+        """
+        导出用于保险库备份的验证信息（dict）。
+        只保留非空字段，便于在导入时做"是否存在"的判断。
+        """
+        result = {}
+        for key in self.BACKUP_AUTH_KEYS:
+            value = self.settings_dict.get(key)
+            if value in (None, '', {}, []):
+                continue
+            result[key] = value
+        return result
+
+    def import_auth_settings(self, data):
+        """
+        将备份包中的验证信息合并到当前配置。
+        备份中存在的字段会覆盖当前字段；备份中缺失的字段保持当前值不变。
+        返回 True 表示至少应用了一个字段。
+        """
+        if not isinstance(data, dict):
+            return False
+        changed = False
+        for key in self.BACKUP_AUTH_KEYS:
+            if key in data and data[key] not in (None, '', {}, []):
+                self.settings_dict[key] = data[key]
+                changed = True
+        if changed:
+            self._save()
+            self._init_auth_data()
+        return changed

@@ -8,6 +8,7 @@ VAULT_VERSION = 1
 ENCRYPTED_FILE_KEY_SIZE = 12 + 32 + 16
 MIN_ENCRYPTED_DATA_SIZE = 12 + 16
 BACKUP_KEY_MAGIC = b'SVBK1'
+BACKUP_MEMBER_ALLOWLIST = ('meta.json', 'index.enc', 'migration.key', 'auth.enc')
 
 
 class StorageManager:
@@ -152,7 +153,8 @@ class StorageManager:
         return encrypted_file_key, encrypted_content
 
     # ---------- 文件管理 ----------
-    def add_file(self, local_path, user_dest=None, is_advanced=False, second_auth_methods=None, tags=None):
+    def add_file(self, local_path, user_dest=None, is_advanced=False,
+                 second_auth_methods=None, tags=None, delete_source=False):
         with open(local_path, 'rb') as f:
             plain = f.read()
         file_key = generate_key()
@@ -202,6 +204,14 @@ class StorageManager:
                     except OSError:
                         pass
             raise
+
+        # 加密全部完成后，如果要求删除源文件则删除
+        if delete_source:
+            try:
+                os.remove(local_path)
+            except OSError as e:
+                self.log(f"删除原文件失败: {local_path} ({e})")
+
         return uid
 
     @staticmethod
@@ -385,9 +395,21 @@ class StorageManager:
         return [entry for entry in self.index if tag in entry.get('tags', [])]
 
     # ---------- 保险库备份 ----------
-    def export_vault(self, export_path, password=None):
+    def export_vault(self, export_path, password, auth_settings=None):
+        """
+        导出保险库。必须提供密码，始终使用 AES 加密的 zip 打包，可跨设备迁移。
+
+        auth_settings: 可选 dict。如果提供，会用当前 master_key 加密后写入
+                       备份包中的 auth.enc，导入时可通过 import_vault 取回。
+        """
+        if not password:
+            raise ValueError("导出保险库必须设置备份密码")
+        if len(password) < 8:
+            raise ValueError("备份密码长度至少 8 位")
+
         temp_dir = tempfile.mkdtemp()
         try:
+            # --- 收集并复制 .vault 文件 ---
             backup_index = []
             for entry in self.index:
                 src = entry['secret_path']
@@ -401,39 +423,48 @@ class StorageManager:
                 backup_entry['secret_path'] = archive_name
                 backup_entry['user_path'] = None
                 backup_index.append(backup_entry)
+
+            # --- 用当前 master_key 加密索引 ---
             index_data = json.dumps(backup_index, ensure_ascii=False).encode('utf-8')
             with open(os.path.join(temp_dir, 'index.enc'), 'wb') as f:
                 f.write(encrypt_data(index_data, self.master_key))
+
+            # --- 可选：加密打包验证信息 ---
+            has_auth = bool(auth_settings)
+            if has_auth:
+                auth_data = json.dumps(auth_settings, ensure_ascii=False).encode('utf-8')
+                with open(os.path.join(temp_dir, 'auth.enc'), 'wb') as f:
+                    f.write(encrypt_data(auth_data, self.master_key))
+
+            # --- meta 信息 ---
             meta = {
-                'version': '2.1',
+                'version': '2.3',
                 'timestamp': __import__('datetime').datetime.now().isoformat(),
-                'portable': bool(password),
+                'portable': True,
+                'includes_auth': has_auth,
             }
             with open(os.path.join(temp_dir, 'meta.json'), 'w', encoding='utf-8') as f:
                 json.dump(meta, f, ensure_ascii=False)
-            if password:
-                salt = os.urandom(16)
-                backup_key = hashlib.scrypt(password.encode('utf-8'), salt=salt,
-                                            n=2 ** 14, r=8, p=1, dklen=32)
-                wrapped = BACKUP_KEY_MAGIC + salt + encrypt_data(self.master_key, backup_key)
-                with open(os.path.join(temp_dir, 'migration.key'), 'wb') as f:
-                    f.write(wrapped)
-                import pyzipper
-                with pyzipper.AESZipFile(export_path, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
-                    zf.setpassword(password.encode())
-                    for root, _, files in os.walk(temp_dir):
-                        for file in files:
-                            full_path = os.path.join(root, file)
-                            arcname = os.path.relpath(full_path, temp_dir)
-                            zf.write(full_path, arcname)
-            else:
-                import zipfile
-                with zipfile.ZipFile(export_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-                    for root, _, files in os.walk(temp_dir):
-                        for file in files:
-                            full_path = os.path.join(root, file)
-                            arcname = os.path.relpath(full_path, temp_dir)
-                            zf.write(full_path, arcname)
+
+            # --- 用密码包装 master_key 生成 migration.key ---
+            salt = os.urandom(16)
+            backup_key = hashlib.scrypt(password.encode('utf-8'), salt=salt,
+                                        n=2 ** 14, r=8, p=1, dklen=32)
+            wrapped = BACKUP_KEY_MAGIC + salt + encrypt_data(self.master_key, backup_key)
+            with open(os.path.join(temp_dir, 'migration.key'), 'wb') as f:
+                f.write(wrapped)
+
+            # --- 始终使用 AES 加密的 zip 打包 ---
+            import pyzipper
+            with pyzipper.AESZipFile(export_path, 'w',
+                                     compression=pyzipper.ZIP_DEFLATED,
+                                     encryption=pyzipper.WZ_AES) as zf:
+                zf.setpassword(password.encode())
+                for root, _, files in os.walk(temp_dir):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        arcname = os.path.relpath(full_path, temp_dir)
+                        zf.write(full_path, arcname)
         finally:
             shutil.rmtree(temp_dir)
 
@@ -449,7 +480,7 @@ class StorageManager:
             if (not name or '\\' in name or ':' in name or path.is_absolute()
                     or '..' in path.parts or len(path.parts) != 1 or stat.S_ISLNK(mode)):
                 raise ValueError(f"备份包包含不安全路径: {name}")
-            if name not in ('meta.json', 'index.enc', 'migration.key') and not name.endswith('.vault'):
+            if name not in BACKUP_MEMBER_ALLOWLIST and not name.endswith('.vault'):
                 raise ValueError(f"备份包包含未知文件: {name}")
             if info.file_size > max(10 * 1024 * 1024, info.compress_size * 100):
                 raise ValueError(f"备份包中的文件压缩比例异常: {name}")
@@ -474,9 +505,19 @@ class StorageManager:
         return decrypt_data(wrapped[start + 16:], backup_key)
 
     def import_vault(self, import_path, password=None):
+        """
+        导入保险库备份，将文件合并到当前保险库。
+
+        返回值：dict
+            - imported_count: 本次导入的文件数量
+            - auth_settings:  备份包中包含的验证信息（dict），若备份包中
+                              没有 auth.enc 则为 None。
+        """
         temp_dir = tempfile.mkdtemp()
         created_paths = []
         old_index = list(self.index)
+        auth_settings = None
+        imported_entries = []
         try:
             try:
                 import pyzipper
@@ -512,7 +553,19 @@ class StorageManager:
             if not isinstance(entries, list):
                 raise ValueError("备份索引格式无效")
 
-            imported_entries = []
+            # --- 读取备份中的验证信息（如果存在）---
+            auth_path = os.path.join(temp_dir, 'auth.enc')
+            if os.path.exists(auth_path):
+                try:
+                    with open(auth_path, 'rb') as f:
+                        raw = decrypt_data(f.read(), backup_master_key)
+                    parsed = json.loads(raw.decode('utf-8'))
+                    if isinstance(parsed, dict):
+                        auth_settings = parsed
+                except Exception:
+                    # 解密失败时静默忽略，不影响文件导入流程
+                    auth_settings = None
+
             for entry in entries:
                 if not isinstance(entry, dict) or not isinstance(entry.get('original_name'), str):
                     raise ValueError("备份索引包含无效记录")
@@ -577,4 +630,7 @@ class StorageManager:
             raise
         finally:
             shutil.rmtree(temp_dir)
-        return True
+        return {
+            'imported_count': len(imported_entries),
+            'auth_settings': auth_settings,
+        }

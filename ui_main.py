@@ -167,8 +167,12 @@ class MainWindow(QMainWindow):
         dialog = UploadDialog(self, file_path)
         if dialog.exec_():
             try:
-                uid = self.storage.add_file(file_path, dialog.user_dest,
-                                            dialog.is_advanced, dialog.second_methods)
+                uid = self.storage.add_file(
+                    file_path,
+                    dialog.user_dest,
+                    dialog.is_advanced,
+                    dialog.second_methods,
+                    delete_source=dialog.delete_source)
                 self.storage.log(f"加密文件: {os.path.basename(file_path)}")
                 QMessageBox.information(self, "成功", f"文件已加密保存，ID: {uid}")
                 self.load_files(); self.load_tags()
