@@ -205,7 +205,6 @@ class StorageManager:
                         pass
             raise
 
-        # 加密全部完成后，如果要求删除源文件则删除
         if delete_source:
             try:
                 os.remove(local_path)
@@ -370,10 +369,41 @@ class StorageManager:
 
     # ---------- 标签 ----------
     def get_all_tags(self):
+        """返回所有标签（包含层级路径），优先从已保存的空文件夹 + 文件标签中收集"""
         tags = set()
         for entry in self.index:
             tags.update(entry.get('tags', []))
+        # 读取用户手动创建的空文件夹标签
+        known = self.settings.load_settings().get('known_tags', [])
+        tags.update(known)
         return sorted(tags)
+
+    def add_known_tag(self, tag):
+        """创建一个新标签（文件夹），并自动补全所有父级路径"""
+        settings = self.settings.load_settings()
+        known = set(settings.get('known_tags', []))
+        if tag in known:
+            return False
+        known.add(tag)
+        # 自动补全父级
+        parts = tag.split('/')
+        for i in range(1, len(parts)):
+            known.add('/'.join(parts[:i]))
+        settings['known_tags'] = sorted(list(known))
+        self.settings.save_settings(settings)
+        return True
+
+    def remove_known_tag(self, tag):
+        """删除标签（文件夹）及其所有子标签"""
+        settings = self.settings.load_settings()
+        known = set(settings.get('known_tags', []))
+        to_remove = {tag}
+        for k in known:
+            if k.startswith(tag + "/"):
+                to_remove.add(k)
+        known -= to_remove
+        settings['known_tags'] = sorted(list(known))
+        self.settings.save_settings(settings)
 
     def add_tag_to_entry(self, entry_id, tag):
         entry = self.get_entry_by_id(entry_id)
@@ -396,12 +426,6 @@ class StorageManager:
 
     # ---------- 保险库备份 ----------
     def export_vault(self, export_path, password, auth_settings=None):
-        """
-        导出保险库。必须提供密码，始终使用 AES 加密的 zip 打包，可跨设备迁移。
-
-        auth_settings: 可选 dict。如果提供，会用当前 master_key 加密后写入
-                       备份包中的 auth.enc，导入时可通过 import_vault 取回。
-        """
         if not password:
             raise ValueError("导出保险库必须设置备份密码")
         if len(password) < 8:
@@ -409,7 +433,6 @@ class StorageManager:
 
         temp_dir = tempfile.mkdtemp()
         try:
-            # --- 收集并复制 .vault 文件 ---
             backup_index = []
             for entry in self.index:
                 src = entry['secret_path']
@@ -424,19 +447,16 @@ class StorageManager:
                 backup_entry['user_path'] = None
                 backup_index.append(backup_entry)
 
-            # --- 用当前 master_key 加密索引 ---
             index_data = json.dumps(backup_index, ensure_ascii=False).encode('utf-8')
             with open(os.path.join(temp_dir, 'index.enc'), 'wb') as f:
                 f.write(encrypt_data(index_data, self.master_key))
 
-            # --- 可选：加密打包验证信息 ---
             has_auth = bool(auth_settings)
             if has_auth:
                 auth_data = json.dumps(auth_settings, ensure_ascii=False).encode('utf-8')
                 with open(os.path.join(temp_dir, 'auth.enc'), 'wb') as f:
                     f.write(encrypt_data(auth_data, self.master_key))
 
-            # --- meta 信息 ---
             meta = {
                 'version': '2.3',
                 'timestamp': __import__('datetime').datetime.now().isoformat(),
@@ -446,7 +466,6 @@ class StorageManager:
             with open(os.path.join(temp_dir, 'meta.json'), 'w', encoding='utf-8') as f:
                 json.dump(meta, f, ensure_ascii=False)
 
-            # --- 用密码包装 master_key 生成 migration.key ---
             salt = os.urandom(16)
             backup_key = hashlib.scrypt(password.encode('utf-8'), salt=salt,
                                         n=2 ** 14, r=8, p=1, dklen=32)
@@ -454,7 +473,6 @@ class StorageManager:
             with open(os.path.join(temp_dir, 'migration.key'), 'wb') as f:
                 f.write(wrapped)
 
-            # --- 始终使用 AES 加密的 zip 打包 ---
             import pyzipper
             with pyzipper.AESZipFile(export_path, 'w',
                                      compression=pyzipper.ZIP_DEFLATED,
@@ -505,14 +523,6 @@ class StorageManager:
         return decrypt_data(wrapped[start + 16:], backup_key)
 
     def import_vault(self, import_path, password=None):
-        """
-        导入保险库备份，将文件合并到当前保险库。
-
-        返回值：dict
-            - imported_count: 本次导入的文件数量
-            - auth_settings:  备份包中包含的验证信息（dict），若备份包中
-                              没有 auth.enc 则为 None。
-        """
         temp_dir = tempfile.mkdtemp()
         created_paths = []
         old_index = list(self.index)
@@ -553,7 +563,6 @@ class StorageManager:
             if not isinstance(entries, list):
                 raise ValueError("备份索引格式无效")
 
-            # --- 读取备份中的验证信息（如果存在）---
             auth_path = os.path.join(temp_dir, 'auth.enc')
             if os.path.exists(auth_path):
                 try:
@@ -563,7 +572,6 @@ class StorageManager:
                     if isinstance(parsed, dict):
                         auth_settings = parsed
                 except Exception:
-                    # 解密失败时静默忽略，不影响文件导入流程
                     auth_settings = None
 
             for entry in entries:

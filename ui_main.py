@@ -2,8 +2,9 @@ import os
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QPushButton, QListWidget, QListWidgetItem, QLabel,
                               QMessageBox, QFileDialog, QDialog, QCheckBox,
-                              QDialogButtonBox, QInputDialog, QAbstractItemView)
-from PyQt5.QtCore import Qt
+                              QDialogButtonBox, QInputDialog, QAbstractItemView,
+                              QTreeWidget, QTreeWidgetItem, QMenu)
+from PyQt5.QtCore import Qt, QMimeData
 
 from constants import VERSION
 from ui_styles import DARK_STYLE, LIGHT_STYLE
@@ -12,6 +13,80 @@ from ui_viewer import FileViewer
 from ui_log import LogDialog
 from ui_dialogs import AuthDialog, DeleteAuthDialog, UploadDialog
 from ui_settings import SettingsDialog
+
+
+# 自定义 MIME 类型：文件列表 → 标签树
+MIME_TYPE = 'application/x-securevault-entry'
+
+
+class EntryListWidget(QListWidget):
+    """文件列表控件：把选中条目的 entry_id 通过自定义 MIME 数据拖出去。"""
+
+    def mimeData(self, items):
+        mdata = QMimeData()
+        if items:
+            entry_id = items[0].data(Qt.UserRole)
+            if entry_id:
+                mdata.setData(MIME_TYPE, str(entry_id).encode('utf-8'))
+        return mdata
+
+
+class TagTreeWidget(QTreeWidget):
+    """标签树控件：接收从文件列表拖来的条目，把它加到对应标签下。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.main_window = None  # 由 MainWindow 赋值
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DropOnly)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+
+    def _is_valid_drag(self, event):
+        return event.mimeData().hasFormat(MIME_TYPE)
+
+    def dragEnterEvent(self, event):
+        if self._is_valid_drag(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if not self._is_valid_drag(event):
+            event.ignore()
+            return
+        item = self.itemAt(event.pos())
+        if item and item.data(0, Qt.UserRole) != "全部":
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not self._is_valid_drag(event):
+            return
+        item = self.itemAt(event.pos())
+        if not item or not self.main_window:
+            return
+        tag_path = item.data(0, Qt.UserRole)
+        if not tag_path or tag_path == "全部":
+            QMessageBox.information(
+                self, "提示",
+                "请先创建一个标签（点击左下角“+”），再把文件拖进去。")
+            return
+        try:
+            entry_id = bytes(event.mimeData().data(MIME_TYPE)).decode('utf-8').strip()
+        except Exception:
+            entry_id = ''
+        if not entry_id:
+            return
+        storage = self.main_window.storage
+        if storage.add_tag_to_entry(entry_id, tag_path):
+            storage.log(f"将文件添加到标签: {tag_path}")
+            self.main_window.load_files()
+            self.main_window.load_tags()
+            QMessageBox.information(self, "成功", f"已添加到标签：{tag_path}")
+        else:
+            QMessageBox.information(self, "提示", f"文件已在标签 {tag_path} 中")
+        event.acceptProposedAction()
 
 
 class MainWindow(QMainWindow):
@@ -25,6 +100,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"SecureVault {VERSION}")
         self.setGeometry(100, 100, 900, 600)
         self.initUI()
+        self.load_tags()
         self.load_files()
         theme = self.auth.settings_dict.get('theme', '明亮')
         self.apply_theme(theme)
@@ -46,14 +122,32 @@ class MainWindow(QMainWindow):
         central = QWidget(); self.setCentralWidget(central)
         main_layout = QHBoxLayout()
 
-        # ===== 左侧标签面板 =====
-        left_panel = QWidget(); left_panel.setFixedWidth(200)
+        # ===== 左侧标签面板（树状） =====
+        left_panel = QWidget(); left_panel.setFixedWidth(220)
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("标签分类"))
-        self.tag_list = QListWidget()
-        self.tag_list.addItem("全部")
+
+        self.tag_list = TagTreeWidget()
+        self.tag_list.main_window = self
+        self.tag_list.setHeaderHidden(True)
+        self.tag_list.setIndentation(15)
         self.tag_list.itemClicked.connect(self.on_tag_clicked)
+        self.tag_list.setStyleSheet("""
+            QTreeWidget {
+                background-color: #2b2b2b;
+                border: 1px solid #555;
+                color: #f0f0f0;
+                outline: none;
+            }
+            QTreeWidget::item { height: 24px; }
+            QTreeWidget::item:selected {
+                background-color: #4a4a4a;
+                color: #ffffff;
+            }
+            QTreeWidget::item:hover { background-color: #3c3c3c; }
+        """)
         left_layout.addWidget(self.tag_list)
+
         tag_btn_layout = QHBoxLayout()
         add_tag_btn = QPushButton("+"); add_tag_btn.setToolTip("创建新标签")
         add_tag_btn.clicked.connect(self.create_tag)
@@ -62,6 +156,12 @@ class MainWindow(QMainWindow):
         del_tag_btn.clicked.connect(self.delete_tag)
         tag_btn_layout.addWidget(del_tag_btn)
         left_layout.addLayout(tag_btn_layout)
+
+        tip_label = QLabel("提示：把右侧文件拖到标签上即可归类")
+        tip_label.setStyleSheet("color: #888; font-size: 8pt;")
+        tip_label.setWordWrap(True)
+        left_layout.addWidget(tip_label)
+
         left_panel.setLayout(left_layout)
         main_layout.addWidget(left_panel)
 
@@ -82,11 +182,13 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.log_btn)
         right_layout.addLayout(top_bar)
 
-        self.file_list = QListWidget()
+        self.file_list = EntryListWidget()
         self.file_list.setDragEnabled(True)
-        self.file_list.setAcceptDrops(True)
-        self.file_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.file_list.setAcceptDrops(False)
+        self.file_list.setDragDropMode(QAbstractItemView.DragOnly)
         self.file_list.itemDoubleClicked.connect(self.open_file)
+        self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(self.show_file_context_menu)
         right_layout.addWidget(self.file_list)
         right_panel.setLayout(right_layout)
         main_layout.addWidget(right_panel)
@@ -108,46 +210,91 @@ class MainWindow(QMainWindow):
         dialog = LogDialog(self, self.storage)
         dialog.show()
 
-    # ---------- 标签 ----------
+    # ---------- 标签（树状） ----------
     def load_tags(self):
-        self.tag_list.clear(); self.tag_list.addItem("全部")
-        for tag in self.storage.get_all_tags():
-            self.tag_list.addItem(tag)
-        if self.current_tag:
-            items = self.tag_list.findItems(self.current_tag, Qt.MatchExactly)
-            if items:
-                self.tag_list.setCurrentItem(items[0])
+        self.tag_list.clear()
+        root_item = QTreeWidgetItem(self.tag_list, ["全部"])
+        root_item.setData(0, Qt.UserRole, "全部")
 
-    def on_tag_clicked(self, item):
-        self.current_tag = None if item.text() == "全部" else item.text()
+        tags = self.storage.get_all_tags()
+        tag_nodes = {}
+
+        for tag in tags:
+            parts = tag.split('/')
+            current_path = ""
+            parent_item = root_item
+
+            for part in parts:
+                current_path = f"{current_path}/{part}" if current_path else part
+
+                if current_path not in tag_nodes:
+                    item = QTreeWidgetItem(parent_item, [part])
+                    item.setData(0, Qt.UserRole, current_path)
+                    tag_nodes[current_path] = item
+
+                parent_item = tag_nodes[current_path]
+
+        self.tag_list.expandAll()
+
+        if self.current_tag and self.current_tag in tag_nodes:
+            self.tag_list.setCurrentItem(tag_nodes[self.current_tag])
+        else:
+            self.tag_list.setCurrentItem(root_item)
+            self.current_tag = None
+
+    def on_tag_clicked(self, item, column):
+        tag_path = item.data(0, Qt.UserRole)
+        self.current_tag = None if tag_path == "全部" else tag_path
         self.load_files()
 
     def create_tag(self):
-        tag, ok = QInputDialog.getText(self, "创建标签", "输入新标签名称：")
-        if ok and tag and tag not in self.storage.get_all_tags():
-            selected = self.file_list.currentItem()
-            if selected:
-                entry_id = selected.data(Qt.UserRole)
-                self.storage.add_tag_to_entry(entry_id, tag)
-                self.load_files(); self.load_tags()
-                self.storage.log(f"创建标签: {tag}")
-            else:
-                QMessageBox.information(self, "提示", "请先选择一个文件来添加标签。")
+        item = self.tag_list.currentItem()
+        if not item:
+            return
+        parent_path = item.data(0, Qt.UserRole)
+        if parent_path == "全部":
+            parent_path = ""
+
+        tag, ok = QInputDialog.getText(
+            self, "创建标签",
+            "输入新标签名称（可再次选中后继续创建子标签）：")
+        if ok and tag:
+            tag = tag.strip()
+            if not tag:
+                return
+            full_path = f"{parent_path}/{tag}" if parent_path else tag
+            if full_path in self.storage.get_all_tags():
+                QMessageBox.warning(self, "提示", f"标签 '{full_path}' 已存在")
+                return
+            self.storage.add_known_tag(full_path)
+            self.load_tags()
+            self.storage.log(f"创建标签: {full_path}")
 
     def delete_tag(self):
-        current = self.tag_list.currentItem()
-        if not current or current.text() == "全部":
+        item = self.tag_list.currentItem()
+        if not item:
             return
-        tag = current.text()
-        reply = QMessageBox.question(self, "确认", f"确定删除标签 '{tag}' 吗？",
-                                      QMessageBox.Yes | QMessageBox.No)
+        tag_path = item.data(0, Qt.UserRole)
+        if tag_path == "全部":
+            return
+
+        reply = QMessageBox.question(
+            self, "确认",
+            f"确定删除标签 '{tag_path}' 及其所有子标签吗？\n（不会删除文件，只移除标签）",
+            QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
+            self.storage.remove_known_tag(tag_path)
             for entry in self.storage.get_all_entries():
-                if tag in entry.get('tags', []):
-                    entry['tags'].remove(tag)
+                tags = entry.get('tags', [])
+                new_tags = [t for t in tags
+                            if t != tag_path and not t.startswith(tag_path + "/")]
+                if len(new_tags) != len(tags):
+                    entry['tags'] = new_tags
             self.storage._save_index()
-            self.load_tags(); self.load_files()
-            self.storage.log(f"删除标签: {tag}")
+            self.current_tag = None
+            self.load_tags()
+            self.load_files()
+            self.storage.log(f"删除标签: {tag_path}")
 
     # ---------- 拖拽上传 ----------
     def dragEnterEvent(self, event):
@@ -184,7 +331,11 @@ class MainWindow(QMainWindow):
         self.file_list.clear()
         entries = self.storage.get_all_entries()
         if self.current_tag:
-            entries = [e for e in entries if self.current_tag in e.get('tags', [])]
+            entries = [
+                e for e in entries
+                if any(t == self.current_tag or t.startswith(self.current_tag + "/")
+                       for t in e.get('tags', []))
+            ]
         for entry in entries:
             tags_str = "[" + ", ".join(entry.get('tags', [])) + "] " if entry.get('tags') else ""
             item_text = f"{tags_str}{entry['original_name']}  {'[高级]' if entry['is_advanced'] else ''}"
@@ -196,6 +347,64 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(self, "选择要加密的文件")
         if file_path:
             self._do_upload(file_path)
+
+    # ---------- 文件右键菜单 ----------
+    def show_file_context_menu(self, pos):
+        item = self.file_list.itemAt(pos)
+        if not item:
+            return
+        self.file_list.setCurrentItem(item)
+        entry_id = item.data(Qt.UserRole)
+
+        menu = QMenu(self)
+
+        open_action = menu.addAction("打开文件")
+        open_action.triggered.connect(lambda: self.open_file(item))
+
+        export_action = menu.addAction("导出解密")
+        export_action.triggered.connect(self.export_decrypted_file)
+
+        menu.addSeparator()
+
+        add_menu = menu.addMenu("添加到标签")
+        tags = self.storage.get_all_tags()
+        if not tags:
+            na = add_menu.addAction("（暂无标签，请先创建）")
+            na.setEnabled(False)
+        else:
+            for tag in tags:
+                act = add_menu.addAction(tag)
+                act.triggered.connect(
+                    lambda checked=False, t=tag, eid=entry_id:
+                        self.add_entry_to_tag(eid, t))
+
+        entry = self.storage.get_entry_by_id(entry_id)
+        if entry and entry.get('tags'):
+            remove_menu = menu.addMenu("从标签移除")
+            for tag in list(entry.get('tags', [])):
+                act = remove_menu.addAction(tag)
+                act.triggered.connect(
+                    lambda checked=False, t=tag, eid=entry_id:
+                        self.remove_entry_from_tag(eid, t))
+
+        menu.addSeparator()
+        delete_action = menu.addAction("删除文件")
+        delete_action.triggered.connect(self.delete_file)
+
+        menu.exec_(self.file_list.viewport().mapToGlobal(pos))
+
+    def add_entry_to_tag(self, entry_id, tag):
+        if self.storage.add_tag_to_entry(entry_id, tag):
+            self.storage.log(f"将文件添加到标签: {tag}")
+            self.load_files()
+            QMessageBox.information(self, "成功", f"已添加到标签：{tag}")
+        else:
+            QMessageBox.information(self, "提示", f"文件已在标签 {tag} 中")
+
+    def remove_entry_from_tag(self, entry_id, tag):
+        if self.storage.remove_tag_from_entry(entry_id, tag):
+            self.storage.log(f"从标签移除文件: {tag}")
+            self.load_files()
 
     # ---------- 导入加密文件 ----------
     def import_vault_file(self):
@@ -328,10 +537,8 @@ class MainWindow(QMainWindow):
 
     # ---------- 获取已启用的验证方式 ----------
     def _get_available_auth_methods(self):
-        """返回当前已配置且已启用的验证方式。"""
         return self.auth.get_enabled_methods()
 
     def _get_entry_auth_methods(self, entry):
-        """只返回文件允许且当前仍启用的二次验证方式。"""
         enabled = set(self._get_available_auth_methods())
         return [m for m in entry.get('second_auth_methods', []) if m in enabled]

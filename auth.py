@@ -1,4 +1,4 @@
-import bcrypt, pyotp, qrcode, smtplib, secrets, string, base64, hmac
+import bcrypt, pyotp, qrcode, smtplib, secrets, string, base64, hmac, time
 from io import BytesIO
 from email.mime.text import MIMEText
 
@@ -165,7 +165,7 @@ class AuthManager:
     def save_email_config(self, smtp_server, port, sender_email, password, receiver_email):
         self.set_email_config(smtp_server, port, sender_email, password, receiver_email)
 
-    # ================= 失败计数 =================
+    # ================= 二次验证失败计数（用于高级文件） =================
     def increment_fail_count(self):
         self.fail_count += 1
         self.settings_dict['fail_count'] = self.fail_count
@@ -175,6 +175,62 @@ class AuthManager:
     def reset_fail_count(self):
         self.fail_count = 0
         self.settings_dict['fail_count'] = 0
+        self._save()
+
+    # ================= 登录失败锁定 =================
+    # 独立于二次验证的 fail_count，避免两者互相干扰。
+    # 状态持久化在 settings_dict 中，重启程序也无法绕过冷却。
+    LOGIN_MAX_ATTEMPTS = 5
+    LOGIN_BASE_LOCK = 60  # 首次锁定 60 秒
+
+    def get_login_lock_remaining(self):
+        """返回当前登录锁定的剩余秒数，0 表示未锁定。"""
+        lock_until = self.settings_dict.get('login_lock_until', 0)
+        try:
+            remaining = int(lock_until) - int(time.time())
+        except Exception:
+            return 0
+        return max(0, remaining)
+
+    def register_login_failure(self):
+        """
+        记录一次登录失败。
+        返回 (失败次数, 锁定秒数)：
+          - 未触发锁定时返回 (当前失败次数, 0)
+          - 触发锁定时返回 (0, 本次锁定秒数)
+        """
+        # 已在锁定状态下，不再累计失败
+        remaining = self.get_login_lock_remaining()
+        if remaining > 0:
+            return 0, remaining
+
+        count = int(self.settings_dict.get('login_fail_count', 0)) + 1
+        self.settings_dict['login_fail_count'] = count
+
+        if count >= self.LOGIN_MAX_ATTEMPTS:
+            lock_count = int(self.settings_dict.get('login_lock_count', 0))
+            if lock_count == 0:
+                duration = self.LOGIN_BASE_LOCK
+            else:
+                last_duration = int(self.settings_dict.get('login_lock_duration',
+                                                            self.LOGIN_BASE_LOCK))
+                duration = last_duration * 2
+            self.settings_dict['login_lock_duration'] = duration
+            self.settings_dict['login_lock_count'] = lock_count + 1
+            self.settings_dict['login_lock_until'] = int(time.time()) + duration
+            self.settings_dict['login_fail_count'] = 0
+            self._save()
+            return 0, duration
+
+        self._save()
+        return count, 0
+
+    def reset_login_lock(self):
+        """登录成功后调用，清除登录失败计数与所有锁定状态。"""
+        self.settings_dict.pop('login_fail_count', None)
+        self.settings_dict.pop('login_lock_until', None)
+        self.settings_dict.pop('login_lock_duration', None)
+        self.settings_dict.pop('login_lock_count', None)
         self._save()
 
     # ================= 恢复代码 =================
@@ -236,9 +292,6 @@ class AuthManager:
         return not self.settings_dict.get('recovery_code_used', True)
 
     # ================= 保险库备份：导出 / 恢复验证信息 =================
-    # 只包含可跨设备迁移的验证字段。
-    # 不包含 recovery_code_encrypted_b64 等由 DPAPI 加密、与本机
-    # Windows 用户账户绑定的数据，以及 theme / language 等个性化偏好。
     BACKUP_AUTH_KEYS = ('password_hash', 'qa', 'totp_secret', 'email', 'method_enabled')
 
     def export_auth_settings(self):

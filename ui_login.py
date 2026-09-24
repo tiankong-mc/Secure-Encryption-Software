@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                               QPushButton, QComboBox, QStackedWidget, QDialogButtonBox,
                               QMessageBox, QWidget, QCheckBox, QInputDialog,
                               QWizard, QWizardPage, QFileDialog)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap
 
 from settings import DEFAULT_SECRET_DIR
@@ -20,11 +20,23 @@ class LoginDialog(QDialog):
         self.auth = auth_manager
         self.storage = storage
         self.recovery_accepted = False
+        self._lock_timer = None
+        self._lock_seconds = 0
         self.setWindowTitle("SecureVault 登录")
         self.setModal(True)
-        self.resize(400, 350)
+        self.resize(420, 400)
         layout = QVBoxLayout()
         layout.addWidget(QLabel("请通过以下任一方式验证身份"))
+
+        # 冷却提示标签（默认隐藏）
+        self.lock_label = QLabel("")
+        self.lock_label.setAlignment(Qt.AlignCenter)
+        self.lock_label.setStyleSheet(
+            "color: #ff6666; font-size: 11pt; padding: 8px; font-weight: bold;")
+        self.lock_label.setWordWrap(True)
+        self.lock_label.setVisible(False)
+        layout.addWidget(self.lock_label)
+
         self.stack = QStackedWidget()
         self.methods = []
 
@@ -56,15 +68,68 @@ class LoginDialog(QDialog):
         layout.addWidget(self.recovery_btn)
         self.setLayout(layout)
 
+        # 检查是否需要显示锁定状态
+        self._apply_lock_if_needed()
+
+    # ---------- 锁定状态管理 ----------
+    def _apply_lock_if_needed(self):
+        remaining = self.auth.get_login_lock_remaining()
+        if remaining > 0:
+            self._apply_lock(remaining)
+
+    def _apply_lock(self, seconds):
+        """应用锁定：禁用所有输入并显示倒计时。"""
+        self._lock_seconds = seconds
+        self.stack.setEnabled(False)
+        self.method_combo.setEnabled(False)
+        self.btn_box.setEnabled(False)
+        self.recovery_btn.setEnabled(False)
+        self.lock_label.setVisible(True)
+        self._update_lock_label()
+
+        if self._lock_timer is not None:
+            self._lock_timer.stop()
+        self._lock_timer = QTimer(self)
+        self._lock_timer.timeout.connect(self._on_lock_tick)
+        self._lock_timer.start(1000)
+
+    def _on_lock_tick(self):
+        self._lock_seconds -= 1
+        if self._lock_seconds <= 0:
+            if self._lock_timer is not None:
+                self._lock_timer.stop()
+                self._lock_timer = None
+            self._release_lock()
+        else:
+            self._update_lock_label()
+
+    def _update_lock_label(self):
+        self.lock_label.setText(
+            f"错误次数过多，请等待 {self._lock_seconds} 秒后再试")
+
+    def _release_lock(self):
+        self.lock_label.setVisible(False)
+        self.stack.setEnabled(True)
+        self.method_combo.setEnabled(True)
+        self.btn_box.setEnabled(True)
+        self.recovery_btn.setEnabled(True)
+        self.storage.log("登录锁定已解除，可以再次尝试")
+
+    # ---------- 恢复代码 ----------
     def recovery_login(self):
-        code, ok = QInputDialog.getText(self, "紧急恢复", "请输入紧急恢复代码（格式：XXXX-XXXX-XXXX-XXXX-XXXX）:")
+        code, ok = QInputDialog.getText(
+            self, "紧急恢复",
+            "请输入紧急恢复代码（格式：XXXX-XXXX-XXXX-XXXX-XXXX）:")
         if not ok or not code: return
         if self.auth.verify_recovery_code(code):
             self.recovery_accepted = True
+            # 恢复代码成功也视为正常登录，清空失败计数和锁定
+            self.auth.reset_login_lock()
             self.accept()
         else:
             QMessageBox.warning(self, "错误", "恢复代码无效或已使用")
 
+    # ---------- 验证组件 ----------
     def create_password_widget(self):
         w = QWidget(); l = QVBoxLayout()
         l.addWidget(QLabel("输入密码："))
@@ -102,6 +167,7 @@ class LoginDialog(QDialog):
         if self.email_code: QMessageBox.information(self, "提示", "验证码已发送")
         else: QMessageBox.warning(self, "错误", "发送失败")
 
+    # ---------- 登录验证 ----------
     def accept(self):
         if self.recovery_accepted:
             self.storage.log("登录成功 (恢复代码)")
@@ -110,6 +176,13 @@ class LoginDialog(QDialog):
         if not self.methods:
             QMessageBox.critical(self, "错误", "没有可用的验证方式")
             return
+
+        # 若处于锁定状态，不处理任何输入
+        remaining = self.auth.get_login_lock_remaining()
+        if remaining > 0:
+            self._apply_lock(remaining)
+            return
+
         method = self.method_combo.currentText()
         ok = False
         if method == 'password':
@@ -121,18 +194,26 @@ class LoginDialog(QDialog):
             ok = self.auth.verify_totp(self.totp_input.text())
         elif method == 'email':
             ok = (self.email_code_input.text() == self.email_code)
+
         if ok:
-            self.auth.reset_fail_count()
+            self.auth.reset_login_lock()
             self.storage.log("登录成功")
             super().accept()
+            return
+
+        # 失败
+        fail_count, lock_seconds = self.auth.register_login_failure()
+        if lock_seconds > 0:
+            self.storage.log(
+                f"登录失败次数过多，已锁定 {lock_seconds} 秒")
+            QMessageBox.warning(
+                self, "验证失败",
+                f"错误次数已达 {self.auth.LOGIN_MAX_ATTEMPTS} 次，"
+                f"已锁定 {lock_seconds} 秒。")
+            self._apply_lock(lock_seconds)
         else:
-            count = self.auth.increment_fail_count()
-            self.storage.log(f"登录失败 (尝试 {count})")
-            QMessageBox.warning(self, "验证失败", f"失败 {count} 次")
-            if count >= 5:
-                self.storage.log("登录错误次数过多，程序退出")
-                QMessageBox.critical(self, "验证失败", "错误次数过多，程序将退出。")
-                super().reject()
+            self.storage.log(f"登录失败 (尝试 {fail_count})")
+            QMessageBox.warning(self, "验证失败", f"失败 {fail_count} 次")
 
 
 # ============================================================
