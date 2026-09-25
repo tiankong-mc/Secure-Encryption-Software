@@ -16,13 +16,48 @@ web_storage = None
 web_auth = None
 _server = None
 _server_thread = None
-EMAIL_CODE_TTL = 600
+EMAIL_CODE_TTL = 300
 EMAIL_CODE_COOLDOWN = 60
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_SECONDS = 60
+MAX_RATE_ENTRIES = 1000
 _rate_lock = threading.Lock()
 _login_rates = {}
 _email_rates = {}
+
+
+def _cleanup_rates_locked(rates, ttl_seconds):
+    """
+    在持有 _rate_lock 的情况下调用。
+    当字典条目数超过上限时，清理过期条目，避免无限增长。
+
+    修复 #5：删除"清理一半就 break"的提前退出条件。
+    清理函数只在字典超限时被调用，遍历 1000 条数据的开销可以接受，
+    提前退出反而可能因为迭代顺序导致部分过期条目没被清理。
+    """
+    if len(rates) <= MAX_RATE_ENTRIES:
+        return
+    now = time.time()
+    to_remove = []
+    for k, v in list(rates.items()):
+        if isinstance(v, dict):
+            # _login_rates 条目
+            lock_until = v.get('lock_until', 0)
+            failures = v.get('failures', 0)
+            last_seen = v.get('last_seen', 0)
+            # 条件一：锁定已过期且已无失败计数
+            if lock_until and lock_until < now and failures == 0:
+                to_remove.append(k)
+                continue
+            # 条件二：last_seen 超过 ttl 秒前
+            if last_seen and now - last_seen > ttl_seconds:
+                to_remove.append(k)
+        else:
+            # _email_rates 条目
+            if now - v > ttl_seconds:
+                to_remove.append(k)
+    for k in to_remove:
+        rates.pop(k, None)
 
 
 @flask_app.before_request
@@ -73,12 +108,15 @@ def _record_login_result(client, succeeded):
     with _rate_lock:
         if succeeded:
             _login_rates.pop(client, None)
-            return
-        state = _login_rates.setdefault(client, {'failures': 0, 'lock_until': 0})
-        state['failures'] += 1
-        if state['failures'] >= LOGIN_MAX_ATTEMPTS:
-            state['failures'] = 0
-            state['lock_until'] = time.time() + LOGIN_LOCK_SECONDS
+        else:
+            state = _login_rates.setdefault(
+                client, {'failures': 0, 'lock_until': 0, 'last_seen': 0})
+            state['failures'] += 1
+            state['last_seen'] = time.time()
+            if state['failures'] >= LOGIN_MAX_ATTEMPTS:
+                state['failures'] = 0
+                state['lock_until'] = time.time() + LOGIN_LOCK_SECONDS
+        _cleanup_rates_locked(_login_rates, LOGIN_LOCK_SECONDS * 2)
 
 
 @flask_app.template_filter('b64encode')
@@ -258,9 +296,9 @@ def send_code():
     web_storage.log(f"移动端发送邮箱验证码至: {to_email}")
     session['email_code'] = code
     session['email_code_expires'] = now + EMAIL_CODE_TTL
-    session['email_code_sent_at'] = now
     with _rate_lock:
         _email_rates[client] = now
+        _cleanup_rates_locked(_email_rates, EMAIL_CODE_TTL * 2)
     return jsonify({'success': True, 'message': '验证码已发送'})
 
 
@@ -270,7 +308,7 @@ def start_web_server(storage, auth):
     web_storage = storage
     web_auth = auth
     if _server is not None:
-        return True  # 已在运行
+        return True
     try:
         print("\n⚠️ 警告：Web服务使用明文HTTP，仅限可信局域网，公共网络下请勿启用。")
         _server = make_server('0.0.0.0', WEB_PORT, flask_app)

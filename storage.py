@@ -16,7 +16,6 @@ class StorageManager:
         self.settings = settings_manager or SettingsManager()
         self.master_key = self.settings.get_master_key()
 
-        # 路径从 settings 动态读取（可在设置中修改）
         self.SECRET_DIR = self.settings.get_secret_dir()
         self.INDEX_PATH = os.path.join(self.SECRET_DIR, 'index.enc')
         self.INDEX_BACKUP_PATH = os.path.join(self.SECRET_DIR, 'index.enc.bak')
@@ -155,6 +154,12 @@ class StorageManager:
     # ---------- 文件管理 ----------
     def add_file(self, local_path, user_dest=None, is_advanced=False,
                  second_auth_methods=None, tags=None, delete_source=False):
+        """
+        加密并保存文件。
+        返回 dict：
+          - uid: 新记录的 ID
+          - delete_error: 若开启 delete_source 且删除原文件失败，则包含错误信息；否则为 None
+        """
         with open(local_path, 'rb') as f:
             plain = f.read()
         file_key = generate_key()
@@ -205,13 +210,16 @@ class StorageManager:
                         pass
             raise
 
+        # 加密全部完成后，如果要求删除源文件则删除
+        delete_error = None
         if delete_source:
             try:
                 os.remove(local_path)
             except OSError as e:
+                delete_error = str(e)
                 self.log(f"删除原文件失败: {local_path} ({e})")
 
-        return uid
+        return {'uid': uid, 'delete_error': delete_error}
 
     @staticmethod
     def _unique_user_path(directory, filename):
@@ -369,23 +377,19 @@ class StorageManager:
 
     # ---------- 标签 ----------
     def get_all_tags(self):
-        """返回所有标签（包含层级路径），优先从已保存的空文件夹 + 文件标签中收集"""
         tags = set()
         for entry in self.index:
             tags.update(entry.get('tags', []))
-        # 读取用户手动创建的空文件夹标签
         known = self.settings.load_settings().get('known_tags', [])
         tags.update(known)
         return sorted(tags)
 
     def add_known_tag(self, tag):
-        """创建一个新标签（文件夹），并自动补全所有父级路径"""
         settings = self.settings.load_settings()
         known = set(settings.get('known_tags', []))
         if tag in known:
             return False
         known.add(tag)
-        # 自动补全父级
         parts = tag.split('/')
         for i in range(1, len(parts)):
             known.add('/'.join(parts[:i]))
@@ -394,7 +398,6 @@ class StorageManager:
         return True
 
     def remove_known_tag(self, tag):
-        """删除标签（文件夹）及其所有子标签"""
         settings = self.settings.load_settings()
         known = set(settings.get('known_tags', []))
         to_remove = {tag}

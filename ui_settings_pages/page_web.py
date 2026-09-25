@@ -47,7 +47,6 @@ class WebPage(SettingsPage):
         self.layout().addWidget(make_section_title(tr("web.qr_hint")))
         self.qr_card, qc = make_card()
 
-        # 关键：给二维码预留充足空间，不被裁切
         self.qr_label = QLabel()
         self.qr_label.setAlignment(Qt.AlignCenter)
         self.qr_label.setMinimumSize(260, 260)
@@ -57,7 +56,17 @@ class WebPage(SettingsPage):
         self.url_label.setAlignment(Qt.AlignCenter)
         self.url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.url_label.setStyleSheet("padding: 8px;")
+        self.url_label.setWordWrap(True)
         qc.addWidget(self.url_label)
+
+        # 无局域网 IP 时的额外警告
+        self.loopback_warning = QLabel("")
+        self.loopback_warning.setAlignment(Qt.AlignCenter)
+        self.loopback_warning.setStyleSheet(
+            "color: #ffaa00; padding: 4px 10px; font-size: 9pt;")
+        self.loopback_warning.setWordWrap(True)
+        self.loopback_warning.setVisible(False)
+        qc.addWidget(self.loopback_warning)
 
         self.layout().addWidget(self.qr_card)
         self.layout().addStretch()
@@ -65,19 +74,23 @@ class WebPage(SettingsPage):
         self.refresh_state()
 
     def _get_ip(self):
+        """
+        获取本机局域网 IP。
+        返回 (ip, is_loopback)：
+          - 正常情况：(局域网 IP, False)
+          - 无可用局域网 IP：(127.0.0.1, True)，此时二维码对其他设备无效
+        """
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0)
-            # 仅用于让系统选择本机局域网网卡，不向公网发请求
             s.connect(('10.255.255.255', 1))
             ip = s.getsockname()[0]
             s.close()
-            return ip
+            return ip, False
         except Exception:
-            return '127.0.0.1'
+            return '127.0.0.1', True
 
     def _make_qr_pixmap(self, url):
-        """生成固定大小二维码 pixmap（不缩放，避免被裁切）。"""
         qr = qrcode.QRCode(
             version=None,
             error_correction=qrcode.constants.ERROR_CORRECT_M,
@@ -112,12 +125,23 @@ class WebPage(SettingsPage):
             self.status_label.setText(tr("web.status") + tr("web.status_running"))
             self.status_label.setStyleSheet("color: #4caf50; font-size: 11pt;")
             self.toggle_btn.setText(tr("web.stop"))
-            ip = self._get_ip()
+
+            ip, is_loopback = self._get_ip()
             url = f"http://{ip}:{WEB_PORT}"
             pixmap = self._make_qr_pixmap(url)
             self.qr_label.setPixmap(pixmap)
             self.url_label.setText(url)
-            self.url_label.setStyleSheet("padding: 8px; color: #5a8cbf;")
+
+            if is_loopback:
+                # 修复 #4：无局域网 IP 时显式警告二维码对其他设备无效
+                self.url_label.setStyleSheet("padding: 8px; color: #ffaa00;")
+                self.loopback_warning.setText(
+                    "⚠ 未检测到局域网 IP（当前为 127.0.0.1）。\n"
+                    "其他设备扫码将无法访问，请确认本机已连接到局域网 / Wi-Fi。")
+                self.loopback_warning.setVisible(True)
+            else:
+                self.url_label.setStyleSheet("padding: 8px; color: #5a8cbf;")
+                self.loopback_warning.setVisible(False)
         else:
             self.status_label.setText(tr("web.status") + tr("web.status_stopped"))
             self.status_label.setStyleSheet("color: #888; font-size: 11pt;")
@@ -127,6 +151,7 @@ class WebPage(SettingsPage):
             self.qr_label.setStyleSheet("color: #666; font-size: 12pt;")
             self.url_label.setText(tr("web.url") + tr("web.url_none"))
             self.url_label.setStyleSheet("padding: 8px; color: #666;")
+            self.loopback_warning.setVisible(False)
 
     def retranslate(self):
         self.warning_label.setText(tr("web.http_warning"))

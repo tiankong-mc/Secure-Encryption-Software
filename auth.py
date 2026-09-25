@@ -52,7 +52,6 @@ class AuthManager:
         """返回 True 表示成功，False 表示拒绝（不能禁用最后一个）。"""
         enabled = dict(self.settings_dict.get('method_enabled', {}))
         enabled[name] = value
-        # 检查是否至少还有一个启用
         configured = self.get_configured_methods()
         active = [m for m in configured if enabled.get(m, True)]
         if not active:
@@ -165,7 +164,7 @@ class AuthManager:
     def save_email_config(self, smtp_server, port, sender_email, password, receiver_email):
         self.set_email_config(smtp_server, port, sender_email, password, receiver_email)
 
-    # ================= 二次验证失败计数（用于高级文件） =================
+    # ================= 高级文件二次验证失败计数 =================
     def increment_fail_count(self):
         self.fail_count += 1
         self.settings_dict['fail_count'] = self.fail_count
@@ -178,10 +177,8 @@ class AuthManager:
         self._save()
 
     # ================= 登录失败锁定 =================
-    # 独立于二次验证的 fail_count，避免两者互相干扰。
-    # 状态持久化在 settings_dict 中，重启程序也无法绕过冷却。
     LOGIN_MAX_ATTEMPTS = 5
-    LOGIN_BASE_LOCK = 60  # 首次锁定 60 秒
+    LOGIN_BASE_LOCK = 60
 
     def get_login_lock_remaining(self):
         """返回当前登录锁定的剩余秒数，0 表示未锁定。"""
@@ -193,13 +190,7 @@ class AuthManager:
         return max(0, remaining)
 
     def register_login_failure(self):
-        """
-        记录一次登录失败。
-        返回 (失败次数, 锁定秒数)：
-          - 未触发锁定时返回 (当前失败次数, 0)
-          - 触发锁定时返回 (0, 本次锁定秒数)
-        """
-        # 已在锁定状态下，不再累计失败
+        """记录一次登录失败。返回 (失败次数, 锁定秒数)。"""
         remaining = self.get_login_lock_remaining()
         if remaining > 0:
             return 0, remaining
@@ -231,6 +222,54 @@ class AuthManager:
         self.settings_dict.pop('login_lock_until', None)
         self.settings_dict.pop('login_lock_duration', None)
         self.settings_dict.pop('login_lock_count', None)
+        self._save()
+
+    # ================= 敏感操作失败锁定（与登录锁定独立） =================
+    OP_MAX_ATTEMPTS = 5
+    OP_BASE_LOCK = 60
+
+    def get_op_lock_remaining(self):
+        """返回当前敏感操作锁定的剩余秒数，0 表示未锁定。"""
+        lock_until = self.settings_dict.get('op_lock_until', 0)
+        try:
+            remaining = int(lock_until) - int(time.time())
+        except Exception:
+            return 0
+        return max(0, remaining)
+
+    def register_op_failure(self):
+        """记录一次敏感操作验证失败。返回 (失败次数, 锁定秒数)。"""
+        remaining = self.get_op_lock_remaining()
+        if remaining > 0:
+            return 0, remaining
+
+        count = int(self.settings_dict.get('op_fail_count', 0)) + 1
+        self.settings_dict['op_fail_count'] = count
+
+        if count >= self.OP_MAX_ATTEMPTS:
+            lock_count = int(self.settings_dict.get('op_lock_count', 0))
+            if lock_count == 0:
+                duration = self.OP_BASE_LOCK
+            else:
+                last_duration = int(self.settings_dict.get('op_lock_duration',
+                                                            self.OP_BASE_LOCK))
+                duration = last_duration * 2
+            self.settings_dict['op_lock_duration'] = duration
+            self.settings_dict['op_lock_count'] = lock_count + 1
+            self.settings_dict['op_lock_until'] = int(time.time()) + duration
+            self.settings_dict['op_fail_count'] = 0
+            self._save()
+            return 0, duration
+
+        self._save()
+        return count, 0
+
+    def reset_op_lock(self):
+        """敏感操作验证成功后调用，清除失败计数与锁定状态。"""
+        self.settings_dict.pop('op_fail_count', None)
+        self.settings_dict.pop('op_lock_until', None)
+        self.settings_dict.pop('op_lock_duration', None)
+        self.settings_dict.pop('op_lock_count', None)
         self._save()
 
     # ================= 恢复代码 =================
@@ -295,10 +334,6 @@ class AuthManager:
     BACKUP_AUTH_KEYS = ('password_hash', 'qa', 'totp_secret', 'email', 'method_enabled')
 
     def export_auth_settings(self):
-        """
-        导出用于保险库备份的验证信息（dict）。
-        只保留非空字段，便于在导入时做"是否存在"的判断。
-        """
         result = {}
         for key in self.BACKUP_AUTH_KEYS:
             value = self.settings_dict.get(key)
@@ -308,11 +343,6 @@ class AuthManager:
         return result
 
     def import_auth_settings(self, data):
-        """
-        将备份包中的验证信息合并到当前配置。
-        备份中存在的字段会覆盖当前字段；备份中缺失的字段保持当前值不变。
-        返回 True 表示至少应用了一个字段。
-        """
         if not isinstance(data, dict):
             return False
         changed = False

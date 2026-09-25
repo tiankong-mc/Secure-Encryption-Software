@@ -1,5 +1,11 @@
 import os, json, re
 
+# 语言包体积上限，避免超大的恶意 JSON 造成内存耗尽
+MAX_LANG_PACK_SIZE = 10 * 1024 * 1024  # 10 MB
+# 翻译条目数上限，避免构造大量 key 消耗内存
+MAX_TRANSLATIONS = 10000
+
+
 class I18nManager:
     def __init__(self, lang_dir):
         self.lang_dir = lang_dir
@@ -27,6 +33,8 @@ class I18nManager:
                 if f.endswith('.json'):
                     try:
                         path = os.path.join(directory, f)
+                        if os.path.getsize(path) > MAX_LANG_PACK_SIZE:
+                            continue
                         with open(path, 'r', encoding='utf-8') as fp:
                             data = json.load(fp)
                         code = data.get('language_code', os.path.splitext(f)[0])
@@ -49,6 +57,13 @@ class I18nManager:
         return True
 
     def import_pack(self, src_path):
+        try:
+            size = os.path.getsize(src_path)
+        except OSError as e:
+            raise ValueError(f"无法读取文件：{e}")
+        if size > MAX_LANG_PACK_SIZE:
+            raise ValueError(
+                f"语言包文件过大（{size} 字节，上限 {MAX_LANG_PACK_SIZE} 字节）")
         with open(src_path, 'r', encoding='utf-8') as fp:
             data = json.load(fp)
         if not self._valid_pack(data):
@@ -78,12 +93,18 @@ class I18nManager:
         code = data.get('language_code')
         name = data.get('language_name')
         translations = data.get('translations')
-        return (isinstance(code, str)
-                and re.fullmatch(r'[A-Za-z0-9_-]{2,32}', code) is not None
-                and isinstance(name, str) and 0 < len(name) <= 100
-                and isinstance(translations, dict)
-                and all(isinstance(k, str) and isinstance(v, str)
-                        for k, v in translations.items()))
+        if not (isinstance(code, str)
+                and re.fullmatch(r'[A-Za-z0-9_-]{2,32}', code) is not None):
+            return False
+        if not (isinstance(name, str) and 0 < len(name) <= 100):
+            return False
+        if not isinstance(translations, dict):
+            return False
+        # 限制翻译条目数量，防止构造大量 key 消耗内存
+        if len(translations) > MAX_TRANSLATIONS:
+            return False
+        return all(isinstance(k, str) and isinstance(v, str)
+                   for k, v in translations.items())
 
     def tr(self, key, default=None):
         if key in self.translations:

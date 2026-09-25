@@ -99,8 +99,22 @@ def find_exe_asset(release_data):
 
 
 def extract_sha256(release_data):
+    """
+    从 Release body 中提取 SHA-256。
+    兼容以下写法（大小写不敏感，连字符 / 空格可选）：
+      - SHA-256: <64 位 hex>
+      - SHA256: <64 位 hex>
+      - sha-256 <64 位 hex>
+      - sha256:<64 位 hex>
+      - sha 256 <64 位 hex>
+    返回小写的 64 位十六进制字符串，若未找到则返回 None。
+    """
     body = release_data.get('body', '') or ''
-    m = re.search(r'sha256[:\s]*([a-fA-F0-9]{64})', body)
+    # sha[- ]?256  匹配 sha256 / sha-256 / sha 256
+    # [:\s]*       允许冒号 / 空白分隔
+    # [a-fA-F0-9]{64}  正好 64 位十六进制
+    # re.IGNORECASE  大小写不敏感
+    m = re.search(r'sha[- ]?256[:\s]*([a-fA-F0-9]{64})', body, re.IGNORECASE)
     return m.group(1).lower() if m else None
 
 
