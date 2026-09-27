@@ -17,13 +17,13 @@ class FileViewer(QDialog):
         super().__init__(parent)
         self.parent_window = parent
         self.setWindowTitle(f"查看: {original_name}")
-        self.setModal(False)  # 非模态，允许操作主界面
+        self.setModal(False)
         self.resize(700, 500)
         layout = QVBoxLayout()
         self.tmp_path = None
         self.player = None
         self.file_data = data
-        self.exported_tmp_files = []  # 导出的明文临时文件，关闭时统一清理
+        self.exported_tmp_files = []
 
         if ftype == 'text':
             te = QTextEdit()
@@ -116,7 +116,6 @@ class FileViewer(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # 跟随主窗口的截屏防护设置
         if getattr(self.parent_window, 'screenshot_protection', False):
             protect_window(self, True)
 
@@ -173,6 +172,14 @@ class FileViewer(QDialog):
                 pass
 
     def closeEvent(self, event):
+        # 修复 #8：先停止播放器并清空 media，释放 Windows 媒体管道对临时文件的句柄，
+        # 否则 cleanup_tmp 中的 os.unlink 可能因文件被占用而失败。
+        if self.player is not None:
+            try:
+                self.player.stop()
+                self.player.setMedia(QMediaContent())
+            except Exception:
+                pass
         self.cleanup_tmp()
         for path in self.exported_tmp_files:
             try:

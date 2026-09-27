@@ -108,6 +108,8 @@ class MainWindow(QMainWindow):
             self.setStyleSheet(DARK_STYLE)
         else:
             self.setStyleSheet(LIGHT_STYLE)
+        # 修复 #6：tip_label 颜色由 QSS 中的 QLabel#HintLabel 统一控制，
+        # 主题切换时无需再手动设置样式
 
     def apply_screenshot_protection(self):
         protect_window(self, self.screenshot_protection)
@@ -125,20 +127,6 @@ class MainWindow(QMainWindow):
         self.tag_list.setHeaderHidden(True)
         self.tag_list.setIndentation(15)
         self.tag_list.itemClicked.connect(self.on_tag_clicked)
-        self.tag_list.setStyleSheet("""
-            QTreeWidget {
-                background-color: #2b2b2b;
-                border: 1px solid #555;
-                color: #f0f0f0;
-                outline: none;
-            }
-            QTreeWidget::item { height: 24px; }
-            QTreeWidget::item:selected {
-                background-color: #4a4a4a;
-                color: #ffffff;
-            }
-            QTreeWidget::item:hover { background-color: #3c3c3c; }
-        """)
         left_layout.addWidget(self.tag_list)
 
         tag_btn_layout = QHBoxLayout()
@@ -150,10 +138,11 @@ class MainWindow(QMainWindow):
         tag_btn_layout.addWidget(del_tag_btn)
         left_layout.addLayout(tag_btn_layout)
 
-        tip_label = QLabel("提示：把右侧文件拖到标签上即可归类")
-        tip_label.setStyleSheet("color: #888; font-size: 8pt;")
-        tip_label.setWordWrap(True)
-        left_layout.addWidget(tip_label)
+        # 修复 #6：使用 objectName 由主题 QSS 控制颜色，避免硬编码
+        self.tip_label = QLabel("提示：把右侧文件拖到标签上即可归类")
+        self.tip_label.setObjectName("HintLabel")
+        self.tip_label.setWordWrap(True)
+        left_layout.addWidget(self.tip_label)
 
         left_panel.setLayout(left_layout)
         main_layout.addWidget(left_panel)
@@ -453,7 +442,6 @@ class MainWindow(QMainWindow):
         if entry['is_advanced']:
             methods = self._get_entry_auth_methods(entry)
             if not methods:
-                # 修复 #4：区分"未设置"与"已设置但均未启用"
                 if entry.get('second_auth_methods'):
                     QMessageBox.warning(
                         self, "提示",
@@ -491,7 +479,6 @@ class MainWindow(QMainWindow):
         if entry['is_advanced']:
             methods = self._get_entry_auth_methods(entry)
             if not methods:
-                # 修复 #4：区分"未设置"与"已设置但均未启用"
                 if entry.get('second_auth_methods'):
                     QMessageBox.warning(
                         self, "提示",
@@ -512,6 +499,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开失败: {e}")
 
+    # ---------- 修复 #3：接受 destroyed(QObject*) 信号的多余参数 ----------
+    def _on_settings_dialog_destroyed(self, *args):
+        self._settings_dialog = None
+
     def open_settings(self):
         if self._settings_dialog is not None:
             try:
@@ -523,8 +514,7 @@ class MainWindow(QMainWindow):
                 self._settings_dialog = None
         self._settings_dialog = SettingsDialog(self, self.auth, self.is_recovery_login)
         self._settings_dialog.setAttribute(Qt.WA_DeleteOnClose)
-        self._settings_dialog.destroyed.connect(
-            lambda *_: setattr(self, '_settings_dialog', None))
+        self._settings_dialog.destroyed.connect(self._on_settings_dialog_destroyed)
         self._settings_dialog.show()
 
     def delete_file(self):

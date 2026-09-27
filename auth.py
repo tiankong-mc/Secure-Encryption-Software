@@ -179,9 +179,10 @@ class AuthManager:
     # ================= 登录失败锁定 =================
     LOGIN_MAX_ATTEMPTS = 5
     LOGIN_BASE_LOCK = 60
+    # 修复 #2：锁定时长上限，避免翻倍导致用户实际上被永久锁死
+    LOGIN_MAX_LOCK = 3600
 
     def get_login_lock_remaining(self):
-        """返回当前登录锁定的剩余秒数，0 表示未锁定。"""
         lock_until = self.settings_dict.get('login_lock_until', 0)
         try:
             remaining = int(lock_until) - int(time.time())
@@ -190,7 +191,6 @@ class AuthManager:
         return max(0, remaining)
 
     def register_login_failure(self):
-        """记录一次登录失败。返回 (失败次数, 锁定秒数)。"""
         remaining = self.get_login_lock_remaining()
         if remaining > 0:
             return 0, remaining
@@ -206,6 +206,8 @@ class AuthManager:
                 last_duration = int(self.settings_dict.get('login_lock_duration',
                                                             self.LOGIN_BASE_LOCK))
                 duration = last_duration * 2
+            # 修复 #2：限制上限
+            duration = min(duration, self.LOGIN_MAX_LOCK)
             self.settings_dict['login_lock_duration'] = duration
             self.settings_dict['login_lock_count'] = lock_count + 1
             self.settings_dict['login_lock_until'] = int(time.time()) + duration
@@ -217,19 +219,19 @@ class AuthManager:
         return count, 0
 
     def reset_login_lock(self):
-        """登录成功后调用，清除登录失败计数与所有锁定状态。"""
         self.settings_dict.pop('login_fail_count', None)
         self.settings_dict.pop('login_lock_until', None)
         self.settings_dict.pop('login_lock_duration', None)
         self.settings_dict.pop('login_lock_count', None)
         self._save()
 
-    # ================= 敏感操作失败锁定（与登录锁定独立） =================
+    # ================= 敏感操作失败锁定（与登录独立） =================
     OP_MAX_ATTEMPTS = 5
     OP_BASE_LOCK = 60
+    # 修复 #2：上限同样限制为 1 小时
+    OP_MAX_LOCK = 3600
 
     def get_op_lock_remaining(self):
-        """返回当前敏感操作锁定的剩余秒数，0 表示未锁定。"""
         lock_until = self.settings_dict.get('op_lock_until', 0)
         try:
             remaining = int(lock_until) - int(time.time())
@@ -238,7 +240,6 @@ class AuthManager:
         return max(0, remaining)
 
     def register_op_failure(self):
-        """记录一次敏感操作验证失败。返回 (失败次数, 锁定秒数)。"""
         remaining = self.get_op_lock_remaining()
         if remaining > 0:
             return 0, remaining
@@ -254,6 +255,7 @@ class AuthManager:
                 last_duration = int(self.settings_dict.get('op_lock_duration',
                                                             self.OP_BASE_LOCK))
                 duration = last_duration * 2
+            duration = min(duration, self.OP_MAX_LOCK)
             self.settings_dict['op_lock_duration'] = duration
             self.settings_dict['op_lock_count'] = lock_count + 1
             self.settings_dict['op_lock_until'] = int(time.time()) + duration
@@ -265,7 +267,6 @@ class AuthManager:
         return count, 0
 
     def reset_op_lock(self):
-        """敏感操作验证成功后调用，清除失败计数与锁定状态。"""
         self.settings_dict.pop('op_fail_count', None)
         self.settings_dict.pop('op_lock_until', None)
         self.settings_dict.pop('op_lock_duration', None)

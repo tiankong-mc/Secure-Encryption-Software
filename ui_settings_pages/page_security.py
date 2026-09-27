@@ -59,7 +59,7 @@ class SecurityPage(SettingsPage):
         ul.addWidget(make_page_title(tr("security.title")))
 
         # ---------- 验证方式 ----------
-        ul.addWidget(make_section_title("验证方式"))
+        ul.addWidget(make_section_title(tr("security.section_methods")))
         card1, c1 = make_card()
         self.method_rows = {}
         for i, key in enumerate(['password', 'question', 'totp', 'email']):
@@ -73,7 +73,7 @@ class SecurityPage(SettingsPage):
         rl.setContentsMargins(10, 8, 10, 8)
         rl.addWidget(QLabel(tr("security.recovery")))
         rl.addStretch()
-        recovery_btn = QPushButton("生成")
+        recovery_btn = QPushButton(tr("security.recovery_generate"))
         recovery_btn.setMinimumWidth(80)
         recovery_btn.clicked.connect(self.settings_dialog.generate_recovery)
         rl.addWidget(recovery_btn)
@@ -81,11 +81,11 @@ class SecurityPage(SettingsPage):
         ul.addWidget(card1)
 
         # ---------- 存储位置 ----------
-        ul.addWidget(make_section_title("存储位置"))
+        ul.addWidget(make_section_title(tr("security.section_storage")))
         ul.addWidget(self._build_storage_card())
 
         # ---------- 安全防护 ----------
-        ul.addWidget(make_section_title("安全防护"))
+        ul.addWidget(make_section_title(tr("security.section_protection")))
         card3, c3 = make_card()
 
         self.screenshot_cb = QCheckBox()
@@ -105,15 +105,14 @@ class SecurityPage(SettingsPage):
         c3.addWidget(row_log)
         c3.addWidget(make_hline())
 
-        # 修复 #3：改用语义化变量名，避免和下面保险库备份卡片的 row 变量重名
         self.secure_delete_cb = QCheckBox()
         self.secure_delete_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('secure_delete', False))
         self.secure_delete_cb.stateChanged.connect(
             self.settings_dialog.toggle_secure_delete)
-        row_secure, _ = make_setting_row("安全擦除（删除时覆写数据）", self.secure_delete_cb)
+        row_secure, _ = make_setting_row(tr("security.secure_delete"), self.secure_delete_cb)
         c3.addWidget(row_secure)
-        tip = QLabel("启用后删除文件时会对数据进行多次覆写，速度较慢但难以被恢复工具还原。")
+        tip = QLabel(tr("security.secure_delete_tip"))
         tip.setStyleSheet("color: #888; font-size: 8pt; padding: 4px 10px;")
         tip.setWordWrap(True)
         c3.addWidget(tip)
@@ -121,18 +120,18 @@ class SecurityPage(SettingsPage):
         ul.addWidget(card3)
 
         # ---------- 保险库备份 ----------
-        ul.addWidget(make_section_title("保险库备份"))
+        ul.addWidget(make_section_title(tr("security.section_backup")))
         card4, c4 = make_card()
-        export_btn = QPushButton("导出备份")
+        export_btn = QPushButton(tr("security.backup_export"))
         export_btn.setMinimumWidth(100)
         export_btn.clicked.connect(self.settings_dialog.export_vault_backup)
-        row_export, _ = make_setting_row("导出保险库", export_btn)
+        row_export, _ = make_setting_row(tr("security.backup_export_row"), export_btn)
         c4.addWidget(row_export)
         c4.addWidget(make_hline())
-        import_btn = QPushButton("导入备份")
+        import_btn = QPushButton(tr("security.backup_import"))
         import_btn.setMinimumWidth(100)
         import_btn.clicked.connect(self.settings_dialog.import_vault_backup)
-        row_import, _ = make_setting_row("与当前保险库合并", import_btn)
+        row_import, _ = make_setting_row(tr("security.backup_import_row"), import_btn)
         c4.addWidget(row_import)
         ul.addWidget(card4)
 
@@ -144,7 +143,7 @@ class SecurityPage(SettingsPage):
         row = QWidget()
         rl = QHBoxLayout(row)
         rl.setContentsMargins(10, 8, 10, 8)
-        label = QLabel("加密文件目录")
+        label = QLabel(tr("security.storage_dir"))
         label.setObjectName("SettingLabel")
         rl.addWidget(label)
         path_text = self.settings_dialog.storage.SECRET_DIR
@@ -152,7 +151,7 @@ class SecurityPage(SettingsPage):
         self.secret_dir_label.setStyleSheet("color: #888; font-size: 9pt;")
         self.secret_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         rl.addWidget(self.secret_dir_label, 1)
-        btn = QPushButton("修改")
+        btn = QPushButton(tr("security.storage_change"))
         btn.setMinimumWidth(80)
         btn.clicked.connect(self.settings_dialog.change_secret_dir)
         rl.addWidget(btn)
@@ -170,17 +169,19 @@ class SecurityPage(SettingsPage):
         name_label = QLabel(tr(label_key))
         name_label.setObjectName("SettingLabel")
         rl.addWidget(name_label)
-        status = QLabel("已配置" if configured else "未配置")
+        status = QLabel(tr("security.configured") if configured
+                        else tr("security.not_configured"))
         status.setStyleSheet("color: #888; font-size: 9pt; padding-left: 6px;")
         rl.addWidget(status)
         rl.addStretch()
-        enable_cb = QCheckBox("启用")
+        enable_cb = QCheckBox(tr("security.enable"))
         enable_cb.setChecked(configured and auth.is_method_enabled(method_name))
         enable_cb.setEnabled(configured)
         enable_cb.stateChanged.connect(
             lambda s, k=method_name: self._on_enable_changed(k, s))
         rl.addWidget(enable_cb)
-        action_btn = QPushButton("修改" if configured else "设置")
+        action_btn = QPushButton(tr("security.action_modify") if configured
+                                 else tr("security.action_setup"))
         action_btn.setMinimumWidth(80)
         if key == 'password':
             action_btn.clicked.connect(self.settings_dialog.change_password)
@@ -199,7 +200,9 @@ class SecurityPage(SettingsPage):
         if not ok:
             self.settings_dialog.auth.set_method_enabled(method_name, True)
             self.refresh_rows()
-            QMessageBox.warning(self, "提示", "至少需要保留一种启用的验证方式。")
+            # 修复 #4：使用 i18n
+            QMessageBox.warning(self, tr("common.warning"),
+                                tr("security.need_at_least_one"))
             return
         state_str = "启用" if enabled else "禁用"
         self.settings_dialog.storage.log(f"验证方式 {method_name}: {state_str}")
@@ -231,3 +234,4 @@ class SecurityPage(SettingsPage):
     def retranslate(self):
         self.locked_hint.setText(tr("security.locked_hint"))
         self.verify_btn.setText(tr("security.verify_button"))
+        self.on_config_changed()

@@ -27,33 +27,21 @@ _email_rates = {}
 
 
 def _cleanup_rates_locked(rates, ttl_seconds):
-    """
-    在持有 _rate_lock 的情况下调用。
-    当字典条目数超过上限时，清理过期条目，避免无限增长。
-
-    修复 #5：删除"清理一半就 break"的提前退出条件。
-    清理函数只在字典超限时被调用，遍历 1000 条数据的开销可以接受，
-    提前退出反而可能因为迭代顺序导致部分过期条目没被清理。
-    """
     if len(rates) <= MAX_RATE_ENTRIES:
         return
     now = time.time()
     to_remove = []
     for k, v in list(rates.items()):
         if isinstance(v, dict):
-            # _login_rates 条目
             lock_until = v.get('lock_until', 0)
             failures = v.get('failures', 0)
             last_seen = v.get('last_seen', 0)
-            # 条件一：锁定已过期且已无失败计数
             if lock_until and lock_until < now and failures == 0:
                 to_remove.append(k)
                 continue
-            # 条件二：last_seen 超过 ttl 秒前
             if last_seen and now - last_seen > ttl_seconds:
                 to_remove.append(k)
         else:
-            # _email_rates 条目
             if now - v > ttl_seconds:
                 to_remove.append(k)
     for k in to_remove:
@@ -62,7 +50,6 @@ def _cleanup_rates_locked(rates, ttl_seconds):
 
 @flask_app.before_request
 def restrict_to_local_network():
-    """即使端口被意外暴露，也拒绝公网来源地址。"""
     try:
         address = ipaddress.ip_address(request.remote_addr or '')
         mapped = getattr(address, 'ipv4_mapped', None)
@@ -92,16 +79,17 @@ def _email_code_matches(value):
                 and secrets.compare_digest(value, code))
 
 
+# 修复 #11：更清晰的锁定剩余检查逻辑
 def _login_lock_remaining(client):
     with _rate_lock:
         state = _login_rates.get(client)
         if not state:
             return 0
-        remaining = state.get('lock_until', 0) - time.time()
-        if remaining <= 0 and state.get('lock_until'):
+        lock_until = state.get('lock_until', 0)
+        if lock_until > 0 and lock_until <= time.time():
             _login_rates.pop(client, None)
             return 0
-        return max(0, int(remaining))
+        return max(0, int(lock_until - time.time()))
 
 
 def _record_login_result(client, succeeded):
@@ -303,7 +291,6 @@ def send_code():
 
 
 def start_web_server(storage, auth):
-    """启动 Flask 服务（可被 stop_web_server 关闭）"""
     global web_storage, web_auth, _server, _server_thread
     web_storage = storage
     web_auth = auth
@@ -323,7 +310,6 @@ def start_web_server(storage, auth):
 
 
 def stop_web_server():
-    """停止 Flask 服务"""
     global _server, _server_thread
     if _server is not None:
         try:

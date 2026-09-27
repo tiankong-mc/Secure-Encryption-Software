@@ -72,7 +72,6 @@ class LoginDialog(QDialog):
 
         self._apply_lock_if_needed()
 
-    # ---------- 锁定 ----------
     def _apply_lock_if_needed(self):
         remaining = self.auth.get_login_lock_remaining()
         if remaining > 0:
@@ -114,7 +113,6 @@ class LoginDialog(QDialog):
         self.recovery_btn.setEnabled(True)
         self.storage.log("登录锁定已解除，可以再次尝试")
 
-    # ---------- 恢复代码 ----------
     def recovery_login(self):
         code, ok = QInputDialog.getText(
             self, "紧急恢复",
@@ -127,7 +125,6 @@ class LoginDialog(QDialog):
         else:
             QMessageBox.warning(self, "错误", "恢复代码无效或已使用")
 
-    # ---------- 控件 ----------
     def create_password_widget(self):
         w = QWidget(); l = QVBoxLayout()
         l.addWidget(QLabel("输入密码："))
@@ -170,7 +167,6 @@ class LoginDialog(QDialog):
             self.email_code_time = 0
             QMessageBox.warning(self, "错误", "发送失败")
 
-    # ---------- 验证 ----------
     def accept(self):
         if self.recovery_accepted:
             self.storage.log("登录成功 (恢复代码)")
@@ -238,7 +234,6 @@ class SetupWizard(QWizard):
         self._build_pages()
 
     def _build_pages(self):
-        # 页0：路径
         p0 = QWizardPage()
         p0.setTitle("加密文件存储位置")
         p0.setSubTitle("选择加密后 .vault 文件的保存位置（可保持默认）")
@@ -263,7 +258,6 @@ class SetupWizard(QWizard):
         p0.setLayout(l)
         self.addPage(p0)
 
-        # 页1：欢迎
         p1 = QWizardPage()
         p1.setTitle("欢迎")
         p1.setSubTitle("配置安全设置以保护您的文件")
@@ -271,7 +265,6 @@ class SetupWizard(QWizard):
         l.addWidget(QLabel("请依次设置以下安全选项，至少需要配置一种验证方式。"))
         p1.setLayout(l); self.addPage(p1)
 
-        # 页2：导入保险库（可选）
         p_import = QWizardPage()
         p_import.setTitle("导入保险库（可选）")
         p_import.setSubTitle("已有 SecureVault 备份可在此导入，并恢复验证信息")
@@ -309,7 +302,6 @@ class SetupWizard(QWizard):
         p_import.setLayout(l)
         self.addPage(p_import)
 
-        # 页3：密码
         p3_pwd = QWizardPage()
         p3_pwd.setTitle("密码验证")
         p3_pwd.setSubTitle("（可选）设置登录密码")
@@ -324,7 +316,6 @@ class SetupWizard(QWizard):
         l.addWidget(self.pw_confirm)
         p3_pwd.setLayout(l); self.addPage(p3_pwd)
 
-        # 页4：安全问题
         p4_qa = QWizardPage()
         p4_qa.setTitle("安全问题")
         p4_qa.setSubTitle("（可选）设置三个安全问题和答案")
@@ -343,7 +334,6 @@ class SetupWizard(QWizard):
         l.addWidget(QLabel("问题3")); l.addWidget(self.q3); l.addWidget(self.a3)
         p4_qa.setLayout(l); self.addPage(p4_qa)
 
-        # 页5：TOTP
         p5_totp = QWizardPage()
         p5_totp.setTitle("TOTP 验证")
         p5_totp.setSubTitle("使用 Microsoft Authenticator 等应用扫描二维码")
@@ -361,7 +351,6 @@ class SetupWizard(QWizard):
         self.totp_setup_done = False
         self.addPage(p5_totp)
 
-        # 页6：邮箱
         p6_email = QWizardPage()
         p6_email.setTitle("邮箱验证")
         p6_email.setSubTitle("配置SMTP发送验证码")
@@ -381,7 +370,6 @@ class SetupWizard(QWizard):
         l.addWidget(self.receiver_email)
         p6_email.setLayout(l); self.addPage(p6_email)
 
-        # 页7：完成
         p7_done = QWizardPage()
         p7_done.setTitle("完成")
         p7_done.setSubTitle("设置已保存，点击完成启动程序")
@@ -571,8 +559,14 @@ class SetupWizard(QWizard):
 
     def accept(self):
         if not self._imported_auth:
+            # 密码：未勾选时清空旧配置，与 QA / TOTP 保持一致
             if self.pw_enable.isChecked():
                 self.auth.set_password(self.pw_input.text())
+            else:
+                self.auth.password_hash = None
+                self.auth.settings_dict.pop('password_hash', None)
+
+            # 安全问题：未勾选时清空
             if self.qa_enable.isChecked():
                 qa_list = [
                     (self.q1.text().strip(), self.a1.text().strip()),
@@ -580,11 +574,18 @@ class SetupWizard(QWizard):
                     (self.q3.text().strip(), self.a3.text().strip()),
                 ]
                 self.auth.set_questions(qa_list)
+            else:
+                self.auth.qa = {}
+                self.auth.settings_dict.pop('qa', None)
+
+            # TOTP：未勾选时清空
             if self.totp_enable.isChecked():
                 self.auth.save_totp_secret(self.totp_secret)
             else:
                 self.auth.settings_dict.pop('totp_secret', None)
                 self.auth.totp_secret = None
+
+            # 邮箱：未勾选时清空
             if self.email_enable.isChecked():
                 self.auth.save_email_config(
                     self.smtp_server.text().strip(),
@@ -595,6 +596,7 @@ class SetupWizard(QWizard):
             else:
                 self.auth.email_config = {}
                 self.auth.settings_dict.pop('email', None)
+
             enabled_map = {}
             if self.pw_enable.isChecked(): enabled_map['password'] = True
             if self.qa_enable.isChecked(): enabled_map['question'] = True

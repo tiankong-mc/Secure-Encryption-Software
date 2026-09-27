@@ -4,6 +4,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                               QPushButton, QComboBox, QStackedWidget, QDialogButtonBox,
                               QMessageBox, QWidget, QCheckBox, QGroupBox, QFileDialog,
                               QApplication)
+# DeleteAuthDialog 中用到 Qt.AlignCenter，必须一并导入 Qt
 from PyQt5.QtCore import Qt, QTimer
 
 from auth_helpers import verify_email_code
@@ -51,10 +52,8 @@ class _BaseAuthDialog(QDialog):
         self.stack = None
         self.method_combo = None
         self.btn_box = None
-        # 邮箱验证码状态
         self.email_code = None
         self.email_code_time = 0
-        # 锁定状态（子类按需使用，统一在基类初始化）
         self._lock_timer = None
         self._lock_seconds = 0
         self._lock_label = None
@@ -109,7 +108,6 @@ class _BaseAuthDialog(QDialog):
         layout.addWidget(self.btn_box)
         self.setLayout(layout)
 
-    # ---------- 共享控件 ----------
     def create_password_widget(self):
         w = QWidget(); l = QVBoxLayout()
         l.addWidget(QLabel("输入密码："))
@@ -150,14 +148,7 @@ class _BaseAuthDialog(QDialog):
             self.email_code_time = 0
             QMessageBox.warning(self, "错误", "邮件发送失败，请检查配置")
 
-    # ---------- 共享验证逻辑 ----------
     def _check_credentials(self):
-        """
-        返回：
-          True  —— 验证通过
-          False —— 验证失败（应计入失败次数）
-          None  —— 无法判断（例如邮箱验证码未发送或过期），不计入失败
-        """
         method = self.method_combo.currentText()
         if method == 'password':
             return self.auth.verify_password(self.pw_input.text())
@@ -193,7 +184,6 @@ class AuthDialog(_BaseAuthDialog):
         self.setWindowTitle("二次验证")
         self.setModal(True)
         self.resize(400, 300)
-        # 每次打开对话框都是一次新的会话，重置 fail_count
         self.auth.reset_fail_count()
         self._setup_ui("请通过以下任意一种方式验证：")
 
@@ -229,7 +219,6 @@ class AuthDialog(_BaseAuthDialog):
 
         QMessageBox.warning(self, "验证失败", f"失败 {count} 次")
 
-    # ---------- 紧急处理 ----------
     def _has_usable_email(self):
         cfg = self.auth.email_config or {}
         required = ('smtp_server', 'port', 'sender_email', 'password', 'receiver_email')
@@ -243,7 +232,6 @@ class AuthDialog(_BaseAuthDialog):
         return True
 
     def _close_and_quit(self):
-        """关闭本对话框，并在下一次事件循环 tick 时退出程序。"""
         try:
             self.reject()
         except Exception:
@@ -252,10 +240,7 @@ class AuthDialog(_BaseAuthDialog):
 
     def _trigger_emergency_action(self):
         storage = self.storage
-
-        # 立即重置 fail_count，防止重启后秒触发
         self.auth.reset_fail_count()
-
         parent_widget = self.parent()
 
         entry = storage.get_entry_by_id(self.entry_id)
@@ -327,7 +312,7 @@ class AuthDialog(_BaseAuthDialog):
 
 
 # ============================================================
-#  敏感操作身份验证（带锁定机制，与登录锁定独立）
+#  敏感操作身份验证（带锁定机制）
 # ============================================================
 class DeleteAuthDialog(_BaseAuthDialog):
     """身份验证（删除/修改敏感操作），失败 5 次触发锁定。"""
@@ -343,7 +328,7 @@ class DeleteAuthDialog(_BaseAuthDialog):
 
         layout = self.layout()
         self._lock_label = QLabel("")
-        self._lock_label.setAlignment(Qt.AlignCenter)
+        self._lock_label.setAlignment(Qt.AlignCenter)  # 需要 Qt
         self._lock_label.setStyleSheet(
             "color: #ff6666; font-size: 11pt; padding: 6px; font-weight: bold;")
         self._lock_label.setWordWrap(True)
@@ -352,7 +337,6 @@ class DeleteAuthDialog(_BaseAuthDialog):
 
         self._apply_lock_if_needed()
 
-    # ---------- 锁定 ----------
     def _apply_lock_if_needed(self):
         remaining = self.auth.get_op_lock_remaining()
         if remaining > 0:
@@ -397,7 +381,6 @@ class DeleteAuthDialog(_BaseAuthDialog):
             self._lock_timer = None
         super().closeEvent(event)
 
-    # ---------- 验证 ----------
     def accept(self):
         if not self.allowed_methods:
             super().reject()

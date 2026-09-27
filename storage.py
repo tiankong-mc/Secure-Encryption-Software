@@ -10,6 +10,9 @@ MIN_ENCRYPTED_DATA_SIZE = 12 + 16
 BACKUP_KEY_MAGIC = b'SVBK1'
 BACKUP_MEMBER_ALLOWLIST = ('meta.json', 'index.enc', 'migration.key', 'auth.enc')
 
+# 修复 #4：覆写文件时的分块大小，避免一次性 os.urandom(size) 造成内存爆掉
+DESTROY_CHUNK_SIZE = 1024 * 1024  # 1 MB
+
 
 class StorageManager:
     def __init__(self, settings_manager=None):
@@ -154,12 +157,6 @@ class StorageManager:
     # ---------- 文件管理 ----------
     def add_file(self, local_path, user_dest=None, is_advanced=False,
                  second_auth_methods=None, tags=None, delete_source=False):
-        """
-        加密并保存文件。
-        返回 dict：
-          - uid: 新记录的 ID
-          - delete_error: 若开启 delete_source 且删除原文件失败，则包含错误信息；否则为 None
-        """
         with open(local_path, 'rb') as f:
             plain = f.read()
         file_key = generate_key()
@@ -210,7 +207,6 @@ class StorageManager:
                         pass
             raise
 
-        # 加密全部完成后，如果要求删除源文件则删除
         delete_error = None
         if delete_source:
             try:
@@ -296,11 +292,16 @@ class StorageManager:
                 for _, staged in moved:
                     try:
                         if destroy:
+                            # 修复 #4：分块覆写，避免大文件一次性 os.urandom 造成 MemoryError
                             size = os.path.getsize(staged)
                             with open(staged, 'r+b') as f:
                                 for _ in range(3):
                                     f.seek(0)
-                                    f.write(os.urandom(size))
+                                    remaining = size
+                                    while remaining > 0:
+                                        n = min(DESTROY_CHUNK_SIZE, remaining)
+                                        f.write(os.urandom(n))
+                                        remaining -= n
                                     f.flush()
                                     os.fsync(f.fileno())
                         os.remove(staged)

@@ -20,7 +20,8 @@ class WebPage(SettingsPage):
         self.layout().addWidget(make_page_title(tr("web.title")))
 
         # ---- 状态卡片 ----
-        self.layout().addWidget(make_section_title("服务状态"))
+        self.section_status = make_section_title(tr("web.section_status"))
+        self.layout().addWidget(self.section_status)
         card, c = make_card()
 
         row = QWidget()
@@ -44,7 +45,8 @@ class WebPage(SettingsPage):
         self.layout().addWidget(card)
 
         # ---- 二维码卡片 ----
-        self.layout().addWidget(make_section_title(tr("web.qr_hint")))
+        self.section_qr = make_section_title(tr("web.qr_hint"))
+        self.layout().addWidget(self.section_qr)
         self.qr_card, qc = make_card()
 
         self.qr_label = QLabel()
@@ -59,7 +61,6 @@ class WebPage(SettingsPage):
         self.url_label.setWordWrap(True)
         qc.addWidget(self.url_label)
 
-        # 无局域网 IP 时的额外警告
         self.loopback_warning = QLabel("")
         self.loopback_warning.setAlignment(Qt.AlignCenter)
         self.loopback_warning.setStyleSheet(
@@ -74,12 +75,6 @@ class WebPage(SettingsPage):
         self.refresh_state()
 
     def _get_ip(self):
-        """
-        获取本机局域网 IP。
-        返回 (ip, is_loopback)：
-          - 正常情况：(局域网 IP, False)
-          - 无可用局域网 IP：(127.0.0.1, True)，此时二维码对其他设备无效
-        """
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0)
@@ -133,11 +128,9 @@ class WebPage(SettingsPage):
             self.url_label.setText(url)
 
             if is_loopback:
-                # 修复 #4：无局域网 IP 时显式警告二维码对其他设备无效
                 self.url_label.setStyleSheet("padding: 8px; color: #ffaa00;")
-                self.loopback_warning.setText(
-                    "⚠ 未检测到局域网 IP（当前为 127.0.0.1）。\n"
-                    "其他设备扫码将无法访问，请确认本机已连接到局域网 / Wi-Fi。")
+                # 走 i18n
+                self.loopback_warning.setText(tr("web.loopback_warning"))
                 self.loopback_warning.setVisible(True)
             else:
                 self.url_label.setStyleSheet("padding: 8px; color: #5a8cbf;")
@@ -154,5 +147,7 @@ class WebPage(SettingsPage):
             self.loopback_warning.setVisible(False)
 
     def retranslate(self):
+        self.section_status.setText(tr("web.section_status"))
+        self.section_qr.setText(tr("web.qr_hint"))
         self.warning_label.setText(tr("web.http_warning"))
         self.refresh_state()
