@@ -318,7 +318,7 @@ class SetupWizard(QWizard):
         self.pw_enable = QCheckBox("启用密码验证")
         l.addWidget(self.pw_enable)
         self.pw_input = QLineEdit(); self.pw_input.setEchoMode(QLineEdit.Password)
-        self.pw_input.setPlaceholderText("输入密码（6-8 位，支持大小写字母、数字、符号）")
+        self.pw_input.setPlaceholderText("输入密码（至少 6 个字符，UTF-8 编码不超过 72 字节，支持大小写字母、数字、符号）")
         l.addWidget(self.pw_input)
         self.pw_confirm = QLineEdit(); self.pw_confirm.setEchoMode(QLineEdit.Password)
         self.pw_confirm.setPlaceholderText("确认密码")
@@ -447,8 +447,8 @@ class SetupWizard(QWizard):
             if not self.pw_enable.isChecked():
                 return True
             pw = self.pw_input.text()
-            if not (6 <= len(pw) <= 8):
-                QMessageBox.warning(self, "错误", "密码长度必须为 6-8 位")
+            if not (len(pw) >= 6 and len(pw.encode('utf-8')) <= 72):
+                QMessageBox.warning(self, "错误", "密码长度必须为 至少 6 个字符，UTF-8 编码不超过 72 字节")
                 return False
             if pw != self.pw_confirm.text():
                 QMessageBox.warning(self, "错误", "两次密码输入不一致")
@@ -462,6 +462,9 @@ class SetupWizard(QWizard):
                     [(self.q1, self.a1), (self.q2, self.a2), (self.q3, self.a3)], 1):
                 if not q.text().strip() or not a.text().strip():
                     QMessageBox.warning(self, "错误", f"请完整填写问题 {i} 和答案")
+                    return False
+                if len(a.text().encode('utf-8')) > 72:
+                    QMessageBox.warning(self, '错误', '答案的 UTF-8 编码不超过 72 字节')
                     return False
             return True
 
@@ -511,7 +514,7 @@ class SetupWizard(QWizard):
                 f"验证码已发送到 {receiver}\n请输入收到的 6 位验证码：")
             if not ok:
                 return False
-            if not secrets.compare_digest(verify_code.strip(), str(result)):
+            if not secrets.compare_digest(verify_code.strip().encode('utf-8'), str(result).encode('utf-8')):
                 QMessageBox.warning(self, "错误", "验证码错误，请重试或重新发送")
                 return False
             return True

@@ -1,0 +1,2149 @@
+diff --git a/README.md b/README.md
+index b039f5a..ae0a357 100644
+--- a/README.md
++++ b/README.md
+@@ -16,7 +16,7 @@
+ ### 🔒 核心加密
+ - **AES-256-GCM** 认证加密，与银行、军方同标准
+ - **一文件一密钥**：每个文件独立生成 256 位随机密钥
+-- **主密钥保护**：文件密钥由主密钥封装，主密钥受 Windows DPAPI 保护，绑定当前 Windows 用户账户与电脑硬件
++- **主密钥保护**：文件密钥由主密钥封装，主密钥受 Windows DPAPI 保护，绑定当前 Windows 用户账户的保护上下文
+ - **自定义 `.vault` 格式**：`MAGIC + VERSION + 密钥长度 + 加密的文件密钥 + 加密内容`，不再依赖 pickle，杜绝反序列化攻击
+ - **严格完整性校验**：GCM 认证标签确保密文哪怕改动 1 字节都会解密失败
+ 
+@@ -38,14 +38,14 @@
+ > 这类程序可以调用同一套 DPAPI 接口取出主密钥，从而直接解密保险库。
+ >
+ > 这是"加密密钥绑定本机 Windows 账户"这类设计的固有限制，并非本项目的缺陷。
+-> 如果你的威胁模型包含"电脑已被恶意软件控制"，请配合全盘加密（BitLocker）使用。
++> 全盘加密可保护关机状态的磁盘数据，但不能防御已登录账户下运行的恶意程序。
+ >
+ > 当然，如果有**"高安全需求"**的用户，可以与我联系，我会提出解决方案，**甚至**会给予专门的**"高安全需求"**版本
+ 
+ ### 🔐 失败锁定机制
+ - **登录失败锁定**：连续 5 次失败后锁定 60 秒；后续再触发锁定时长翻倍（60 → 120 → 240 → 480…）。锁定状态持久化，重启程序无法绕过
+ - **敏感操作独立锁定**：删除文件 / 导出解密 / 修改验证信息 / 生成恢复代码 / 导入导出保险库等所有敏感操作共享一套**独立于登录**的锁定机制，两组攻击路径互不污染
+-- **高级文件二次验证紧急处理**：打开高级文件时连续输错 5 次，会把该文件发送到绑定邮箱并删除本地加密副本（邮箱未配置则仅退出程序，保留文件；**只影响当前文件**，不影响其他保险库文件）
++- **高级文件二次验证锁定**：与敏感操作共用持久化失败锁定；关闭窗口或重启程序不会清零，验证失败不会发送或删除文件。
+ 
+ ### 🗂️ 文件管理
+ - **上传加密**：支持拖拽上传、批量选择，自动加密到 `.vault`
+@@ -63,7 +63,8 @@
+ - 局域网内手机扫码访问，无需安装 App
+ - 网页端同样需要验证（支持密码 / 安全问题 / TOTP / 邮箱）
+ - 高级文件在网页端也要二次验证
+-- 只能在局域网访问，自动阻断公网来源
++- 手机访问必须使用 HTTPS；证书初始化失败时停止启动。关闭 HTTPS 后仅允许本机访问。
++- 网页端提供 CSRF 与 Host 校验；登录会话最长 30 分钟，高级文件授权最长 5 分钟。修改验证配置或重启服务会使旧会话失效。
+ - 可手动开启 / 停止服务
+ - **无局域网 IP 时会警告**：二维码指向 `127.0.0.1` 时提示其他设备无法访问
+ 
+@@ -88,7 +89,7 @@
+ ### ⚙️ 其它
+ - **加密文件目录可自定义**：安装向导和设置页均可修改
+ - **配置文件和主密钥固定保存在系统默认位置**，防止用户误改导致安全性降低
+-- **检查更新**：从 GitHub Releases 自动检查并下载新版（支持断点续传、SHA-256 校验、SSL 分级降级）
++- **检查更新**：从 GitHub Releases 自动检查并下载新版（支持断点续传、SHA-256 校验、严格 TLS 证书验证、Ed25519 签名校验）
+ 
+ ---
+ 
+@@ -118,4 +119,15 @@ cd Secure-Encryption-Software
+ pip install -r requirements.txt
+ 
+ # 3. 启动
+-python main.py
+\ No newline at end of file
++python main.py
++
++## 2.5.4 安全修复版
++
++详细修改、兼容性和验证范围见 [SECURITY_FIXES.md](SECURITY_FIXES.md)。
++
++开发者回归测试：
++
++```bash
++pip install -r requirements.txt -r requirements-dev.txt
++python -m pytest -q tests
++```
+diff --git a/SECURITY_FIXES.md b/SECURITY_FIXES.md
+new file mode 100644
+index 0000000..15da067
+--- /dev/null
++++ b/SECURITY_FIXES.md
+@@ -0,0 +1,53 @@
++# SecureVault 2.5.4 安全修复说明
++
++基于提供的 2.5.3 源码修改。没有更改 AES-GCM 密文结构、`.vault` 文件版本、现有发布者签名公钥或备份密钥派生参数。现有密码仍可登录；已验证旧格式备份可以跨主密钥恢复。
++
++## 已修改的问题
++
++| 问题 | 修复 | 主要文件 |
++|---|---|---|
++| SMTP STARTTLS 没有显式要求受信证书及主机名校验，存在中间人攻击风险 | 所有邮件操作共用严格证书验证；465 端口使用 SMTP_SSL，其他端口必须成功 STARTTLS 后才能发送凭据 | `mail_security.py`、`auth.py`、`backup.py`、`ui_web.py` |
++| 请求 HTTPS 后，证书初始化失败自动降级为 HTTP | HTTPS 初始化失败直接停止启动；手动关闭 HTTPS 时只监听 127.0.0.1，界面同步显示本机地址 | `ui_web.py`、`ui_settings_pages/page_web.py` |
++| POST 只在 Origin 存在时校验，没有完整 CSRF 验证；任意 DNS Host 可访问本地服务 | 每个修改请求必须携带会话 CSRF token；保留 Origin 校验，Host 仅允许 localhost 或本地 IP 字面量 | `ui_web.py` |
++| 邮箱验证码只按 IP 绑定，可能被同一 IP 的另一个浏览器覆盖或用于另一验证操作 | 绑定随机浏览器会话标识及登录/具体文件用途；成功后消费；增加收件人全局发送冷却 | `ui_web.py` |
++| 网页身份和高级文件授权缺少明确生命周期；高级验证失败可通过重新登录清零 | 登录最长 30 分钟，高级文件授权最长 5 分钟；配置变化、重新登录或服务重启使相关旧授权失效；操作锁定独立于登录，跨 IP 持久化 | `ui_web.py`、`auth.py` |
++| 高级文件桌面验证重开窗口清零，输错五次触发自动发邮件并删除本地文件 | 与敏感操作共用持久化锁定；重开窗口不能绕过；验证失败不再导出或删除文件 | `ui_dialogs.py` |
++| 配置解密/解析失败被当作首次运行，可能重置验证配置；配置写入使用固定临时文件名 | 已有配置损坏或已有主密钥但配置丢失时停止启动；使用唯一临时文件；首次建密钥前保存未完成配置，保证取消向导后仍可正常重启 | `settings.py` |
++| TOTP 可在同一时间片内重放；恢复登录给设置授权约 31 年 | 成功使用的 TOTP 时间片持久化并拒绝重放；恢复代码只赋予从使用时起 15 分钟的设置授权，重开设置不延长 | `auth.py`、`ui_settings.py` |
++| bcrypt 超长输入可能被截断或抛异常；非 ASCII 验证码可能让比较函数异常；密码最多 8 位限制阻止长口令 | 校验 UTF-8 的 72 字节 bcrypt 边界；格式异常视为失败；比较函数处理 Unicode；新密码允许至少 6 个字符且不超过 72 字节，建议使用更长的口令 | `auth.py`、`auth_helpers.py`、`ui_login.py`、`ui_settings.py`、`ui_web.py` |
++| 备份允许过宽的 Windows 文件名，缺少解压总量和元数据绝对大小限制 | 只接受导出器产生的精确元数据名和 UUID.vault；拒绝路径、设备名、流、链接、重复项；按声明和实际读取量限制解压；验证配置损坏时取消整个导入 | `storage.py` |
++| 更新脚本直接拼接路径和摘要，使用固定脚本名；没有 release SHA 时脚本可能不再次校验已签名文件 | 拒绝批处理扩展/控制字符；必须使用签名验证当次计算的 SHA-256；替换前再次校验；脚本随机命名；下载放在用户配置目录；禁止缺公钥时安装 | `updater.py`、`ui_settings.py` |
++| 解密内容可能被浏览器缓存，网页口令默认可见 | 敏感响应 no-store；增加防嵌入、nosniff、CSP、Referrer-Policy；口令和安全问题答案隐藏显示 | `ui_web.py` |
++
++补充了运行依赖中缺失的 `PyQt5`，增加 `requirements-dev.txt` 和 `tests/`；删除压缩包中的旧字节码缓存。
++
++## 验证结果
++
++- `python -m pytest -q tests`：51 项测试全部通过。
++- `python -m compileall -q .`：通过。
++- `git diff --check`：通过。
++- 真实 Flask 请求、真实 AES-GCM/bcrypt/TOTP/Ed25519 算法、真实 AES ZIP 备份跨密钥恢复均经过测试。
++- 桌面高级文件验证使用真实 PyQt5 的无界面窗口测试，证明重开窗口仍受锁定且不会调用文件删除。
++- 测试只模拟了 Windows DPAPI 与网络 I/O。没有实际发送邮件、下载发布版本、运行替换脚本、访问用户保险库或删除用户文件。
++
++## 兼容性与限制
++
++- `.vault` 与 `.vaultbk` 格式保持不变；备份导入限制为最多 10,000 个成员、单文件最多 1 GiB、元数据单文件最多 16 MiB、解压总量最多 8 GiB。超过限制需分批备份或经评估调整常量。
++- 自定义域名访问网页端将被拒绝，请使用界面给出的 IP 地址。手机访问必须启用 HTTPS。
++- TOTP 成功使用后，应等待下一个 30 秒时间片再进行下一次 TOTP 验证，或使用另一种已启用方式。
++- 配置确已损坏或丢失时，程序不会自动创建新验证配置，需要恢复有效配置。不要删除现有主密钥。
++- 已登录 Windows 账户下的恶意代码仍可能调用 DPAPI 取得主密钥。全盘加密不能消除已登录账户下的这类风险；本次没有重新设计密钥保护模型。
++- 本次执行环境为 Linux。Windows 原生 DPAPI、注册表、媒体播放器、邮件服务端以及打包 EXE 的端到端运行需要在 Windows 上复测。这里交付的是源码修复包，不包含重新打包的 EXE，也不构成完整安全审计或无漏洞保证。
++
++## 开发者复测
++
++```bash
++pip install -r requirements.txt -r requirements-dev.txt
++python -m pytest -q tests
++```
++
++## 实现参考
++
++- Python 官方 SMTP 文档：https://docs.python.org/3/library/smtplib.html
++- Flask 官方安全说明：https://flask.palletsprojects.com/en/stable/web-security/
++- Flask 官方会话与配置：https://flask.palletsprojects.com/en/stable/config/
+diff --git a/auth.py b/auth.py
+index 7c285a1..eb752b4 100644
+--- a/auth.py
++++ b/auth.py
+@@ -1,10 +1,22 @@
+-import bcrypt, pyotp, qrcode, smtplib, secrets, string, base64, hmac, time
++from mail_security import secure_smtp
++import bcrypt, pyotp, qrcode, secrets, string, base64, hmac, time, threading, math
++from functools import wraps
++
++
++def _serialized(method):
++    @wraps(method)
++    def wrapped(self, *args, **kwargs):
++        with self._auth_lock:
++            return method(self, *args, **kwargs)
++    return wrapped
+ from io import BytesIO
+ from email.mime.text import MIMEText
+ 
+ 
+ class AuthManager:
+     def __init__(self, settings_manager):
++        self._auth_lock = threading.RLock()
++        self.recovery_verified_until = 0
+         self.settings = settings_manager
+         self.settings_dict = self.settings.load_settings()
+         self._init_auth_data()
+@@ -20,6 +32,7 @@ class AuthManager:
+         self.recovery_code_used = self.settings_dict.get('recovery_code_used', True)
+         self.method_enabled = self.settings_dict.get('method_enabled', {})
+ 
++    @_serialized
+     def _save(self):
+         self.settings.save_settings(self.settings_dict)
+ 
+@@ -60,26 +73,47 @@ class AuthManager:
+         return True
+ 
+     # ================= 密码 =================
++    @_serialized
+     def set_password(self, password):
+-        self.password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
++        encoded = password.encode('utf-8')
++        if len(password) < 6 or len(encoded) > 72:
++            raise ValueError('密码至少 6 个字符，UTF-8 编码不超过 72 字节')
++        self.password_hash = bcrypt.hashpw(encoded, bcrypt.gensalt()).decode()
+         self.settings_dict['password_hash'] = self.password_hash
+         self._save()
+ 
+     def verify_password(self, password):
+         if not self.password_hash: return False
+-        return bcrypt.checkpw(password.encode(), self.password_hash.encode())
++        return self._check_bcrypt(password, self.password_hash)
+ 
+     # ================= 安全问题 =================
++    @staticmethod
++    def _check_bcrypt(value, stored_hash):
++        if not isinstance(value, str) or not isinstance(stored_hash, str):
++            return False
++        encoded = value.encode('utf-8')
++        if not encoded or len(encoded) > 72:
++            return False
++        try:
++            return bcrypt.checkpw(encoded, stored_hash.encode('ascii'))
++        except (ValueError, TypeError, UnicodeError):
++            return False
++
++    @_serialized
+     def set_questions(self, qa_list):
+-        self.qa = {}
++        qa = {}
+         for q, a in qa_list:
+-            self.qa[q] = bcrypt.hashpw(a.encode(), bcrypt.gensalt()).decode()
++            encoded = a.encode('utf-8')
++            if not encoded or len(encoded) > 72:
++                raise ValueError('安全问题答案的 UTF-8 编码长度必须为 1–72 字节')
++            qa[q] = bcrypt.hashpw(encoded, bcrypt.gensalt()).decode()
++        self.qa = qa
+         self.settings_dict['qa'] = self.qa
+         self._save()
+ 
+     def verify_question(self, question, answer):
+         if question not in self.qa: return False
+-        return bcrypt.checkpw(answer.encode(), self.qa[question].encode())
++        return self._check_bcrypt(answer, self.qa[question])
+ 
+     def get_questions(self):
+         return list(self.qa.keys())
+@@ -93,6 +127,7 @@ class AuthManager:
+     def setup_totp(self):
+         self.totp_secret = pyotp.random_base32()
+         self.settings_dict['totp_secret'] = self.totp_secret
++        self.settings_dict.pop('totp_last_counter', None)
+         self._save()
+         totp = pyotp.TOTP(self.totp_secret)
+         uri = totp.provisioning_uri(name="SecureVault", issuer_name="SecureApp")
+@@ -101,19 +136,40 @@ class AuthManager:
+         img.save(buf, format='PNG')
+         return buf.getvalue()
+ 
++    @_serialized
+     def verify_totp(self, code):
+-        if not self.totp_secret: return False
+-        return pyotp.TOTP(self.totp_secret).verify(code)
++        if not self.totp_secret or not isinstance(code, str):
++            return False
++        if len(code) != 6 or not code.isascii() or not code.isdigit():
++            return False
++        try:
++            totp = pyotp.TOTP(self.totp_secret)
++            now = time.time()
++            counter = int(now // totp.interval)
++            if counter <= self.settings_dict.get('totp_last_counter', -1):
++                return False
++            if not totp.verify(code, for_time=now):
++                return False
++            self.settings_dict['totp_last_counter'] = counter
++            self._save()
++            return True
++        except (ValueError, TypeError):
++            return False
+ 
+     def generate_totp_secret(self):
+         return pyotp.random_base32()
+ 
+     def verify_totp_secret(self, secret, code):
+-        return pyotp.TOTP(secret).verify(code)
++        try:
++            return pyotp.TOTP(secret).verify(code)
++        except (ValueError, TypeError):
++            return False
+ 
++    @_serialized
+     def save_totp_secret(self, secret):
+         self.totp_secret = secret
+         self.settings_dict['totp_secret'] = secret
++        self.settings_dict.pop('totp_last_counter', None)
+         self._save()
+ 
+     # ================= 邮箱 =================
+@@ -136,8 +192,7 @@ class AuthManager:
+         msg['From'] = self.email_config['sender_email']
+         msg['To'] = to_email
+         try:
+-            with smtplib.SMTP(self.email_config['smtp_server'], self.email_config['port'], timeout=20) as server:
+-                server.starttls()
++            with secure_smtp(self.email_config['smtp_server'], self.email_config['port'], timeout=20) as server:
+                 server.login(self.email_config['sender_email'], self.email_config['password'])
+                 server.sendmail(self.email_config['sender_email'], [to_email], msg.as_string())
+             return code
+@@ -152,8 +207,7 @@ class AuthManager:
+             msg['Subject'] = 'SecureVault 邮箱配置测试'
+             msg['From'] = sender_email
+             msg['To'] = receiver_email
+-            with smtplib.SMTP(smtp_server, port, timeout=20) as server:
+-                server.starttls()
++            with secure_smtp(smtp_server, port, timeout=20) as server:
+                 server.login(sender_email, password)
+                 server.sendmail(sender_email, [receiver_email], msg.as_string())
+             return True, code
+@@ -184,11 +238,12 @@ class AuthManager:
+     def get_login_lock_remaining(self):
+         lock_until = self.settings_dict.get('login_lock_until', 0)
+         try:
+-            remaining = int(lock_until) - int(time.time())
++            remaining = math.ceil(float(lock_until) - time.time())
+         except Exception:
+             return 0
+         return max(0, remaining)
+ 
++    @_serialized
+     def register_login_failure(self):
+         remaining = self.get_login_lock_remaining()
+         if remaining > 0:
+@@ -217,6 +272,7 @@ class AuthManager:
+         self._save()
+         return count, 0
+ 
++    @_serialized
+     def reset_login_lock(self):
+         """
+         登录成功后清除当前锁定，但**保留 login_lock_count** 和 login_lock_duration，
+@@ -236,11 +292,12 @@ class AuthManager:
+     def get_op_lock_remaining(self):
+         lock_until = self.settings_dict.get('op_lock_until', 0)
+         try:
+-            remaining = int(lock_until) - int(time.time())
++            remaining = math.ceil(float(lock_until) - time.time())
+         except Exception:
+             return 0
+         return max(0, remaining)
+ 
++    @_serialized
+     def register_op_failure(self):
+         remaining = self.get_op_lock_remaining()
+         if remaining > 0:
+@@ -268,6 +325,7 @@ class AuthManager:
+         self._save()
+         return count, 0
+ 
++    @_serialized
+     def reset_op_lock(self):
+         """同 reset_login_lock：保留 lock_count 和 lock_duration。"""
+         self.settings_dict.pop('op_fail_count', None)
+@@ -275,6 +333,7 @@ class AuthManager:
+         self._save()
+ 
+     # ================= 恢复代码 =================
++    @_serialized
+     def generate_recovery_code(self):
+         chars = string.ascii_uppercase + string.digits
+         raw = ''.join(secrets.choice(chars) for _ in range(20))
+@@ -287,6 +346,7 @@ class AuthManager:
+         self._send_recovery_email(generated=True)
+         return formatted
+ 
++    @_serialized
+     def verify_recovery_code(self, input_code):
+         encrypted_b64 = self.settings_dict.get('recovery_code_encrypted_b64')
+         if not encrypted_b64: return False
+@@ -297,9 +357,12 @@ class AuthManager:
+         except Exception:
+             return False
+         normalized = input_code.strip().upper()
++        if not normalized.isascii():
++            return False
+         if hmac.compare_digest(stored_code, normalized):
+             self.settings_dict['recovery_code_used'] = True
+             self._save()
++            self.recovery_verified_until = time.time() + 900
+             self._send_recovery_email(generated=False)
+             return True
+         return False
+@@ -320,8 +383,7 @@ class AuthManager:
+         msg['From'] = smtp_config['sender_email']
+         msg['To'] = to_email
+         try:
+-            with smtplib.SMTP(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
+-                server.starttls()
++            with secure_smtp(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
+                 server.login(smtp_config['sender_email'], smtp_config['password'])
+                 server.sendmail(smtp_config['sender_email'], [to_email], msg.as_string())
+         except Exception as e:
+@@ -344,6 +406,7 @@ class AuthManager:
+             result[key] = value
+         return result
+ 
++    @_serialized
+     def import_auth_settings(self, data):
+         if not isinstance(data, dict):
+             return False
+diff --git a/auth_helpers.py b/auth_helpers.py
+index 1d35924..c7c6ef3 100644
+--- a/auth_helpers.py
++++ b/auth_helpers.py
+@@ -1,40 +1,40 @@
+-"""验证相关的共享工具函数与常量。
+-
+-将邮箱验证码的 TTL、恒定时间比较逻辑集中在此，
+-避免 ui_dialogs.py 与 ui_login.py 各自维护一份重复实现，
+-未来修改 TTL 只需改这一处。
+-"""
+-
+-import time
+-import secrets
+-
+-
+-# 邮箱验证码有效期（秒）
+-EMAIL_CODE_TTL = 300
+-
+-
+-def verify_email_code(input_value, expected_code, code_time):
+-    """
+-    校验邮箱验证码。
+-
+-    参数：
+-      input_value   - 用户输入的内容
+-      expected_code - 发送过的验证码（None 表示尚未发送）
+-      code_time     - 发送验证码时记录的时间戳（time.time()）
+-
+-    返回：
+-      (status, message)
+-      status:
+-        'ok'      - 校验通过
+-        'fail'    - 校验失败（信息不匹配）
+-        'no_code' - 尚未点击“发送验证码”
+-        'expired' - 验证码已超过有效期
+-      message: 仅当 status 为 'no_code' / 'expired' 时提供提示文本，否则为 None
+-    """
+-    if expected_code is None:
+-        return 'no_code', "请先点击“发送验证码”获取验证码"
+-    if time.time() - code_time > EMAIL_CODE_TTL:
+-        return 'expired', "验证码已过期，请重新发送"
+-    if secrets.compare_digest(str(input_value), str(expected_code)):
+-        return 'ok', None
+-    return 'fail', None
++"""验证相关的共享工具函数与常量。
++
++将邮箱验证码的 TTL、恒定时间比较逻辑集中在此，
++避免 ui_dialogs.py 与 ui_login.py 各自维护一份重复实现，
++未来修改 TTL 只需改这一处。
++"""
++
++import time
++import secrets
++
++
++# 邮箱验证码有效期（秒）
++EMAIL_CODE_TTL = 300
++
++
++def verify_email_code(input_value, expected_code, code_time):
++    """
++    校验邮箱验证码。
++
++    参数：
++      input_value   - 用户输入的内容
++      expected_code - 发送过的验证码（None 表示尚未发送）
++      code_time     - 发送验证码时记录的时间戳（time.time()）
++
++    返回：
++      (status, message)
++      status:
++        'ok'      - 校验通过
++        'fail'    - 校验失败（信息不匹配）
++        'no_code' - 尚未点击“发送验证码”
++        'expired' - 验证码已超过有效期
++      message: 仅当 status 为 'no_code' / 'expired' 时提供提示文本，否则为 None
++    """
++    if expected_code is None:
++        return 'no_code', "请先点击“发送验证码”获取验证码"
++    if time.time() - code_time > EMAIL_CODE_TTL:
++        return 'expired', "验证码已过期，请重新发送"
++    if secrets.compare_digest(str(input_value).encode('utf-8'), str(expected_code).encode('utf-8')):
++        return 'ok', None
++    return 'fail', None
+diff --git a/backup.py b/backup.py
+index 01ff8d6..b745f1e 100644
+--- a/backup.py
++++ b/backup.py
+@@ -1,3 +1,4 @@
++from mail_security import secure_smtp
+ import os
+ import smtplib
+ from email.mime.base import MIMEBase
+@@ -36,8 +37,7 @@ class BackupManager:
+         encoders.encode_base64(part)
+         part.add_header('Content-Disposition', f'attachment; filename={display_name}')
+         msg.attach(part)
+-        with smtplib.SMTP(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
+-            server.starttls()
++        with secure_smtp(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
+             server.login(smtp_config['sender_email'], smtp_config['password'])
+             server.sendmail(smtp_config['sender_email'], [to_email], msg.as_string())
+ 
+diff --git a/constants.py b/constants.py
+index edf8bbc..ce0b587 100644
+--- a/constants.py
++++ b/constants.py
+@@ -1,6 +1,6 @@
+ import os
+ 
+-VERSION = "v2.5.3"
++VERSION = "v2.5.4"
+ WEB_PORT = 8080
+ ISSUES_URL = "https://github.com/tiankong-mc/Secure-Encryption-Software/issues"
+ LANG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lang")
+diff --git a/mail_security.py b/mail_security.py
+new file mode 100644
+index 0000000..3f3a571
+--- /dev/null
++++ b/mail_security.py
+@@ -0,0 +1,20 @@
++"""Certificate-verified SMTP transport shared by every mail operation."""
++import smtplib
++import ssl
++from contextlib import contextmanager
++
++
++@contextmanager
++def secure_smtp(host, port, timeout=20):
++    context = ssl.create_default_context()
++    port = int(port)
++    if port == 465:
++        server = smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
++    else:
++        server = smtplib.SMTP(host, port, timeout=timeout)
++    with server:
++        if port != 465:
++            server.ehlo()
++            server.starttls(context=context)
++            server.ehlo()
++        yield server
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+new file mode 100644
+index 0000000..cc52e8c
+--- /dev/null
++++ b/requirements-dev.txt
+@@ -0,0 +1 @@
++pytest>=8
+diff --git a/requirements.txt b/requirements.txt
+index dc1dc51..a317417 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,4 @@
++PyQt5>=5.15.9
+ psutil
+ pyzipper
+ packaging
+diff --git a/settings.py b/settings.py
+index 850caad..e2cba2b 100644
+--- a/settings.py
++++ b/settings.py
+@@ -1,6 +1,7 @@
+ import os
+ import json
+ import ctypes
++import tempfile
+ from ctypes import wintypes
+ 
+ # 加密文件默认目录（首次运行使用，用户可在设置中修改）
+@@ -55,6 +56,10 @@ class SettingsManager:
+                 raise ValueError("主密钥长度无效")
+             return key
+         else:
++            # Persist an unfinished first-run configuration before creating the
++            # key, so cancelling the setup wizard does not resemble lost config.
++            if not os.path.exists(self.CONFIG_PATH):
++                self.save_settings(self.load_settings())
+             key = os.urandom(32)
+             encrypted = self.dpapi.protect(key)
+             self._atomic_write(self.MASTER_KEY_PATH, encrypted)
+@@ -62,9 +67,9 @@ class SettingsManager:
+ 
+     @staticmethod
+     def _atomic_write(path, data):
+-        temp_path = path + '.tmp'
++        fd, temp_path = tempfile.mkstemp(prefix='.sv-', dir=os.path.dirname(path))
+         try:
+-            with open(temp_path, 'wb') as f:
++            with os.fdopen(fd, 'wb') as f:
+                 f.write(data)
+                 f.flush()
+                 os.fsync(f.fileno())
+@@ -84,11 +89,15 @@ class SettingsManager:
+                 encrypted = f.read()
+             try:
+                 data = self.dpapi.unprotect(encrypted)
+-                self._settings_cache = json.loads(data.decode('utf-8'))
+-                return self._settings_cache
+-            except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+-                self._settings_cache = {}
++                parsed = json.loads(data.decode('utf-8'))
++                if not isinstance(parsed, dict):
++                    raise ValueError("配置根节点必须是对象")
++                self._settings_cache = parsed
+                 return self._settings_cache
++            except (OSError, ValueError, UnicodeDecodeError) as exc:
++                raise RuntimeError("安全配置损坏或无法解密；已停止启动，请恢复有效配置备份。") from exc
++        if os.path.exists(self.MASTER_KEY_PATH):
++            raise RuntimeError("检测到已有主密钥，但安全配置缺失；已停止启动，请恢复配置。")
+         self._settings_cache = {}
+         return self._settings_cache
+ 
+diff --git a/storage.py b/storage.py
+index e23765c..0e0444f 100644
+--- a/storage.py
++++ b/storage.py
+@@ -1,4 +1,4 @@
+-import os, json, shutil, uuid, zipfile, tempfile, struct, time, hashlib, stat
++import os, json, shutil, uuid, zipfile, tempfile, struct, time, hashlib, stat, re
+ import datetime
+ from pathlib import PurePosixPath
+ from collections import Counter
+@@ -11,6 +11,11 @@ ENCRYPTED_FILE_KEY_SIZE = 12 + 32 + 16
+ MIN_ENCRYPTED_DATA_SIZE = 12 + 16
+ BACKUP_KEY_MAGIC = b'SVBK1'
+ BACKUP_MEMBER_ALLOWLIST = ('meta.json', 'index.enc', 'migration.key', 'auth.enc')
++MAX_BACKUP_MEMBERS = 10000
++MAX_BACKUP_BYTES = 8 * 1024 ** 3
++MAX_BACKUP_FILE_BYTES = 1024 ** 3
++MAX_BACKUP_METADATA_BYTES = 16 * 1024 ** 2
++BACKUP_VAULT_NAME = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.vault\Z')
+ 
+ # 修复 R2：安全擦除时使用分块写入，避免一次性 os.urandom(size) 造成内存爆掉
+ DESTROY_CHUNK_SIZE = 1024 * 1024  # 1 MB
+@@ -581,22 +586,53 @@ class StorageManager:
+     @staticmethod
+     def _validate_backup_members(zf):
+         seen = set()
+-        if len(zf.infolist()) > 100000:
++        total = 0
++        if len(zf.infolist()) > MAX_BACKUP_MEMBERS:
+             raise ValueError("备份包文件数量异常")
+         for info in zf.infolist():
+             name = info.filename
+-            path = PurePosixPath(name)
+             mode = (info.external_attr >> 16) & 0xFFFF
+-            if (not name or '\\' in name or ':' in name or path.is_absolute()
+-                    or '..' in path.parts or len(path.parts) != 1 or stat.S_ISLNK(mode)):
+-                raise ValueError(f"备份包包含不安全路径: {name}")
+-            if name not in BACKUP_MEMBER_ALLOWLIST and not name.endswith('.vault'):
+-                raise ValueError(f"备份包包含未知文件: {name}")
++            # Restrict to exact exporter-generated filenames. This also rejects
++            # Windows ADS, device names, trailing dots/spaces and path traversal.
++            if (name not in BACKUP_MEMBER_ALLOWLIST and not BACKUP_VAULT_NAME.fullmatch(name)):
++                raise ValueError(f"备份包包含不安全文件名: {name}")
++            if stat.S_ISLNK(mode) or info.is_dir():
++                raise ValueError("备份包不能包含链接或目录")
++            limit = (MAX_BACKUP_METADATA_BYTES if name in BACKUP_MEMBER_ALLOWLIST
++                     else MAX_BACKUP_FILE_BYTES)
++            if info.file_size < 0 or info.file_size > limit:
++                raise ValueError(f"备份成员超过大小限制: {name}")
++            total += info.file_size
++            if total > MAX_BACKUP_BYTES:
++                raise ValueError("备份解压后的总大小超过限制")
+             if info.file_size > max(10 * 1024 * 1024, info.compress_size * 100):
+                 raise ValueError(f"备份包中的文件压缩比例异常: {name}")
+-            if name in seen:
++            if name.casefold() in seen:
+                 raise ValueError(f"备份包包含重复文件: {name}")
+-            seen.add(name)
++            seen.add(name.casefold())
++        if not {'meta.json', 'index.enc'}.issubset(seen):
++            raise ValueError("备份包缺少必要文件")
++
++    @staticmethod
++    def _extract_backup(zf, destination):
++        StorageManager._validate_backup_members(zf)
++        total = 0
++        for info in zf.infolist():
++            written = 0
++            limit = (MAX_BACKUP_METADATA_BYTES if info.filename in BACKUP_MEMBER_ALLOWLIST
++                     else MAX_BACKUP_FILE_BYTES)
++            with zf.open(info) as source, open(os.path.join(destination, info.filename), 'xb') as target:
++                while True:
++                    chunk = source.read(1024 * 1024)
++                    if not chunk:
++                        break
++                    written += len(chunk)
++                    total += len(chunk)
++                    if written > limit or written > info.file_size or total > MAX_BACKUP_BYTES:
++                        raise ValueError("备份解压数据超过大小限制")
++                    target.write(chunk)
++            if written != info.file_size:
++                raise ValueError("备份成员大小与声明不一致")
+ 
+     @staticmethod
+     def _read_migration_key(path, password):
+@@ -627,7 +663,7 @@ class StorageManager:
+                     self._validate_backup_members(zf)
+                     if password:
+                         zf.setpassword(password.encode())
+-                    zf.extractall(temp_dir)
++                    self._extract_backup(zf, temp_dir)
+             except (RuntimeError, ValueError, zipfile.BadZipFile) as e:
+                 raise ValueError(f"无法打开备份包，请检查文件和密码: {e}") from e
+             meta_path = os.path.join(temp_dir, 'meta.json')
+@@ -635,6 +671,8 @@ class StorageManager:
+                 raise ValueError("无效的备份包：缺少 meta.json")
+             with open(meta_path, 'r', encoding='utf-8') as f:
+                 meta = json.load(f)
++            if not isinstance(meta, dict):
++                raise ValueError('备份元信息格式无效')
+             index_path = os.path.join(temp_dir, 'index.enc')
+             if not os.path.exists(index_path):
+                 raise ValueError("无效的备份包：缺少 index.enc")
+@@ -661,16 +699,17 @@ class StorageManager:
+                     with open(auth_path, 'rb') as f:
+                         raw = decrypt_data(f.read(), backup_master_key)
+                     parsed = json.loads(raw.decode('utf-8'))
+-                    if isinstance(parsed, dict):
+-                        auth_settings = parsed
+-                except Exception:
+-                    auth_settings = None
++                    if not isinstance(parsed, dict):
++                        raise ValueError('验证配置格式无效')
++                    auth_settings = parsed
++                except Exception as exc:
++                    raise ValueError('备份验证配置损坏，已取消导入') from exc
+ 
+             for entry in entries:
+                 if not isinstance(entry, dict) or not isinstance(entry.get('original_name'), str):
+                     raise ValueError("备份索引包含无效记录")
+-                archive_name = os.path.basename(str(entry.get('secret_path', '')))
+-                if not archive_name.endswith('.vault'):
++                archive_name = entry.get('secret_path', '')
++                if not isinstance(archive_name, str) or not BACKUP_VAULT_NAME.fullmatch(archive_name):
+                     raise ValueError("备份索引中的文件名无效")
+                 source_path = os.path.join(temp_dir, archive_name)
+                 if not os.path.isfile(source_path):
+@@ -688,7 +727,8 @@ class StorageManager:
+                 new_id = str(uuid.uuid4())
+                 dest_path = os.path.join(self.SECRET_DIR, new_id + '.vault')
+                 temp_path = dest_path + '.tmp'
+-                with open(temp_path, 'wb') as f:
++                created_paths.append(temp_path)
++                with open(temp_path, 'xb') as f:
+                     f.write(data_pack)
+                     f.flush()
+                     os.fsync(f.fileno())
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..887c4f1
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,8 @@
++import os
++import sys
++import tempfile
++from pathlib import Path
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++os.environ.setdefault('APPDATA', tempfile.gettempdir())
++
++os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+diff --git a/tests/test_security.py b/tests/test_security.py
+new file mode 100644
+index 0000000..e1be3b1
+--- /dev/null
++++ b/tests/test_security.py
+@@ -0,0 +1,506 @@
++"""Regression tests use real crypto/Flask; only OS DPAPI and network I/O are mocked."""
++import base64
++import hashlib
++import io
++import json
++import os
++import re
++import ssl
++import time
++import uuid
++import zipfile
++from concurrent.futures import ThreadPoolExecutor
++from unittest.mock import MagicMock
++
++import bcrypt
++import pyotp
++import pyzipper
++import pytest
++from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
++from cryptography.hazmat.primitives import serialization
++
++import auth
++import crypto
++import mail_security
++import settings
++import storage
++import ui_web as web
++import updater
++
++
++class FakeSettings:
++    """Windows storage substitute, with actual AES master keys."""
++    def __init__(self, root, data=None):
++        self.root = str(root)
++        self.data = data or {}
++        self.key = os.urandom(32)
++        self.dpapi = MagicMock()
++        self.dpapi.protect.side_effect = lambda data: data
++        self.dpapi.unprotect.side_effect = lambda data: data
++    def load_settings(self):
++        return self.data
++    def save_settings(self, data):
++        self.data = dict(data)
++    def get_master_key(self):
++        return self.key
++    def get_secret_dir(self):
++        return self.root
++
++
++@pytest.fixture
++def manager(tmp_path):
++    return auth.AuthManager(FakeSettings(tmp_path))
++
++
++@pytest.fixture
++def web_env(tmp_path, monkeypatch):
++    a = auth.AuthManager(FakeSettings(tmp_path))
++    # Low bcrypt cost here keeps HTTP tests fast; production setters use defaults.
++    a.password_hash = bcrypt.hashpw(b'correct', bcrypt.gensalt(rounds=4)).decode()
++    a.settings_dict['password_hash'] = a.password_hash
++    a.email_config = {'receiver_email': 'receiver@example.test'}
++    a.settings_dict['email'] = a.email_config
++    class Files:
++        entry = {'id': 'file1', 'original_name': '<script>alert(1)</script>.txt',
++                 'is_advanced': True, 'second_auth_methods': ['password', 'email'],
++                 'ext': '.txt', 'type': 'text', 'tags': []}
++        def get_entry_by_id(self, value):
++            return self.entry if value == 'file1' else None
++        def get_all_entries(self):
++            return [self.entry]
++        def get_file_data(self, value):
++            return b'<script>secret</script>'
++        def log(self, value):
++            pass
++    files = Files()
++    monkeypatch.setattr(web, 'web_auth', a)
++    monkeypatch.setattr(web, 'web_storage', files)
++    monkeypatch.setattr(web, '_server', None)
++    monkeypatch.setattr(web, '_login_rates', {})
++    monkeypatch.setattr(web, '_op_rates', {})
++    monkeypatch.setattr(web, '_email_rates', {})
++    monkeypatch.setattr(web, '_email_codes', {})
++    monkeypatch.setattr(web, '_email_global_last_sent', 0)
++    web.flask_app.config.update(TESTING=True, SESSION_COOKIE_SECURE=True)
++    web.flask_app.secret_key = os.urandom(32)
++    return a, files
++
++
++def token(client):
++    response = client.get('/login', base_url='https://localhost')
++    assert response.status_code == 200
++    return re.search(rb'name="csrf_token" value="([^"]+)"', response.data)[1].decode()
++
++
++def post(client, path, data=None, csrf=None, **kwargs):
++    if csrf is None:
++        with client.session_transaction(base_url='https://localhost') as sess:
++            csrf = sess['csrf_token']
++    payload = {'csrf_token': csrf, **(data or {})}
++    return client.post(path, data=payload, base_url='https://localhost', **kwargs)
++
++
++def login(client):
++    t = token(client)
++    response = post(client, '/login', {'method': 'password', 'input': 'correct'}, csrf=t)
++    assert response.status_code == 302
++    client.get('/', base_url='https://localhost')
++
++
++@pytest.mark.parametrize('corrupt', [b'not json', b'[]', b'null'])
++def test_corrupt_config_stops_without_overwriting(tmp_path, corrupt):
++    obj = settings.SettingsManager.__new__(settings.SettingsManager)
++    obj.CONFIG_PATH = str(tmp_path / 'config.dat')
++    obj.MASTER_KEY_PATH = str(tmp_path / 'master.key')
++    obj._settings_cache = None
++    obj.dpapi = MagicMock()
++    obj.dpapi.unprotect.return_value = corrupt
++    with open(obj.CONFIG_PATH, 'wb') as f:
++        f.write(b'existing')
++    with pytest.raises(RuntimeError):
++        obj.load_settings()
++    assert open(obj.CONFIG_PATH, 'rb').read() == b'existing'
++    assert obj._settings_cache is None
++
++
++def test_missing_config_with_existing_key_stops(tmp_path):
++    obj = settings.SettingsManager.__new__(settings.SettingsManager)
++    obj.CONFIG_PATH = str(tmp_path / 'absent')
++    obj.MASTER_KEY_PATH = str(tmp_path / 'key')
++    obj._settings_cache = None
++    (tmp_path / 'key').write_bytes(b'key')
++    with pytest.raises(RuntimeError):
++        obj.load_settings()
++
++
++def test_atomic_config_write_does_not_follow_predictable_tmp_link(tmp_path):
++    victim = tmp_path / 'victim'
++    victim.write_bytes(b'keep')
++    destination = tmp_path / 'config.dat'
++    (tmp_path / 'config.dat.tmp').symlink_to(victim)
++    settings.SettingsManager._atomic_write(str(destination), b'safe')
++    assert victim.read_bytes() == b'keep'
++    assert destination.read_bytes() == b'safe'
++
++
++@pytest.mark.parametrize('port', [587, 465])
++def test_smtp_checks_certificates(monkeypatch, port):
++    smtp = MagicMock()
++    smtp.__enter__.return_value = smtp
++    ctor = MagicMock(return_value=smtp)
++    monkeypatch.setattr(mail_security.smtplib, 'SMTP_SSL' if port == 465 else 'SMTP', ctor)
++    with mail_security.secure_smtp('mail.example.test', port) as server:
++        server.login('user', 'secret')
++    context = (ctor.call_args.kwargs['context'] if port == 465
++               else smtp.starttls.call_args.kwargs['context'])
++    assert context.verify_mode == ssl.CERT_REQUIRED
++    assert context.check_hostname
++
++
++def test_smtp_tls_failure_prevents_credentials(monkeypatch):
++    smtp = MagicMock()
++    smtp.__enter__.return_value = smtp
++    smtp.starttls.side_effect = ssl.SSLCertVerificationError('untrusted')
++    monkeypatch.setattr(mail_security.smtplib, 'SMTP', MagicMock(return_value=smtp))
++    with pytest.raises(ssl.SSLCertVerificationError):
++        with mail_security.secure_smtp('mail.example.test', 587) as server:
++            server.login('user', 'secret')
++    smtp.login.assert_not_called()
++
++
++def test_bcrypt_long_prefix_and_malformed_hash_fail_closed(manager):
++    manager.password_hash = bcrypt.hashpw(b'a' * 72, bcrypt.gensalt(rounds=4)).decode()
++    assert manager.verify_password('a' * 72)
++    assert not manager.verify_password('a' * 72 + 'different')
++    manager.password_hash = 'invalid'
++    assert not manager.verify_password('anything')
++    with pytest.raises(ValueError):
++        manager.set_password('汉' * 25)
++
++
++def test_totp_consumed_once_including_concurrent_requests(manager):
++    manager.save_totp_secret(pyotp.random_base32())
++    code = pyotp.TOTP(manager.totp_secret).now()
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        results = list(pool.map(manager.verify_totp, [code] * 4))
++    assert results.count(True) == 1
++    restored = auth.AuthManager(manager.settings)
++    assert not restored.verify_totp(code)
++
++
++def test_csrf_without_origin_still_rejected(web_env):
++    client = web.flask_app.test_client()
++    token(client)
++    assert client.post('/login', data={'method': 'password', 'input': 'correct'},
++                       base_url='https://localhost').status_code == 403
++    assert client.post('/send_code', base_url='https://localhost').status_code == 403
++
++
++def test_cross_origin_post_rejected_even_with_token(web_env):
++    client = web.flask_app.test_client()
++    t = token(client)
++    assert post(client, '/login', {'method': 'password', 'input': 'correct'}, csrf=t,
++                headers={'Origin': 'https://attacker.example'}).status_code == 403
++
++
++@pytest.mark.parametrize('host', ['evil.example', '8.8.8.8'])
++def test_dns_rebinding_and_public_host_rejected(web_env, host):
++    response = web.flask_app.test_client().get('/login', base_url='https://' + host)
++    assert response.status_code == 403
++
++
++def test_public_client_and_oversized_body_rejected(web_env):
++    client = web.flask_app.test_client()
++    assert client.get('/login', environ_overrides={'REMOTE_ADDR': '8.8.8.8'},
++                      base_url='https://localhost').status_code == 403
++    assert client.post('/login', data={'input': 'x' * 20000},
++                       base_url='https://localhost').status_code == 413
++
++
++def test_security_headers_and_no_cached_plaintext(web_env):
++    client = web.flask_app.test_client()
++    login(client)
++    response = client.get('/', base_url='https://localhost')
++    assert 'no-store' in response.headers['Cache-Control']
++    assert response.headers['X-Frame-Options'] == 'DENY'
++    assert response.headers['X-Content-Type-Options'] == 'nosniff'
++    assert b'&lt;script&gt;' in response.data
++    assert b'<script>alert' not in response.data
++
++
++def test_advanced_files_require_second_auth_and_grant_expires(web_env):
++    client = web.flask_app.test_client()
++    login(client)
++    for path in ['/view/file1', '/download/file1']:
++        assert client.get(path, base_url='https://localhost').status_code == 302
++    client.get('/second_auth/file1', base_url='https://localhost')
++    assert post(client, '/second_auth/file1', {'method': 'password', 'input': 'correct'}).status_code == 200
++    assert client.get('/download/file1', base_url='https://localhost').data == b'<script>secret</script>'
++    with client.session_transaction(base_url='https://localhost') as sess:
++        record = sess['second_auth']
++        record['file1']['expiry'] = time.time() - 1
++        sess['second_auth'] = record
++    assert client.get('/download/file1', base_url='https://localhost').status_code == 302
++
++
++def test_relogin_discards_old_second_auth(web_env):
++    client = web.flask_app.test_client()
++    login(client)
++    with client.session_transaction(base_url='https://localhost') as sess:
++        sess['second_auth'] = {'file1': {'client': '127.0.0.1', 'expiry': time.time() + 60}}
++    login(client)
++    assert client.get('/download/file1', base_url='https://localhost').status_code == 302
++
++
++@pytest.mark.parametrize('reason', ['expiry', 'password_changed', 'client_changed'])
++def test_session_expires_and_invalidates_on_security_changes(web_env, reason):
++    a, _ = web_env
++    client = web.flask_app.test_client()
++    login(client)
++    kwargs = {}
++    if reason == 'expiry':
++        with client.session_transaction(base_url='https://localhost') as sess:
++            sess['auth_expiry'] = time.time() - 1
++    elif reason == 'password_changed':
++        a.settings_dict['password_hash'] = 'changed'
++    else:
++        kwargs['environ_overrides'] = {'REMOTE_ADDR': '192.168.0.2'}
++    assert client.get('/', base_url='https://localhost', **kwargs).status_code == 302
++
++
++def test_email_codes_isolated_by_browser_and_operation(web_env):
++    first, second = web.flask_app.test_client(), web.flask_app.test_client()
++    for client, sid in [(first, 'browser1'), (second, 'browser2')]:
++        token(client)
++        with client.session_transaction(base_url='https://localhost') as sess:
++            sess['challenge_id'] = sid
++    web._store_email_code(('browser1', 'login'), '123456')
++    assert post(second, '/login', {'method': 'email', 'input': '123456'}).status_code == 200
++    assert post(first, '/login', {'method': 'email', 'input': '123456'}).status_code == 302
++    web._store_email_code(('browser1', 'login'), '654321')
++    assert not web._email_code_matches(('browser1', 'second_auth:file1'), '654321')
++    assert web._email_code_matches(('browser1', 'login'), '654321')
++    assert not web._email_code_matches(('browser1', 'login'), '654321')
++
++
++def test_second_auth_failures_cannot_be_cleared_by_relogin(web_env):
++    a, _ = web_env
++    client = web.flask_app.test_client()
++    login(client)
++    for _ in range(5):
++        post(client, '/second_auth/file1', {'method': 'password', 'input': 'wrong'})
++    assert a.get_op_lock_remaining() > 0
++    login(client)
++    assert post(client, '/second_auth/file1', {'method': 'password', 'input': 'correct'}).status_code == 429
++
++
++def test_lockout_shared_across_ip_and_survives_auth_reload(web_env):
++    a, _ = web_env
++    for i in range(5):
++        client = web.flask_app.test_client()
++        t = token(client)
++        post(client, '/login', {'method': 'password', 'input': 'wrong'}, csrf=t,
++             environ_overrides={'REMOTE_ADDR': f'192.168.0.{i+1}'})
++    assert a.get_login_lock_remaining() > 0
++    assert auth.AuthManager(a.settings).get_login_lock_remaining() > 0
++    client = web.flask_app.test_client()
++    t = token(client)
++    assert post(client, '/login', {'method': 'password', 'input': 'correct'}, csrf=t).status_code == 429
++
++
++def test_email_recipient_cooldown_not_bypassed_by_new_ip(web_env):
++    assert web._reserve_email_send('192.168.0.1') == 0
++    assert web._reserve_email_send('192.168.0.2') > 0
++
++
++def test_https_failure_never_starts_plain_http(web_env, monkeypatch):
++    monkeypatch.setattr(web, '_ensure_self_signed_cert', MagicMock(side_effect=RuntimeError('broken')))
++    make = MagicMock()
++    monkeypatch.setattr(web, 'make_server', make)
++    assert not web.start_web_server(web.web_storage, web.web_auth)
++    make.assert_not_called()
++
++
++def test_http_can_only_bind_loopback_and_stop_revokes_sessions(web_env, monkeypatch):
++    client = web.flask_app.test_client()
++    login(client)
++    make = MagicMock()
++    monkeypatch.setattr(web, 'make_server', make)
++    monkeypatch.setattr(web.threading, 'Thread', MagicMock())
++    assert web.start_web_server(web.web_storage, web.web_auth, enable_https=False)
++    assert make.call_args.args[0] == '127.0.0.1'
++    web.stop_web_server()
++    assert client.get('/', base_url='https://localhost').status_code == 302
++
++
++@pytest.mark.parametrize('name', ['../escape.vault', 'NUL.vault', 'folder/file.vault',
++                                   'file.vault:stream', 'CON.vault', 'file.vault.',
++                                   'file.vault ', 'x\\escape.vault'])
++def test_backup_rejects_windows_and_traversal_paths(name):
++    buffer = io.BytesIO()
++    with zipfile.ZipFile(buffer, 'w') as zf:
++        zf.writestr('meta.json', '{}')
++        zf.writestr('index.enc', b'x')
++        zf.writestr(name, b'x')
++    with zipfile.ZipFile(buffer) as zf, pytest.raises(ValueError):
++        storage.StorageManager._validate_backup_members(zf)
++
++
++def test_backup_total_and_metadata_limits(monkeypatch):
++    infos = [zipfile.ZipInfo('meta.json'), zipfile.ZipInfo('index.enc')]
++    infos[0].file_size = storage.MAX_BACKUP_METADATA_BYTES + 1
++    infos[0].compress_size = infos[0].file_size
++    zf = MagicMock()
++    zf.infolist.return_value = infos
++    with pytest.raises(ValueError):
++        storage.StorageManager._validate_backup_members(zf)
++    infos[0].file_size = infos[1].file_size = 6
++    infos[1].compress_size = 6
++    monkeypatch.setattr(storage, 'MAX_BACKUP_BYTES', 10)
++    with pytest.raises(ValueError):
++        storage.StorageManager._validate_backup_members(zf)
++
++
++def test_real_portable_backup_roundtrip_and_wrong_password(tmp_path):
++    source_settings = FakeSettings(tmp_path / 'source')
++    source = storage.StorageManager(source_settings)
++    path = tmp_path / 'plain.txt'
++    path.write_bytes(b'confidential test')
++    source.add_file(str(path), is_advanced=True, second_auth_methods=['password'])
++    backup = tmp_path / 'backup.vaultbk'
++    source.export_vault(str(backup), 'backup-password', auth_settings={'password_hash': 'test'})
++    destination = storage.StorageManager(FakeSettings(tmp_path / 'dest'))
++    result = destination.import_vault(str(backup), 'backup-password')
++    assert result['imported_count'] == 1
++    entry = destination.index[0]
++    assert entry['is_advanced']
++    assert destination.get_file_data(entry['id']) == path.read_bytes()
++    assert result['auth_settings'] == {'password_hash': 'test'}
++    before = list(destination.index)
++    with pytest.raises(ValueError):
++        destination.import_vault(str(backup), 'incorrect')
++    assert destination.index == before
++
++
++def test_backup_failure_rolls_back_partial_import(tmp_path):
++    source = storage.StorageManager(FakeSettings(tmp_path / 'source'))
++    path = tmp_path / 'plain.txt'
++    path.write_bytes(b'data')
++    source.add_file(str(path))
++    # A corrupt second record fails after the first file was staged.
++    source.index.append({**source.index[0], 'id': str(uuid.uuid4()),
++                         'original_name': '\x00bad'})
++    backup = tmp_path / 'backup.vaultbk'
++    source.export_vault(str(backup), 'backup-password')
++    destination = storage.StorageManager(FakeSettings(tmp_path / 'dest'))
++    with pytest.raises(ValueError):
++        destination.import_vault(str(backup), 'backup-password')
++    assert destination.index == []
++    assert list((tmp_path / 'dest').glob('*.vault*')) == []
++
++
++@pytest.mark.parametrize('value', ['bad%PATH%', 'bad!path', 'bad"path', 'bad\npath', 'bad&path'])
++def test_updater_rejects_batch_path_injection(tmp_path, value):
++    with pytest.raises(updater.UpdateError):
++        updater.write_update_bat(str(tmp_path), value, 'target.exe', 'a' * 64)
++    assert not list(tmp_path.glob('*.bat'))
++
++
++def test_updater_requires_hash_and_generates_unique_scripts(tmp_path):
++    with pytest.raises(updater.UpdateError):
++        updater.write_update_bat(str(tmp_path), 'download.exe', 'target.exe')
++    paths = [updater.write_update_bat(str(tmp_path), 'download.exe', 'target.exe', 'a' * 64)
++             for _ in range(2)]
++    assert paths[0] != paths[1]
++    assert 'certutil -hashfile' in open(paths[0]).read()
++
++
++def test_signature_returns_exact_verified_digest_and_rejects_tampering(tmp_path):
++    key = Ed25519PrivateKey.generate()
++    pub = base64.b64encode(key.public_key().public_bytes(
++        serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
++    path = tmp_path / 'update.exe'
++    data = b'genuine publisher binary'
++    path.write_bytes(data)
++    sig = key.sign(hashlib.sha256(data).digest())
++    assert updater.verified_update_sha256(str(path), sig, pub) == hashlib.sha256(data).hexdigest()
++    assert updater.verify_update_signature(str(path), sig, pub)
++    path.write_bytes(b'tampered')
++    assert updater.verified_update_sha256(str(path), sig, pub) is None
++
++
++def test_aes_gcm_rejects_modified_ciphertext_and_handles_empty_file():
++    key = os.urandom(32)
++    encrypted = crypto.encrypt_data(b'secret', key)
++    with pytest.raises(ValueError):
++        crypto.decrypt_data(encrypted[:-1] + bytes([encrypted[-1] ^ 1]), key)
++    assert crypto.decrypt_data(crypto.encrypt_data(b'', key), key) == b''
++
++
++def test_non_ascii_verification_input_is_a_failure_not_a_crash(web_env, manager):
++    import auth_helpers
++    client = web.flask_app.test_client()
++    t = token(client)
++    assert post(client, '/login', {'method': 'email', 'input': '你好'}, csrf=t).status_code == 200
++    assert post(client, '/login', {'csrf_token': '你好', 'input': 'wrong'}, csrf=t).status_code == 403
++    web._store_email_code(('browser', 'login'), '123456')
++    assert not web._email_code_matches(('browser', 'login'), '你好')
++    assert auth_helpers.verify_email_code('你好', '123456', time.time())[0] == 'fail'
++    manager.generate_recovery_code()
++    assert not manager.verify_recovery_code('你好')
++
++
++def test_desktop_second_auth_reopening_keeps_lock_and_never_deletes(manager, monkeypatch):
++    from PyQt5.QtWidgets import QApplication, QDialog
++    import ui_dialogs
++    application = QApplication.instance() or QApplication([])
++    manager.password_hash = bcrypt.hashpw(b'correct', bcrypt.gensalt(rounds=4)).decode()
++    manager.settings_dict['password_hash'] = manager.password_hash
++    files = MagicMock()
++    monkeypatch.setattr(ui_dialogs.QMessageBox, 'warning', MagicMock())
++    for _ in range(5):
++        dialog = ui_dialogs.AuthDialog(None, manager, ['password'], 'file1', files)
++        dialog.pw_input.setText('wrong')
++        dialog.accept()
++        assert dialog.result() != QDialog.Accepted
++        dialog.close()
++    assert manager.get_op_lock_remaining() > 0
++    dialog = ui_dialogs.AuthDialog(None, manager, ['password'], 'file1', files)
++    dialog.pw_input.setText('correct')
++    dialog.accept()
++    assert dialog.result() != QDialog.Accepted
++    files.remove_entry.assert_not_called()
++    files.get_file_data.assert_not_called()
++    dialog.close()
++    assert application is not None
++
++
++def test_cancelled_first_setup_can_restart_without_lost_config_error(tmp_path):
++    obj = settings.SettingsManager.__new__(settings.SettingsManager)
++    obj.CONFIG_PATH = str(tmp_path / 'config.dat')
++    obj.MASTER_KEY_PATH = str(tmp_path / 'master.key')
++    obj._settings_cache = None
++    obj.dpapi = MagicMock()
++    obj.dpapi.protect.side_effect = lambda data: data
++    obj.dpapi.unprotect.side_effect = lambda data: data
++    key = obj.get_master_key()
++    obj._settings_cache = None
++    assert obj.load_settings() == {}
++    assert obj.get_master_key() == key
++
++
++def test_recovery_grant_expires_and_code_cannot_be_reused(manager, monkeypatch):
++    monkeypatch.setattr(auth.time, 'time', lambda: 1000)
++    code = manager.generate_recovery_code()
++    assert manager.verify_recovery_code(code)
++    assert manager.recovery_verified_until == 1900
++    monkeypatch.setattr(auth.time, 'time', lambda: 1100)
++    assert not manager.verify_recovery_code(code)
++    assert manager.recovery_verified_until == 1900
++
++
++def test_long_new_password_allowed_and_existing_short_password_still_works(manager):
++    manager.set_password('a strong longer passphrase')
++    assert manager.verify_password('a strong longer passphrase')
++    manager.password_hash = bcrypt.hashpw(b'legacy', bcrypt.gensalt(rounds=4)).decode()
++    assert manager.verify_password('legacy')
+diff --git a/ui_dialogs.py b/ui_dialogs.py
+index bcd26c9..8428a8b 100644
+--- a/ui_dialogs.py
++++ b/ui_dialogs.py
+@@ -220,144 +220,6 @@ class _BaseAuthDialog(QDialog):
+         return False
+ 
+ 
+-class AuthDialog(_BaseAuthDialog):
+-    MAX_ATTEMPTS = 5
+-
+-    def __init__(self, parent, auth_manager, allowed_methods, entry_id, storage):
+-        filtered = _filter_methods(auth_manager, allowed_methods)
+-        super().__init__(parent, auth_manager, filtered)
+-        self.entry_id = entry_id
+-        self.storage = storage
+-        self.setWindowTitle("二次验证")
+-        self.setModal(True)
+-        self.resize(400, 300)
+-        self.auth.reset_fail_count()
+-        self._setup_ui("请通过以下任意一种方式验证：")
+-
+-    def accept(self):
+-        if not self.allowed_methods:
+-            super().reject()
+-            return
+-
+-        result = self._check_credentials()
+-        if result is None:
+-            return
+-        if result:
+-            self.auth.reset_fail_count()
+-            self.storage.log(f"二次验证成功 (文件ID: {self.entry_id})")
+-            super().accept()
+-            return
+-
+-        count = self.auth.increment_fail_count()
+-        self.storage.log(f"二次验证失败 (文件ID: {self.entry_id})")
+-
+-        if count >= self.MAX_ATTEMPTS:
+-            self.storage.log(
+-                f"二次验证错误次数过多，触发紧急处理 (文件ID: {self.entry_id})")
+-            QMessageBox.warning(
+-                self, "验证失败",
+-                f"失败 {count} 次。\n\n"
+-                "错误次数已达上限，即将执行紧急处理：\n"
+-                "  · 将该文件发送到绑定邮箱\n"
+-                "  · 删除该文件的本地加密副本\n"
+-                "  · 退出程序")
+-            self._trigger_emergency_action()
+-            return
+-
+-        QMessageBox.warning(self, "验证失败", f"失败 {count} 次")
+-
+-    def _has_usable_email(self):
+-        cfg = self.auth.email_config or {}
+-        required = ('smtp_server', 'port', 'sender_email', 'password', 'receiver_email')
+-        if not all(cfg.get(k) for k in required):
+-            return False
+-        try:
+-            if 'email' not in self.auth.get_enabled_methods():
+-                return False
+-        except Exception:
+-            return False
+-        return True
+-
+-    def _close_and_quit(self):
+-        try:
+-            self.reject()
+-        except Exception:
+-            pass
+-        QTimer.singleShot(0, QApplication.quit)
+-
+-    def _trigger_emergency_action(self):
+-        storage = self.storage
+-        self.auth.reset_fail_count()
+-        parent_widget = self.parent()
+-
+-        entry = storage.get_entry_by_id(self.entry_id)
+-        if not entry:
+-            storage.log("紧急处理：找不到目标记录，程序将退出")
+-            QMessageBox.critical(parent_widget, "错误",
+-                                 "找不到目标文件记录，程序将退出。")
+-            self._close_and_quit()
+-            return
+-
+-        if not self._has_usable_email():
+-            storage.log("紧急处理：未配置或未启用邮箱验证方式，程序退出，本地文件保留")
+-            QMessageBox.critical(
+-                parent_widget, "安全退出",
+-                "错误次数过多，且未配置或未启用邮箱验证方式。\n\n"
+-                "为避免误删数据，本地加密文件将保留，程序将退出。")
+-            self._close_and_quit()
+-            return
+-
+-        email_cfg = self.auth.email_config
+-        to_email = email_cfg.get('receiver_email')
+-
+-        vault_path = entry.get('secret_path')
+-        user_path = entry.get('user_path')
+-        if not (vault_path and os.path.exists(vault_path)):
+-            if user_path and os.path.exists(user_path):
+-                vault_path = user_path
+-            else:
+-                storage.log(f"紧急处理：文件已不存在 ({entry['id']})，程序将退出")
+-                QMessageBox.critical(
+-                    parent_widget, "文件丢失",
+-                    "错误次数过多，但目标加密文件已不存在。\n程序将退出。")
+-                self._close_and_quit()
+-                return
+-
+-        display_name = entry.get('original_name', 'file') + '.vault'
+-        files = [(vault_path, display_name)]
+-
+-        from backup import BackupManager
+-        try:
+-            storage.log(f"紧急处理：正在发送文件 {entry.get('original_name')} 到 {to_email}")
+-            BackupManager.send_multiple_vault_files(files, to_email, email_cfg)
+-            storage.log("紧急处理：邮件发送成功")
+-        except Exception as e:
+-            storage.log(f"紧急处理：邮件发送失败 {e}")
+-            QMessageBox.critical(
+-                parent_widget, "发送失败",
+-                f"将该文件发送到邮箱失败：\n{e}\n\n"
+-                "为避免误删数据，本地加密文件将保留，程序将退出。")
+-            self._close_and_quit()
+-            return
+-
+-        storage.log(f"紧急处理：删除本地文件 {entry.get('original_name')}")
+-        try:
+-            storage.remove_entry(self.entry_id, destroy=True)
+-            QMessageBox.information(
+-                parent_widget, "紧急处理完成",
+-                f"文件已发送到：{to_email}\n"
+-                f"本地加密副本已删除。\n\n程序将退出。")
+-        except Exception as e:
+-            storage.log(f"紧急处理：删除失败 {e}")
+-            QMessageBox.warning(
+-                parent_widget, "删除失败",
+-                f"文件已发送到：{to_email}\n\n"
+-                f"但本地文件删除失败：\n{e}\n\n"
+-                f"请手动清理后退出程序。")
+-
+-        self._close_and_quit()
+-
+-
+ class DeleteAuthDialog(_BaseAuthDialog):
+     def __init__(self, parent, auth_manager, allowed_methods):
+         filtered = _filter_methods(auth_manager, allowed_methods)
+@@ -463,6 +325,23 @@ class DeleteAuthDialog(_BaseAuthDialog):
+             QMessageBox.warning(self, "验证失败", f"失败 {fail_count} 次")
+ 
+ 
++class AuthDialog(DeleteAuthDialog):
++    """Per-file verification uses the same persistent operation lockout.
++
++    A failed verification never deletes or exports a protected file.
++    """
++    def __init__(self, parent, auth_manager, allowed_methods, entry_id, storage):
++        self.entry_id = entry_id
++        self.storage = storage
++        super().__init__(parent, auth_manager, allowed_methods)
++        self.setWindowTitle("二次验证")
++
++    def accept(self):
++        super().accept()
++        if self.result() == QDialog.Accepted:
++            self.storage.log(f"二次验证成功 (文件ID: {self.entry_id})")
++
++
+ class UploadDialog(QDialog):
+     """上传文件选项"""
+     def __init__(self, parent, file_path):
+diff --git a/ui_login.py b/ui_login.py
+index 1ffed7d..31cd55b 100644
+--- a/ui_login.py
++++ b/ui_login.py
+@@ -318,7 +318,7 @@ class SetupWizard(QWizard):
+         self.pw_enable = QCheckBox("启用密码验证")
+         l.addWidget(self.pw_enable)
+         self.pw_input = QLineEdit(); self.pw_input.setEchoMode(QLineEdit.Password)
+-        self.pw_input.setPlaceholderText("输入密码（6-8 位，支持大小写字母、数字、符号）")
++        self.pw_input.setPlaceholderText("输入密码（至少 6 个字符，UTF-8 编码不超过 72 字节，支持大小写字母、数字、符号）")
+         l.addWidget(self.pw_input)
+         self.pw_confirm = QLineEdit(); self.pw_confirm.setEchoMode(QLineEdit.Password)
+         self.pw_confirm.setPlaceholderText("确认密码")
+@@ -447,8 +447,8 @@ class SetupWizard(QWizard):
+             if not self.pw_enable.isChecked():
+                 return True
+             pw = self.pw_input.text()
+-            if not (6 <= len(pw) <= 8):
+-                QMessageBox.warning(self, "错误", "密码长度必须为 6-8 位")
++            if not (len(pw) >= 6 and len(pw.encode('utf-8')) <= 72):
++                QMessageBox.warning(self, "错误", "密码长度必须为 至少 6 个字符，UTF-8 编码不超过 72 字节")
+                 return False
+             if pw != self.pw_confirm.text():
+                 QMessageBox.warning(self, "错误", "两次密码输入不一致")
+@@ -463,6 +463,9 @@ class SetupWizard(QWizard):
+                 if not q.text().strip() or not a.text().strip():
+                     QMessageBox.warning(self, "错误", f"请完整填写问题 {i} 和答案")
+                     return False
++                if len(a.text().encode('utf-8')) > 72:
++                    QMessageBox.warning(self, '错误', '答案的 UTF-8 编码不超过 72 字节')
++                    return False
+             return True
+ 
+         if page_id == 5:
+@@ -511,7 +514,7 @@ class SetupWizard(QWizard):
+                 f"验证码已发送到 {receiver}\n请输入收到的 6 位验证码：")
+             if not ok:
+                 return False
+-            if not secrets.compare_digest(verify_code.strip(), str(result)):
++            if not secrets.compare_digest(verify_code.strip().encode('utf-8'), str(result).encode('utf-8')):
+                 QMessageBox.warning(self, "错误", "验证码错误，请重试或重新发送")
+                 return False
+             return True
+diff --git a/ui_settings.py b/ui_settings.py
+index 836f173..1fe67c7 100644
+--- a/ui_settings.py
++++ b/ui_settings.py
+@@ -96,10 +96,9 @@ class SettingsDialog(QDialog):
+ 
+         # 修复 C2：用时间戳控制解锁有效期，而非永久 bool
+         if is_recovery_login:
+-            # L-A1：恢复登录模式下，用户在登录界面已通过恢复代码完成强验证，
+-            # 且通常伴随紧急场景（忘记密码等）。此处视为整场会话都处于解锁状态。
+-            # 10**9 秒 ≈ 31.7 年，远超一次会话可能持续的时间。
+-            self._unlocked_until = time.time() + 10 ** 9
++            # A recovery grant expires 15 minutes after the code was used;
++            # reopening settings must not extend it.
++            self._unlocked_until = getattr(self.auth, 'recovery_verified_until', 0.0)
+         else:
+             self._unlocked_until = 0.0
+         self._download_worker = None
+@@ -508,7 +507,8 @@ class SettingsDialog(QDialog):
+ 
+             # 用 URL 哈希做临时文件唯一标识，避免旧版本残留污染断点续传
+             url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()[:8]
+-            temp_dir = tempfile.gettempdir()
++            temp_dir = os.path.join(self.auth.settings.CONFIG_DIR, 'updates')
++            os.makedirs(temp_dir, exist_ok=True)
+             temp_path = os.path.join(temp_dir, f"SecureVault_update_{url_hash}.exe")
+ 
+             try:
+@@ -620,7 +620,7 @@ class SettingsDialog(QDialog):
+                 return
+ 
+             try:
+-                sig_ok = updater.verify_update_signature(path, sig_bytes)
++                sig_ok = updater.verified_update_sha256(path, sig_bytes)
+             except Exception as e:
+                 QMessageBox.critical(
+                     self, tr("common.error"),
+@@ -641,9 +641,13 @@ class SettingsDialog(QDialog):
+                 self._cleanup_download_worker()
+                 return
+         else:
+-            self.storage.log(
+-                "警告：未配置 SIGNING_PUBLIC_KEY，跳过 Ed25519 签名校验。"
+-                "建议在 updater.py 中配置发布者公钥以获得更强保护。")
++            QMessageBox.critical(self, tr("common.error"), "未配置发布者签名公钥，已拒绝自动安装。")
++            self._cleanup_download_worker()
++            return
++
++        # Pin the digest produced during signature verification; do not reopen
++        # the file and accidentally trust bytes swapped in after verification.
++        expected_sha = sig_ok
+ 
+         # ---------- 3. 提示完成 ----------
+         QMessageBox.information(
+@@ -711,11 +715,11 @@ class SettingsDialog(QDialog):
+         if not self._verify_identity(): return
+         pw, ok = QInputDialog.getText(
+             self, "修改密码",
+-            "输入新密码（6-8 位，支持大小写字母、数字、符号）：",
++            "输入新密码（至少 6 个字符，UTF-8 编码不超过 72 字节，支持大小写字母、数字、符号）：",
+             QLineEdit.Password)
+         if not ok: return
+-        if not (6 <= len(pw) <= 8):
+-            QMessageBox.warning(self, tr("common.error"), "密码长度必须为 6-8 位")
++        if not (len(pw) >= 6 and len(pw.encode('utf-8')) <= 72):
++            QMessageBox.warning(self, tr("common.error"), "密码长度必须为 至少 6 个字符，UTF-8 编码不超过 72 字节")
+             return
+         confirm, ok = QInputDialog.getText(self, "修改密码", "再次输入新密码：", QLineEdit.Password)
+         if not ok or pw != confirm:
+@@ -741,6 +745,9 @@ class SettingsDialog(QDialog):
+         if dialog.exec_() != QDialog.Accepted: return
+         if not all([q1.text(), a1.text(), q2.text(), a2.text(), q3.text(), a3.text()]):
+             QMessageBox.warning(self, tr("common.error"), "请完整填写"); return
++        if any(len(answer.text().encode('utf-8')) > 72 for answer in (a1, a2, a3)):
++            QMessageBox.warning(self, tr('common.error'), '答案的 UTF-8 编码不超过 72 字节')
++            return
+         self.auth.set_questions([(q1.text(), a1.text()), (q2.text(), a2.text()), (q3.text(), a3.text())])
+         self.storage.log("修改安全问题")
+         QMessageBox.information(self, tr("common.success"), "安全问题已更新")
+@@ -805,7 +812,7 @@ class SettingsDialog(QDialog):
+         if not ok:
+             QMessageBox.warning(self, tr("common.error"), f"测试失败: {result}"); return
+         vc, ok = QInputDialog.getText(self, "验证邮箱", f"输入 {recv.text()} 收到的验证码")
+-        if not ok or not secrets.compare_digest(vc.strip(), str(result)):
++        if not ok or not secrets.compare_digest(vc.strip().encode('utf-8'), str(result).encode('utf-8')):
+             QMessageBox.warning(self, tr("common.error"), "验证码错误"); return
+         self.auth.save_email_config(smtp.text(), port_i, sender.text(), pwd.text(), recv.text())
+         self.storage.log("修改邮箱配置")
+diff --git a/ui_settings_pages/page_web.py b/ui_settings_pages/page_web.py
+index fb1b444..e6e89a6 100644
+--- a/ui_settings_pages/page_web.py
++++ b/ui_settings_pages/page_web.py
+@@ -166,7 +166,7 @@ class WebPage(SettingsPage):
+             # 服务运行中不允许修改 HTTPS 开关
+             self.https_cb.setEnabled(False)
+ 
+-            ip, is_loopback = self._get_ip()
++            ip, is_loopback = self._get_ip() if https_on else ('127.0.0.1', True)
+             scheme = 'https' if https_on else 'http'
+             url = f"{scheme}://{ip}:{WEB_PORT}"
+             pixmap = self._make_qr_pixmap(url)
+diff --git a/ui_web.py b/ui_web.py
+index 1ea341e..778b0ad 100644
+--- a/ui_web.py
++++ b/ui_web.py
+@@ -1,7 +1,10 @@
++from mail_security import secure_smtp
+ import os, secrets, smtplib, threading, time, ipaddress, socket, tempfile
+ from datetime import datetime, timezone, timedelta
+ from email.mime.text import MIMEText
+ from io import BytesIO
++import hashlib, json, math
++from urllib.parse import urlsplit
+ from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, send_file
+ from werkzeug.serving import make_server
+ from constants import VERSION, WEB_PORT
+@@ -10,7 +13,12 @@ flask_app = Flask(__name__)
+ flask_app.secret_key = os.urandom(24)
+ flask_app.config.update(
+     SESSION_COOKIE_HTTPONLY=True,
+-    SESSION_COOKIE_SAMESITE='Lax',
++    SESSION_COOKIE_SAMESITE='Strict',
++    SESSION_COOKIE_SECURE=True,
++    MAX_CONTENT_LENGTH=16 * 1024,
++    MAX_FORM_MEMORY_SIZE=16 * 1024,
++    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
++    SESSION_REFRESH_EACH_REQUEST=False,
+ )
+ web_storage = None
+ web_auth = None
+@@ -25,17 +33,18 @@ LOGIN_LOCK_SECONDS = 60
+ MAX_RATE_ENTRIES = 1000
+ MAX_EMAIL_CODE_ATTEMPTS = 5
+ # M3：服务端验证码字典的软上限，超过后按最旧清理
+-MAX_EMAIL_CODES = 10000
++MAX_EMAIL_CODES = 1000
++SESSION_TTL = 1800
++SECOND_AUTH_TTL = 300
++_email_global_last_sent = 0
++_op_rates = {}
+ 
+ _rate_lock = threading.Lock()
+ _login_rates = {}
+ _email_rates = {}
+ 
+ # ---------- A2：服务端邮箱验证码存储 ----------
+-# 结构：{client_ip: {'code': str, 'expiry': ts, 'attempts': int, 'created_at': ts}}
+-# 验证码不写入 session cookie，避免明文 HTTP 下 cookie 被嗅探后直接复用。
+-# M5（已知局限，有意保留）：second_auth 绑定 client IP，但 NAT 场景下多设备可能共享 remote_addr。
+-#   HTTPS 已对 cookie 加上 Secure 属性，大幅提高 cookie 嗅探难度，因此判定为可接受风险。
++# Codes are bound to an unpredictable browser session ID and operation.
+ _email_codes = {}
+ _email_codes_lock = threading.Lock()
+ 
+@@ -87,7 +96,7 @@ def _ensure_self_signed_cert():
+     """
+     生成（或复用）自签名证书，返回 (cert_path, key_path)。
+ 
+-    依赖 cryptography。若不可用，会抛 ImportError，调用方应回退到 HTTP。
++    依赖 cryptography。若不可用，调用方必须停止启动。
+     证书有效期 1 年，SAN 含 localhost / 127.0.0.1 / 当前局域网 IP。
+     """
+     from cryptography import x509
+@@ -197,53 +206,127 @@ def _cleanup_rates_locked(rates, ttl_seconds):
+         rates.pop(k, None)
+ 
+ 
++def _auth_fingerprint():
++    if not web_auth:
++        return ''
++    data = {key: web_auth.settings_dict.get(key)
++            for key in web_auth.BACKUP_AUTH_KEYS}
++    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
++
++
++def _is_authenticated():
++    valid = (session.get('authenticated') is True
++             and session.get('auth_expiry', 0) > time.time()
++             and session.get('auth_fingerprint') == _auth_fingerprint()
++             and session.get('auth_client') == request.remote_addr)
++    if not valid and session.get('authenticated'):
++        session.clear()
++    return valid
++
++
++def _csrf_token():
++    if 'csrf_token' not in session:
++        session['csrf_token'] = secrets.token_urlsafe(32)
++    return session['csrf_token']
++
++
++def _email_scope(purpose):
++    if 'challenge_id' not in session:
++        session['challenge_id'] = secrets.token_urlsafe(32)
++    return session['challenge_id'], purpose
++
++
++@flask_app.context_processor
++def security_template_context():
++    purpose = ('second_auth:' + request.view_args['entry_id']
++               if request.endpoint == 'web_second_auth' else 'login')
++    return {'csrf_token': _csrf_token(), 'email_purpose': purpose}
++
++
+ @flask_app.before_request
+ def restrict_to_local_network():
+     try:
+         address = ipaddress.ip_address(request.remote_addr or '')
+-        mapped = getattr(address, 'ipv4_mapped', None)
+-        if mapped:
+-            address = mapped
++        address = getattr(address, 'ipv4_mapped', None) or address
+     except ValueError:
+         return "拒绝访问", 403
+     if not (address.is_private or address.is_loopback or address.is_link_local):
+         return "仅允许局域网访问", 403
+-    origin = request.headers.get('Origin')
+-    if request.method == 'POST' and origin:
+-        expected = request.host_url.rstrip('/')
+-        if origin.rstrip('/') != expected:
++    # Host must be a local IP literal or localhost, never an arbitrary DNS name.
++    # This prevents a hostile website from rebinding its domain to this service.
++    try:
++        hostname = urlsplit(request.host_url).hostname
++        host_address = ipaddress.ip_address(hostname) if hostname != 'localhost' else None
++        if host_address and not (host_address.is_private or host_address.is_loopback
++                                 or host_address.is_link_local):
++            return "请求主机无效", 403
++    except ValueError:
++        return "请求主机无效", 403
++    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
++        origin = request.headers.get('Origin')
++        if origin and origin.rstrip('/') != request.host_url.rstrip('/'):
+             return "请求来源无效", 403
++        expected = session.get('csrf_token')
++        supplied = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token', '')
++        if not expected or not supplied.isascii() or not secrets.compare_digest(expected, supplied):
++            return "请求验证失败，请刷新页面", 403
++
++
++@flask_app.after_request
++def security_headers(response):
++    response.headers['Cache-Control'] = 'no-store, max-age=0'
++    response.headers['Pragma'] = 'no-cache'
++    response.headers['X-Content-Type-Options'] = 'nosniff'
++    response.headers['X-Frame-Options'] = 'DENY'
++    response.headers['Referrer-Policy'] = 'no-referrer'
++    response.headers['Content-Security-Policy'] = (
++        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
++        "script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; "
++        "base-uri 'none'; form-action 'self'; object-src 'none'")
++    return response
+ 
+ 
+ def _enabled_methods():
+     return web_auth.get_enabled_methods() if web_auth else []
+ 
+ 
+-def _login_lock_remaining(client):
++def _login_lock_remaining(client, operation=False):
++    persistent = (web_auth.get_op_lock_remaining() if operation
++                  else web_auth.get_login_lock_remaining()) if web_auth else 0
++    if persistent:
++        return persistent
++    rates = _op_rates if operation else _login_rates
+     with _rate_lock:
+-        state = _login_rates.get(client)
++        state = rates.get(client)
+         if not state:
+             return 0
+         lock_until = state.get('lock_until', 0)
+         if lock_until > 0 and lock_until <= time.time():
+-            _login_rates.pop(client, None)
++            rates.pop(client, None)
+             return 0
+-        return max(0, int(lock_until - time.time()))
++        return max(0, math.ceil(lock_until - time.time()))
+ 
+ 
+-def _record_login_result(client, succeeded):
++def _record_login_result(client, succeeded, operation=False):
++    if web_auth:
++        if operation:
++            action = web_auth.reset_op_lock if succeeded else web_auth.register_op_failure
++        else:
++            action = web_auth.reset_login_lock if succeeded else web_auth.register_login_failure
++        action()
++    rates = _op_rates if operation else _login_rates
+     with _rate_lock:
+         if succeeded:
+-            _login_rates.pop(client, None)
++            rates.pop(client, None)
+         else:
+-            state = _login_rates.setdefault(
++            state = rates.setdefault(
+                 client, {'failures': 0, 'lock_until': 0, 'last_seen': 0})
+             state['failures'] += 1
+             state['last_seen'] = time.time()
+             if state['failures'] >= LOGIN_MAX_ATTEMPTS:
+                 state['failures'] = 0
+                 state['lock_until'] = time.time() + LOGIN_LOCK_SECONDS
+-        _cleanup_rates_locked(_login_rates, LOGIN_LOCK_SECONDS * 2)
++        _cleanup_rates_locked(rates, LOGIN_LOCK_SECONDS * 2)
+ 
+ 
+ # ============================================================
+@@ -288,14 +371,15 @@ def _email_code_matches(client, value):
+         entry = _email_codes.get(client)
+         if not entry:
+             return False
+-        if entry.get('expiry', 0) < now:
++        if entry.get('expiry', 0) <= now:
+             _email_codes.pop(client, None)
+             return False
+         entry['attempts'] = entry.get('attempts', 0) + 1
+         if entry['attempts'] > MAX_EMAIL_CODE_ATTEMPTS:
+             _email_codes.pop(client, None)
+             return False
+-        if secrets.compare_digest(str(value), str(entry.get('code', ''))):
++        if (isinstance(value, str) and value.isascii()
++                and secrets.compare_digest(value, str(entry.get('code', '')))):
+             _email_codes.pop(client, None)
+             return True
+     return False
+@@ -306,12 +390,14 @@ def _reserve_email_send(client):
+     预占位：锁内检查+写入，避免并发请求全部通过冷却检查。
+     返回 0 表示已占用成功；否则返回还需等待的秒数。
+     """
++    global _email_global_last_sent
+     now = time.time()
+     with _rate_lock:
+-        last_sent = _email_rates.get(client, 0)
++        last_sent = max(_email_rates.get(client, 0), _email_global_last_sent)
+         if now - last_sent < EMAIL_CODE_COOLDOWN:
+             return max(1, int(EMAIL_CODE_COOLDOWN - (now - last_sent)) + 1)
+         _email_rates[client] = now
++        _email_global_last_sent = now
+         _cleanup_rates_locked(_email_rates, EMAIL_CODE_TTL * 2)
+     return 0
+ 
+@@ -329,7 +415,7 @@ def b64encode_filter(data):
+ 
+ @flask_app.route('/')
+ def web_index():
+-    if 'authenticated' not in session or not session['authenticated']:
++    if not _is_authenticated():
+         return redirect(url_for('web_login'))
+     entries = web_storage.get_all_entries() if web_storage else []
+     return render_template_string(WEB_TEMPLATE, entries=entries, VERSION=VERSION)
+@@ -359,11 +445,16 @@ def web_login():
+         elif method == 'totp':
+             ok = web_auth.verify_totp(inp) if web_auth else False
+         elif method == 'email':
+-            ok = _email_code_matches(client, inp)
++            ok = _email_code_matches(_email_scope('login'), inp)
+         if ok:
+             web_storage.log("移动端登录成功")
+             _record_login_result(client, True)
++            session.clear()
++            session.permanent = True
+             session['authenticated'] = True
++            session['auth_expiry'] = time.time() + SESSION_TTL
++            session['auth_client'] = request.remote_addr
++            session['auth_fingerprint'] = _auth_fingerprint()
+             return redirect(url_for('web_index'))
+         else:
+             web_storage.log("移动端登录失败")
+@@ -376,7 +467,7 @@ def web_login():
+ 
+ @flask_app.route('/view/<entry_id>')
+ def web_view(entry_id):
+-    if 'authenticated' not in session or not session['authenticated']:
++    if not _is_authenticated():
+         return redirect(url_for('web_login'))
+     if not check_second_auth(entry_id):
+         entry = web_storage.get_entry_by_id(entry_id)
+@@ -396,7 +487,7 @@ def web_view(entry_id):
+ 
+ @flask_app.route('/second_auth/<entry_id>', methods=['GET', 'POST'])
+ def web_second_auth(entry_id):
+-    if 'authenticated' not in session or not session['authenticated']:
++    if not _is_authenticated():
+         return redirect(url_for('web_login'))
+     entry = web_storage.get_entry_by_id(entry_id)
+     if not entry:
+@@ -408,7 +499,7 @@ def web_second_auth(entry_id):
+         return "此文件没有可用的二次验证方式", 403
+     if request.method == 'POST':
+         client = request.remote_addr or 'unknown'
+-        wait_seconds = _login_lock_remaining(client)
++        wait_seconds = _login_lock_remaining(client, operation=True)
+         if wait_seconds:
+             return render_template_string(
+                 WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods,
+@@ -427,13 +518,13 @@ def web_second_auth(entry_id):
+         elif method == 'totp':
+             ok = web_auth.verify_totp(inp) if web_auth else False
+         elif method == 'email':
+-            ok = _email_code_matches(client, inp)
++            ok = _email_code_matches(_email_scope('second_auth:' + entry_id), inp)
+         if ok:
+             web_storage.log(f"移动端二次验证成功 (文件ID: {entry_id})")
+-            _record_login_result(client, True)
++            _record_login_result(client, True, operation=True)
+             second_auth = dict(session.get('second_auth', {}))
+             second_auth[entry_id] = {
+-                'expiry': datetime.now(timezone.utc).timestamp() + 3600,
++                'expiry': datetime.now(timezone.utc).timestamp() + SECOND_AUTH_TTL,
+                 'client': client,
+             }
+             session['second_auth'] = second_auth
+@@ -441,14 +532,14 @@ def web_second_auth(entry_id):
+             return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
+         else:
+             web_storage.log(f"移动端二次验证失败 (文件ID: {entry_id})")
+-            _record_login_result(client, False)
++            _record_login_result(client, False, operation=True)
+             return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error="验证失败")
+     return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error=None)
+ 
+ 
+ @flask_app.route('/download/<entry_id>')
+ def web_download(entry_id):
+-    if 'authenticated' not in session or not session['authenticated']:
++    if not _is_authenticated():
+         return redirect(url_for('web_login'))
+     entry = web_storage.get_entry_by_id(entry_id)
+     if not entry:
+@@ -465,11 +556,9 @@ def web_download(entry_id):
+ 
+ 
+ def check_second_auth(entry_id):
+-    """
+-    M5（已知局限，有意保留）：本函数把 entry_id 的二次验证结果绑定到 client IP，
+-    但 NAT 场景下同一 IP 可能对应多台物理设备。这不是本项目的漏洞——
+-    HTTPS 已给 session cookie 加上 Secure 属性，cookie 嗅探难度大幅提高。
+-    """
++    """Only a current authenticated session can hold a recent per-file grant."""
++    if not _is_authenticated():
++        return False
+     second_auth = session.get('second_auth', {})
+     record = second_auth.get(entry_id, 0)
+     now_ts = datetime.now(timezone.utc).timestamp()
+@@ -478,17 +567,30 @@ def check_second_auth(entry_id):
+         client_in_record = record.get('client')
+         current_client = request.remote_addr or 'unknown'
+         return (expiry > now_ts) and (client_in_record == current_client)
+-    else:
+-        return record > now_ts
++    return False
+ 
+ 
+ @flask_app.route('/send_code', methods=['POST'])
+ def send_code():
+     if 'email' not in _enabled_methods() or not web_auth.email_config:
+         return jsonify({'success': False, 'message': '邮箱未配置或未启用'}), 400
+-    now = time.time()
++    purpose = request.headers.get('X-Email-Purpose', '')
++    if purpose == 'login':
++        if _is_authenticated():
++            return jsonify({'success': False, 'message': '请使用文件二次验证页面'}), 400
++    elif purpose.startswith('second_auth:'):
++        entry_id = purpose.split(':', 1)[1]
++        if not _is_authenticated():
++            return jsonify({'success': False, 'message': '请先登录'}), 401
++        entry = web_storage.get_entry_by_id(entry_id)
++        if not entry or 'email' not in entry.get('second_auth_methods', []):
++            return jsonify({'success': False, 'message': '不允许的验证方式'}), 403
++    else:
++        return jsonify({'success': False, 'message': '验证用途无效'}), 400
+     client = request.remote_addr or 'unknown'
+-
++    wait = _login_lock_remaining(client, operation=(purpose != 'login'))
++    if wait:
++        return jsonify({'success': False, 'message': '验证已锁定'}), 429
+     wait = _reserve_email_send(client)
+     if wait:
+         return jsonify({'success': False,
+@@ -505,8 +607,7 @@ def send_code():
+     msg['From'] = config['sender_email']
+     msg['To'] = to_email
+     try:
+-        with smtplib.SMTP(config['smtp_server'], config['port'], timeout=20) as server:
+-            server.starttls()
++        with secure_smtp(config['smtp_server'], config['port'], timeout=20) as server:
+             server.login(config['sender_email'], config['password'])
+             server.sendmail(config['sender_email'], [to_email], msg.as_string())
+     except Exception as e:
+@@ -516,7 +617,7 @@ def send_code():
+         return jsonify({'success': False, 'message': '邮件发送失败，请检查桌面端日志'}), 500
+     web_storage.log(f"移动端发送邮箱验证码至: {to_email}")
+ 
+-    _store_email_code(client, code)
++    _store_email_code(_email_scope(purpose), code)
+ 
+     return jsonify({'success': True, 'message': '验证码已发送'})
+ 
+@@ -539,13 +640,9 @@ def start_web_server(storage, auth, enable_https=True):
+             cert_path, key_path = _ensure_self_signed_cert()
+             ssl_context = (cert_path, key_path)
+             https_on = True
+-        except ImportError as e:
+-            print(f"[警告] 未安装 cryptography，无法生成 HTTPS 证书，回退到 HTTP: {e}")
+-            print("       请运行：pip install cryptography")
+-            ssl_context = None
+         except Exception as e:
+-            print(f"[警告] HTTPS 证书生成失败，回退到 HTTP: {e}")
+-            ssl_context = None
++            print(f"HTTPS 初始化失败，已停止启动: {e}")
++            return False
+ 
+     _configure_transport_security(https_on)
+ 
+@@ -554,10 +651,13 @@ def start_web_server(storage, auth, enable_https=True):
+             print("\n🔒 Web服务已启用 HTTPS（自签名证书）。")
+             print("   浏览器会提示证书不受信任，请手动选择“继续访问”。")
+         else:
+-            print("\n⚠️ 警告：Web服务使用明文HTTP，仅限可信局域网。")
+-            print("   同一网络下的其他人可能嗅探到会话数据，公共网络下请勿启用。")
++            print("\n⚠️ 警告：Web服务使用明文HTTP，仅允许本机访问。")
++            print("   手机或其他设备访问必须启用 HTTPS。")
+ 
+-        bind_host = '0.0.0.0'
++        bind_host = '0.0.0.0' if https_on else '127.0.0.1'
++        flask_app.secret_key = os.urandom(32)
++        with _email_codes_lock:
++            _email_codes.clear()
+         if ssl_context:
+             _server = make_server(bind_host, WEB_PORT, flask_app, ssl_context=ssl_context)
+         else:
+@@ -577,6 +677,9 @@ def start_web_server(storage, auth, enable_https=True):
+ 
+ def stop_web_server():
+     global _server, _server_thread, _server_is_https
++    flask_app.secret_key = os.urandom(32)
++    with _email_codes_lock:
++        _email_codes.clear()
+     if _server is not None:
+         try:
+             _server.shutdown()
+@@ -606,6 +709,7 @@ WEB_LOGIN_TEMPLATE = """<!DOCTYPE html>
+ <script>
+ function toggleQuestion() {
+     var method = document.getElementById('method').value;
++    document.getElementById('auth_input').type = (method === 'password' || method === 'question') ? 'password' : 'text';
+     var qDiv = document.getElementById('question_div');
+     var emailDiv = document.getElementById('email_div');
+     if (method === 'question') { qDiv.style.display = 'block'; } else { qDiv.style.display = 'none'; }
+@@ -615,7 +719,7 @@ function sendCode() {
+     var btn = document.getElementById('send_code_btn');
+     btn.disabled = true;
+     btn.textContent = '发送中...';
+-    fetch('/send_code', { method: 'POST' })
++    fetch('/send_code', { method: 'POST', headers: { 'X-CSRF-Token': {{ csrf_token|tojson }}, 'X-Email-Purpose': {{ email_purpose|tojson }} } })
+         .then(response => response.json())
+         .then(data => {
+             if (data.success) { alert('验证码已发送至您的邮箱'); } else { alert('发送失败: ' + data.message); }
+@@ -627,6 +731,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
+ </script>
+ </head><body>
+ <form method="post">
++<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+ <h2>SecureVault 登录</h2>
+ {% if error %}<p class="error">{{ error }}</p>{% endif %}
+ <select id="method" name="method">
+@@ -640,7 +745,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
+ <div id="email_div" style="display:none;">
+ <button type="button" id="send_code_btn" onclick="sendCode()">发送验证码</button>
+ </div>
+-<input type="text" name="input" placeholder="输入验证信息">
++<input id="auth_input" type="password" name="input" placeholder="输入验证信息" autocomplete="off">
+ <button type="submit">登录</button>
+ </form>
+ </body></html>"""
+@@ -651,6 +756,7 @@ WEB_SECOND_AUTH_TEMPLATE = """<!DOCTYPE html>
+ <script>
+ function toggleQuestion() {
+     var method = document.getElementById('method').value;
++    document.getElementById('auth_input').type = (method === 'password' || method === 'question') ? 'password' : 'text';
+     var qDiv = document.getElementById('question_div');
+     var emailDiv = document.getElementById('email_div');
+     if (method === 'question') { qDiv.style.display = 'block'; } else { qDiv.style.display = 'none'; }
+@@ -660,7 +766,7 @@ function sendCode() {
+     var btn = document.getElementById('send_code_btn');
+     btn.disabled = true;
+     btn.textContent = '发送中...';
+-    fetch('/send_code', { method: 'POST' })
++    fetch('/send_code', { method: 'POST', headers: { 'X-CSRF-Token': {{ csrf_token|tojson }}, 'X-Email-Purpose': {{ email_purpose|tojson }} } })
+         .then(response => response.json())
+         .then(data => {
+             if (data.success) { alert('验证码已发送至您的邮箱'); } else { alert('发送失败: ' + data.message); }
+@@ -672,6 +778,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
+ </script>
+ </head><body>
+ <form method="post">
++<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+ <h2>二次验证 - {{ entry.original_name }}</h2>
+ {% if error %}<p class="error">{{ error }}</p>{% endif %}
+ <select id="method" name="method">
+@@ -685,7 +792,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
+ <div id="email_div" style="display:none;">
+ <button type="button" id="send_code_btn" onclick="sendCode()">发送验证码</button>
+ </div>
+-<input type="text" name="input" placeholder="输入验证信息">
++<input id="auth_input" type="password" name="input" placeholder="输入验证信息" autocomplete="off">
+ <button type="submit">验证</button>
+ </form>
+ </body></html>"""
+diff --git a/updater.py b/updater.py
+index 66f0317..7ef742b 100644
+--- a/updater.py
++++ b/updater.py
+@@ -23,7 +23,7 @@ GITEE_API = (
+     f"/releases?{urlencode(_gitee_params)}"
+ )
+ 
+-# Ed25519 发布者公钥（base64 的 32 字节原始公钥）。留空则跳过签名校验。
++# Ed25519 发布者公钥（base64 的 32 字节原始公钥）。自动更新必须验证签名。
+ SIGNING_PUBLIC_KEY = "nx697jofj6nw3UZhnJpKixo2E+lbf90pcpisC2v2GRw="
+ 
+ DOWNLOAD_MIRRORS = [
+@@ -462,7 +462,7 @@ def _verify_ed25519(signature, message, public_key_b64):
+         "请安装 cryptography（推荐，pip install cryptography）或 PyNaCl（pip install pynacl）。")
+ 
+ 
+-def verify_update_signature(file_path, signature_bytes, public_key_b64=None):
++def verified_update_sha256(file_path, signature_bytes, public_key_b64=None):
+     key = public_key_b64 if public_key_b64 is not None else SIGNING_PUBLIC_KEY
+     if not key:
+         raise UpdateError("未配置签名公钥，无法进行签名校验")
+@@ -476,14 +476,18 @@ def verify_update_signature(file_path, signature_bytes, public_key_b64=None):
+     digest = sha.digest()
+ 
+     if _verify_ed25519(sig, digest, key):
+-        return True
++        return sha.hexdigest()
+     try:
+         if _verify_ed25519(sig, sha.hexdigest().encode('ascii'), key):
+-            return True
++            return sha.hexdigest()
+     except UpdateError:
+         raise
+ 
+-    return False
++    return None
++
++
++def verify_update_signature(file_path, signature_bytes, public_key_b64=None):
++    return verified_update_sha256(file_path, signature_bytes, public_key_b64) is not None
+ 
+ 
+ def _decode_signature_blob(blob):
+@@ -724,15 +728,20 @@ def _is_dir_writable(directory):
+ 
+ 
+ def write_update_bat(exe_dir, temp_path, target_exe, expected_sha256=None):
+-    bat_path = None
+-    if _is_dir_writable(exe_dir):
+-        bat_path = os.path.join(exe_dir, "SecureVault_update.bat")
+-    else:
+-        temp_dir = tempfile.gettempdir()
+-        bat_path = os.path.join(temp_dir, f"SecureVault_update_{os.getpid()}.bat")
++    # These values are embedded in cmd.exe source. Reject expansion and
++    # control characters even when they occur inside quoted Windows paths.
++    for path in (exe_dir, temp_path, target_exe):
++        if not isinstance(path, str) or not path or any(c in path for c in '\r\n\x00"%!&|<>^'):
++            raise UpdateError("更新路径含有不安全的命令字符，请手动安装")
++    if not isinstance(expected_sha256, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', expected_sha256):
++        raise UpdateError("替换程序前必须提供已验证文件的 SHA-256")
++    directory = exe_dir if _is_dir_writable(exe_dir) else os.path.dirname(temp_path)
++    fd, bat_path = tempfile.mkstemp(prefix='SecureVault_update_', suffix='.bat', dir=directory)
++    os.close(fd)
+ 
+     lines = []
+     lines.append("@echo off")
++    lines.append("chcp 65001 > nul")
+     lines.append("setlocal enabledelayedexpansion")
+     lines.append("timeout /t 2 > nul")
+     lines.append("")

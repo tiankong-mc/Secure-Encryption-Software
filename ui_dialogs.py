@@ -110,11 +110,6 @@ class _BaseAuthDialog(QDialog):
         self.setLayout(layout)
 
     def _find_main_window(self):
-        """
-        修复 M4：优先从 parent 链查找带 open_settings 的窗口；
-        找不到时回退到 QApplication.topLevelWidgets()。
-        """
-        # 1) parent 链
         parent = self.parent()
         while parent is not None:
             if hasattr(parent, 'open_settings'):
@@ -123,8 +118,6 @@ class _BaseAuthDialog(QDialog):
                 parent = parent.parent()
             except Exception:
                 parent = None
-
-        # 2) 顶层窗口兜底
         try:
             for w in QApplication.topLevelWidgets():
                 if hasattr(w, 'open_settings'):
@@ -135,16 +128,13 @@ class _BaseAuthDialog(QDialog):
                         continue
         except Exception:
             pass
-
         return None
 
     def _open_settings_page(self):
-        """尝试打开主窗口的设置对话框并跳到安全页。"""
         try:
             parent = self._find_main_window()
             if parent is None:
-                QMessageBox.information(
-                    self, "提示",
+                QMessageBox.information(self, "提示",
                     "请手动打开「设置 → 安全」进行配置。")
                 return
             parent.open_settings()
@@ -218,144 +208,6 @@ class _BaseAuthDialog(QDialog):
                 return None
             return status == 'ok'
         return False
-
-
-class AuthDialog(_BaseAuthDialog):
-    MAX_ATTEMPTS = 5
-
-    def __init__(self, parent, auth_manager, allowed_methods, entry_id, storage):
-        filtered = _filter_methods(auth_manager, allowed_methods)
-        super().__init__(parent, auth_manager, filtered)
-        self.entry_id = entry_id
-        self.storage = storage
-        self.setWindowTitle("二次验证")
-        self.setModal(True)
-        self.resize(400, 300)
-        self.auth.reset_fail_count()
-        self._setup_ui("请通过以下任意一种方式验证：")
-
-    def accept(self):
-        if not self.allowed_methods:
-            super().reject()
-            return
-
-        result = self._check_credentials()
-        if result is None:
-            return
-        if result:
-            self.auth.reset_fail_count()
-            self.storage.log(f"二次验证成功 (文件ID: {self.entry_id})")
-            super().accept()
-            return
-
-        count = self.auth.increment_fail_count()
-        self.storage.log(f"二次验证失败 (文件ID: {self.entry_id})")
-
-        if count >= self.MAX_ATTEMPTS:
-            self.storage.log(
-                f"二次验证错误次数过多，触发紧急处理 (文件ID: {self.entry_id})")
-            QMessageBox.warning(
-                self, "验证失败",
-                f"失败 {count} 次。\n\n"
-                "错误次数已达上限，即将执行紧急处理：\n"
-                "  · 将该文件发送到绑定邮箱\n"
-                "  · 删除该文件的本地加密副本\n"
-                "  · 退出程序")
-            self._trigger_emergency_action()
-            return
-
-        QMessageBox.warning(self, "验证失败", f"失败 {count} 次")
-
-    def _has_usable_email(self):
-        cfg = self.auth.email_config or {}
-        required = ('smtp_server', 'port', 'sender_email', 'password', 'receiver_email')
-        if not all(cfg.get(k) for k in required):
-            return False
-        try:
-            if 'email' not in self.auth.get_enabled_methods():
-                return False
-        except Exception:
-            return False
-        return True
-
-    def _close_and_quit(self):
-        try:
-            self.reject()
-        except Exception:
-            pass
-        QTimer.singleShot(0, QApplication.quit)
-
-    def _trigger_emergency_action(self):
-        storage = self.storage
-        self.auth.reset_fail_count()
-        parent_widget = self.parent()
-
-        entry = storage.get_entry_by_id(self.entry_id)
-        if not entry:
-            storage.log("紧急处理：找不到目标记录，程序将退出")
-            QMessageBox.critical(parent_widget, "错误",
-                                 "找不到目标文件记录，程序将退出。")
-            self._close_and_quit()
-            return
-
-        if not self._has_usable_email():
-            storage.log("紧急处理：未配置或未启用邮箱验证方式，程序退出，本地文件保留")
-            QMessageBox.critical(
-                parent_widget, "安全退出",
-                "错误次数过多，且未配置或未启用邮箱验证方式。\n\n"
-                "为避免误删数据，本地加密文件将保留，程序将退出。")
-            self._close_and_quit()
-            return
-
-        email_cfg = self.auth.email_config
-        to_email = email_cfg.get('receiver_email')
-
-        vault_path = entry.get('secret_path')
-        user_path = entry.get('user_path')
-        if not (vault_path and os.path.exists(vault_path)):
-            if user_path and os.path.exists(user_path):
-                vault_path = user_path
-            else:
-                storage.log(f"紧急处理：文件已不存在 ({entry['id']})，程序将退出")
-                QMessageBox.critical(
-                    parent_widget, "文件丢失",
-                    "错误次数过多，但目标加密文件已不存在。\n程序将退出。")
-                self._close_and_quit()
-                return
-
-        display_name = entry.get('original_name', 'file') + '.vault'
-        files = [(vault_path, display_name)]
-
-        from backup import BackupManager
-        try:
-            storage.log(f"紧急处理：正在发送文件 {entry.get('original_name')} 到 {to_email}")
-            BackupManager.send_multiple_vault_files(files, to_email, email_cfg)
-            storage.log("紧急处理：邮件发送成功")
-        except Exception as e:
-            storage.log(f"紧急处理：邮件发送失败 {e}")
-            QMessageBox.critical(
-                parent_widget, "发送失败",
-                f"将该文件发送到邮箱失败：\n{e}\n\n"
-                "为避免误删数据，本地加密文件将保留，程序将退出。")
-            self._close_and_quit()
-            return
-
-        storage.log(f"紧急处理：删除本地文件 {entry.get('original_name')}")
-        try:
-            storage.remove_entry(self.entry_id, destroy=True)
-            QMessageBox.information(
-                parent_widget, "紧急处理完成",
-                f"文件已发送到：{to_email}\n"
-                f"本地加密副本已删除。\n\n程序将退出。")
-        except Exception as e:
-            storage.log(f"紧急处理：删除失败 {e}")
-            QMessageBox.warning(
-                parent_widget, "删除失败",
-                f"文件已发送到：{to_email}\n\n"
-                f"但本地文件删除失败：\n{e}\n\n"
-                f"请手动清理后退出程序。")
-
-        self._close_and_quit()
 
 
 class DeleteAuthDialog(_BaseAuthDialog):
@@ -452,6 +304,168 @@ class DeleteAuthDialog(_BaseAuthDialog):
             super().accept()
             return
 
+        fail_count, lock_seconds = self.auth.register_op_failure()
+        if lock_seconds > 0:
+            QMessageBox.warning(
+                self, "验证失败",
+                f"错误次数已达 {self.auth.OP_MAX_ATTEMPTS} 次，"
+                f"已锁定 {lock_seconds} 秒。")
+            self._apply_lock(lock_seconds)
+        else:
+            QMessageBox.warning(self, "验证失败", f"失败 {fail_count} 次")
+
+
+class AuthDialog(DeleteAuthDialog):
+    """高级文件二次验证。
+
+    失败 5 次时的行为（按用户要求）：
+      - 已配置并启用邮箱：把**该文件**发送到绑定邮箱 → 删除**该文件**的本地加密副本
+        → 退出主程序。其他保险库文件不受影响。
+      - 未配置邮箱：与 DeleteAuthDialog 相同，进入持久化锁定（60 秒起，翻倍）。
+    成功时重置失败计数。
+    """
+    MAX_ATTEMPTS = 5
+
+    def __init__(self, parent, auth_manager, allowed_methods, entry_id, storage):
+        self.entry_id = entry_id
+        self.storage = storage
+        super().__init__(parent, auth_manager, allowed_methods)
+        self.setWindowTitle("二次验证")
+
+    # ---------- 邮箱可用性 ----------
+    def _has_usable_email(self):
+        cfg = self.auth.email_config or {}
+        required = ('smtp_server', 'port', 'sender_email', 'password', 'receiver_email')
+        if not all(cfg.get(k) for k in required):
+            return False
+        try:
+            if 'email' not in self.auth.get_enabled_methods():
+                return False
+        except Exception:
+            return False
+        return True
+
+    # ---------- 退出辅助 ----------
+    def _close_and_quit(self):
+        """先关闭对话框，下一次事件循环 tick 时退出程序。"""
+        try:
+            self.reject()
+        except Exception:
+            pass
+        QTimer.singleShot(0, QApplication.quit)
+
+    # ---------- 紧急处理：只处理当前 entry_id ----------
+    def _trigger_emergency_action(self):
+        storage = self.storage
+
+        # 先清零失败计数，避免退出路径上又被判断一次
+        self.auth.settings_dict['op_fail_count'] = 0
+        self.auth._save()
+
+        parent_widget = self.parent()
+
+        entry = storage.get_entry_by_id(self.entry_id)
+        if not entry:
+            storage.log("紧急处理：找不到目标记录，程序将退出")
+            QMessageBox.critical(parent_widget, "错误",
+                                 "找不到目标文件记录，程序将退出。")
+            self._close_and_quit()
+            return
+
+        email_cfg = self.auth.email_config
+        to_email = email_cfg.get('receiver_email')
+
+        vault_path = entry.get('secret_path')
+        user_path = entry.get('user_path')
+        if not (vault_path and os.path.exists(vault_path)):
+            if user_path and os.path.exists(user_path):
+                vault_path = user_path
+            else:
+                storage.log(f"紧急处理：文件已不存在 ({entry['id']})，程序将退出")
+                QMessageBox.critical(
+                    parent_widget, "文件丢失",
+                    "错误次数过多，但目标加密文件已不存在。\n程序将退出。")
+                self._close_and_quit()
+                return
+
+        display_name = entry.get('original_name', 'file') + '.vault'
+        files = [(vault_path, display_name)]
+
+        from backup import BackupManager
+        try:
+            storage.log(f"紧急处理：正在发送文件 {entry.get('original_name')} 到 {to_email}")
+            BackupManager.send_multiple_vault_files(files, to_email, email_cfg)
+            storage.log("紧急处理：邮件发送成功")
+        except Exception as e:
+            storage.log(f"紧急处理：邮件发送失败 {e}")
+            QMessageBox.critical(
+                parent_widget, "发送失败",
+                f"将该文件发送到邮箱失败：\n{e}\n\n"
+                "为避免误删数据，本地加密文件将保留，程序将退出。")
+            self._close_and_quit()
+            return
+
+        storage.log(f"紧急处理：删除本地文件 {entry.get('original_name')}")
+        try:
+            storage.remove_entry(self.entry_id, destroy=True)
+            QMessageBox.information(
+                parent_widget, "紧急处理完成",
+                f"文件已发送到：{to_email}\n"
+                f"本地加密副本已删除。\n\n程序将退出。")
+        except Exception as e:
+            storage.log(f"紧急处理：删除失败 {e}")
+            QMessageBox.warning(
+                parent_widget, "删除失败",
+                f"文件已发送到：{to_email}\n\n"
+                f"但本地文件删除失败：\n{e}\n\n"
+                f"请手动清理后退出程序。")
+
+        self._close_and_quit()
+
+    # ---------- 覆盖 accept：区分"有邮箱"和"无邮箱"两条路径 ----------
+    def accept(self):
+        if not self.allowed_methods:
+            super().reject()
+            return
+
+        # 已在锁定中
+        remaining = self.auth.get_op_lock_remaining()
+        if remaining > 0:
+            self._apply_lock(remaining)
+            return
+
+        result = self._check_credentials()
+        if result is None:
+            return
+
+        if result:
+            self.auth.reset_op_lock()
+            self.storage.log(f"二次验证成功 (文件ID: {self.entry_id})")
+            # 直接调 QDialog.accept，跳过 DeleteAuthDialog.accept 里的日志
+            QDialog.accept(self)
+            return
+
+        # ---------- 失败处理 ----------
+        # 判断"下一次失败是否达到上限"
+        current = int(self.auth.settings_dict.get('op_fail_count', 0))
+        next_count = current + 1
+
+        if next_count >= self.MAX_ATTEMPTS and self._has_usable_email():
+            # 有邮箱 → 触发紧急处理（不进入常规锁定）
+            self.storage.log(
+                f"二次验证错误次数达到上限，触发紧急处理 (文件ID: {self.entry_id})")
+            QMessageBox.warning(
+                self, "验证失败",
+                f"失败 {next_count} 次。\n\n"
+                "错误次数已达上限，即将执行紧急处理：\n"
+                "  · 将该文件发送到绑定邮箱\n"
+                "  · 删除该文件的本地加密副本\n"
+                "  · 退出程序")
+            self._trigger_emergency_action()
+            return
+
+        # 无邮箱，或尚未达到上限 → 走 op_lock 计数与锁定
+        self.storage.log(f"二次验证失败 (文件ID: {self.entry_id})")
         fail_count, lock_seconds = self.auth.register_op_failure()
         if lock_seconds > 0:
             QMessageBox.warning(

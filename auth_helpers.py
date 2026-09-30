@@ -35,6 +35,6 @@ def verify_email_code(input_value, expected_code, code_time):
         return 'no_code', "请先点击“发送验证码”获取验证码"
     if time.time() - code_time > EMAIL_CODE_TTL:
         return 'expired', "验证码已过期，请重新发送"
-    if secrets.compare_digest(str(input_value), str(expected_code)):
+    if secrets.compare_digest(str(input_value).encode('utf-8'), str(expected_code).encode('utf-8')):
         return 'ok', None
     return 'fail', None

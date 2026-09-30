@@ -1,7 +1,10 @@
+from mail_security import secure_smtp
 import os, secrets, smtplib, threading, time, ipaddress, socket, tempfile
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from io import BytesIO
+import hashlib, json, math
+from urllib.parse import urlsplit
 from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, send_file
 from werkzeug.serving import make_server
 from constants import VERSION, WEB_PORT
@@ -10,7 +13,12 @@ flask_app = Flask(__name__)
 flask_app.secret_key = os.urandom(24)
 flask_app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SAMESITE='Strict',
+    SESSION_COOKIE_SECURE=True,
+    MAX_CONTENT_LENGTH=16 * 1024,
+    MAX_FORM_MEMORY_SIZE=16 * 1024,
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
+    SESSION_REFRESH_EACH_REQUEST=False,
 )
 web_storage = None
 web_auth = None
@@ -25,17 +33,18 @@ LOGIN_LOCK_SECONDS = 60
 MAX_RATE_ENTRIES = 1000
 MAX_EMAIL_CODE_ATTEMPTS = 5
 # M3：服务端验证码字典的软上限，超过后按最旧清理
-MAX_EMAIL_CODES = 10000
+MAX_EMAIL_CODES = 1000
+SESSION_TTL = 1800
+SECOND_AUTH_TTL = 300
+_email_global_last_sent = 0
+_op_rates = {}
 
 _rate_lock = threading.Lock()
 _login_rates = {}
 _email_rates = {}
 
 # ---------- A2：服务端邮箱验证码存储 ----------
-# 结构：{client_ip: {'code': str, 'expiry': ts, 'attempts': int, 'created_at': ts}}
-# 验证码不写入 session cookie，避免明文 HTTP 下 cookie 被嗅探后直接复用。
-# M5（已知局限，有意保留）：second_auth 绑定 client IP，但 NAT 场景下多设备可能共享 remote_addr。
-#   HTTPS 已对 cookie 加上 Secure 属性，大幅提高 cookie 嗅探难度，因此判定为可接受风险。
+# Codes are bound to an unpredictable browser session ID and operation.
 _email_codes = {}
 _email_codes_lock = threading.Lock()
 
@@ -87,7 +96,7 @@ def _ensure_self_signed_cert():
     """
     生成（或复用）自签名证书，返回 (cert_path, key_path)。
 
-    依赖 cryptography。若不可用，会抛 ImportError，调用方应回退到 HTTP。
+    依赖 cryptography。若不可用，调用方必须停止启动。
     证书有效期 1 年，SAN 含 localhost / 127.0.0.1 / 当前局域网 IP。
     """
     from cryptography import x509
@@ -197,53 +206,127 @@ def _cleanup_rates_locked(rates, ttl_seconds):
         rates.pop(k, None)
 
 
+def _auth_fingerprint():
+    if not web_auth:
+        return ''
+    data = {key: web_auth.settings_dict.get(key)
+            for key in web_auth.BACKUP_AUTH_KEYS}
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def _is_authenticated():
+    valid = (session.get('authenticated') is True
+             and session.get('auth_expiry', 0) > time.time()
+             and session.get('auth_fingerprint') == _auth_fingerprint()
+             and session.get('auth_client') == request.remote_addr)
+    if not valid and session.get('authenticated'):
+        session.clear()
+    return valid
+
+
+def _csrf_token():
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_urlsafe(32)
+    return session['csrf_token']
+
+
+def _email_scope(purpose):
+    if 'challenge_id' not in session:
+        session['challenge_id'] = secrets.token_urlsafe(32)
+    return session['challenge_id'], purpose
+
+
+@flask_app.context_processor
+def security_template_context():
+    purpose = ('second_auth:' + request.view_args['entry_id']
+               if request.endpoint == 'web_second_auth' else 'login')
+    return {'csrf_token': _csrf_token(), 'email_purpose': purpose}
+
+
 @flask_app.before_request
 def restrict_to_local_network():
     try:
         address = ipaddress.ip_address(request.remote_addr or '')
-        mapped = getattr(address, 'ipv4_mapped', None)
-        if mapped:
-            address = mapped
+        address = getattr(address, 'ipv4_mapped', None) or address
     except ValueError:
         return "拒绝访问", 403
     if not (address.is_private or address.is_loopback or address.is_link_local):
         return "仅允许局域网访问", 403
-    origin = request.headers.get('Origin')
-    if request.method == 'POST' and origin:
-        expected = request.host_url.rstrip('/')
-        if origin.rstrip('/') != expected:
+    # Host must be a local IP literal or localhost, never an arbitrary DNS name.
+    # This prevents a hostile website from rebinding its domain to this service.
+    try:
+        hostname = urlsplit(request.host_url).hostname
+        host_address = ipaddress.ip_address(hostname) if hostname != 'localhost' else None
+        if host_address and not (host_address.is_private or host_address.is_loopback
+                                 or host_address.is_link_local):
+            return "请求主机无效", 403
+    except ValueError:
+        return "请求主机无效", 403
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        origin = request.headers.get('Origin')
+        if origin and origin.rstrip('/') != request.host_url.rstrip('/'):
             return "请求来源无效", 403
+        expected = session.get('csrf_token')
+        supplied = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token', '')
+        if not expected or not supplied.isascii() or not secrets.compare_digest(expected, supplied):
+            return "请求验证失败，请刷新页面", 403
+
+
+@flask_app.after_request
+def security_headers(response):
+    response.headers['Cache-Control'] = 'no-store, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; "
+        "base-uri 'none'; form-action 'self'; object-src 'none'")
+    return response
 
 
 def _enabled_methods():
     return web_auth.get_enabled_methods() if web_auth else []
 
 
-def _login_lock_remaining(client):
+def _login_lock_remaining(client, operation=False):
+    persistent = (web_auth.get_op_lock_remaining() if operation
+                  else web_auth.get_login_lock_remaining()) if web_auth else 0
+    if persistent:
+        return persistent
+    rates = _op_rates if operation else _login_rates
     with _rate_lock:
-        state = _login_rates.get(client)
+        state = rates.get(client)
         if not state:
             return 0
         lock_until = state.get('lock_until', 0)
         if lock_until > 0 and lock_until <= time.time():
-            _login_rates.pop(client, None)
+            rates.pop(client, None)
             return 0
-        return max(0, int(lock_until - time.time()))
+        return max(0, math.ceil(lock_until - time.time()))
 
 
-def _record_login_result(client, succeeded):
+def _record_login_result(client, succeeded, operation=False):
+    if web_auth:
+        if operation:
+            action = web_auth.reset_op_lock if succeeded else web_auth.register_op_failure
+        else:
+            action = web_auth.reset_login_lock if succeeded else web_auth.register_login_failure
+        action()
+    rates = _op_rates if operation else _login_rates
     with _rate_lock:
         if succeeded:
-            _login_rates.pop(client, None)
+            rates.pop(client, None)
         else:
-            state = _login_rates.setdefault(
+            state = rates.setdefault(
                 client, {'failures': 0, 'lock_until': 0, 'last_seen': 0})
             state['failures'] += 1
             state['last_seen'] = time.time()
             if state['failures'] >= LOGIN_MAX_ATTEMPTS:
                 state['failures'] = 0
                 state['lock_until'] = time.time() + LOGIN_LOCK_SECONDS
-        _cleanup_rates_locked(_login_rates, LOGIN_LOCK_SECONDS * 2)
+        _cleanup_rates_locked(rates, LOGIN_LOCK_SECONDS * 2)
 
 
 # ============================================================
@@ -288,14 +371,15 @@ def _email_code_matches(client, value):
         entry = _email_codes.get(client)
         if not entry:
             return False
-        if entry.get('expiry', 0) < now:
+        if entry.get('expiry', 0) <= now:
             _email_codes.pop(client, None)
             return False
         entry['attempts'] = entry.get('attempts', 0) + 1
         if entry['attempts'] > MAX_EMAIL_CODE_ATTEMPTS:
             _email_codes.pop(client, None)
             return False
-        if secrets.compare_digest(str(value), str(entry.get('code', ''))):
+        if (isinstance(value, str) and value.isascii()
+                and secrets.compare_digest(value, str(entry.get('code', '')))):
             _email_codes.pop(client, None)
             return True
     return False
@@ -306,12 +390,14 @@ def _reserve_email_send(client):
     预占位：锁内检查+写入，避免并发请求全部通过冷却检查。
     返回 0 表示已占用成功；否则返回还需等待的秒数。
     """
+    global _email_global_last_sent
     now = time.time()
     with _rate_lock:
-        last_sent = _email_rates.get(client, 0)
+        last_sent = max(_email_rates.get(client, 0), _email_global_last_sent)
         if now - last_sent < EMAIL_CODE_COOLDOWN:
             return max(1, int(EMAIL_CODE_COOLDOWN - (now - last_sent)) + 1)
         _email_rates[client] = now
+        _email_global_last_sent = now
         _cleanup_rates_locked(_email_rates, EMAIL_CODE_TTL * 2)
     return 0
 
@@ -329,7 +415,7 @@ def b64encode_filter(data):
 
 @flask_app.route('/')
 def web_index():
-    if 'authenticated' not in session or not session['authenticated']:
+    if not _is_authenticated():
         return redirect(url_for('web_login'))
     entries = web_storage.get_all_entries() if web_storage else []
     return render_template_string(WEB_TEMPLATE, entries=entries, VERSION=VERSION)
@@ -359,11 +445,16 @@ def web_login():
         elif method == 'totp':
             ok = web_auth.verify_totp(inp) if web_auth else False
         elif method == 'email':
-            ok = _email_code_matches(client, inp)
+            ok = _email_code_matches(_email_scope('login'), inp)
         if ok:
             web_storage.log("移动端登录成功")
             _record_login_result(client, True)
+            session.clear()
+            session.permanent = True
             session['authenticated'] = True
+            session['auth_expiry'] = time.time() + SESSION_TTL
+            session['auth_client'] = request.remote_addr
+            session['auth_fingerprint'] = _auth_fingerprint()
             return redirect(url_for('web_index'))
         else:
             web_storage.log("移动端登录失败")
@@ -376,7 +467,7 @@ def web_login():
 
 @flask_app.route('/view/<entry_id>')
 def web_view(entry_id):
-    if 'authenticated' not in session or not session['authenticated']:
+    if not _is_authenticated():
         return redirect(url_for('web_login'))
     if not check_second_auth(entry_id):
         entry = web_storage.get_entry_by_id(entry_id)
@@ -396,7 +487,7 @@ def web_view(entry_id):
 
 @flask_app.route('/second_auth/<entry_id>', methods=['GET', 'POST'])
 def web_second_auth(entry_id):
-    if 'authenticated' not in session or not session['authenticated']:
+    if not _is_authenticated():
         return redirect(url_for('web_login'))
     entry = web_storage.get_entry_by_id(entry_id)
     if not entry:
@@ -408,7 +499,7 @@ def web_second_auth(entry_id):
         return "此文件没有可用的二次验证方式", 403
     if request.method == 'POST':
         client = request.remote_addr or 'unknown'
-        wait_seconds = _login_lock_remaining(client)
+        wait_seconds = _login_lock_remaining(client, operation=True)
         if wait_seconds:
             return render_template_string(
                 WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods,
@@ -427,13 +518,13 @@ def web_second_auth(entry_id):
         elif method == 'totp':
             ok = web_auth.verify_totp(inp) if web_auth else False
         elif method == 'email':
-            ok = _email_code_matches(client, inp)
+            ok = _email_code_matches(_email_scope('second_auth:' + entry_id), inp)
         if ok:
             web_storage.log(f"移动端二次验证成功 (文件ID: {entry_id})")
-            _record_login_result(client, True)
+            _record_login_result(client, True, operation=True)
             second_auth = dict(session.get('second_auth', {}))
             second_auth[entry_id] = {
-                'expiry': datetime.now(timezone.utc).timestamp() + 3600,
+                'expiry': datetime.now(timezone.utc).timestamp() + SECOND_AUTH_TTL,
                 'client': client,
             }
             session['second_auth'] = second_auth
@@ -441,14 +532,14 @@ def web_second_auth(entry_id):
             return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
         else:
             web_storage.log(f"移动端二次验证失败 (文件ID: {entry_id})")
-            _record_login_result(client, False)
+            _record_login_result(client, False, operation=True)
             return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error="验证失败")
     return render_template_string(WEB_SECOND_AUTH_TEMPLATE, entry=entry, methods=allowed_methods, questions=questions, error=None)
 
 
 @flask_app.route('/download/<entry_id>')
 def web_download(entry_id):
-    if 'authenticated' not in session or not session['authenticated']:
+    if not _is_authenticated():
         return redirect(url_for('web_login'))
     entry = web_storage.get_entry_by_id(entry_id)
     if not entry:
@@ -465,11 +556,9 @@ def web_download(entry_id):
 
 
 def check_second_auth(entry_id):
-    """
-    M5（已知局限，有意保留）：本函数把 entry_id 的二次验证结果绑定到 client IP，
-    但 NAT 场景下同一 IP 可能对应多台物理设备。这不是本项目的漏洞——
-    HTTPS 已给 session cookie 加上 Secure 属性，cookie 嗅探难度大幅提高。
-    """
+    """Only a current authenticated session can hold a recent per-file grant."""
+    if not _is_authenticated():
+        return False
     second_auth = session.get('second_auth', {})
     record = second_auth.get(entry_id, 0)
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -478,17 +567,30 @@ def check_second_auth(entry_id):
         client_in_record = record.get('client')
         current_client = request.remote_addr or 'unknown'
         return (expiry > now_ts) and (client_in_record == current_client)
-    else:
-        return record > now_ts
+    return False
 
 
 @flask_app.route('/send_code', methods=['POST'])
 def send_code():
     if 'email' not in _enabled_methods() or not web_auth.email_config:
         return jsonify({'success': False, 'message': '邮箱未配置或未启用'}), 400
-    now = time.time()
+    purpose = request.headers.get('X-Email-Purpose', '')
+    if purpose == 'login':
+        if _is_authenticated():
+            return jsonify({'success': False, 'message': '请使用文件二次验证页面'}), 400
+    elif purpose.startswith('second_auth:'):
+        entry_id = purpose.split(':', 1)[1]
+        if not _is_authenticated():
+            return jsonify({'success': False, 'message': '请先登录'}), 401
+        entry = web_storage.get_entry_by_id(entry_id)
+        if not entry or 'email' not in entry.get('second_auth_methods', []):
+            return jsonify({'success': False, 'message': '不允许的验证方式'}), 403
+    else:
+        return jsonify({'success': False, 'message': '验证用途无效'}), 400
     client = request.remote_addr or 'unknown'
-
+    wait = _login_lock_remaining(client, operation=(purpose != 'login'))
+    if wait:
+        return jsonify({'success': False, 'message': '验证已锁定'}), 429
     wait = _reserve_email_send(client)
     if wait:
         return jsonify({'success': False,
@@ -505,8 +607,7 @@ def send_code():
     msg['From'] = config['sender_email']
     msg['To'] = to_email
     try:
-        with smtplib.SMTP(config['smtp_server'], config['port'], timeout=20) as server:
-            server.starttls()
+        with secure_smtp(config['smtp_server'], config['port'], timeout=20) as server:
             server.login(config['sender_email'], config['password'])
             server.sendmail(config['sender_email'], [to_email], msg.as_string())
     except Exception as e:
@@ -516,7 +617,7 @@ def send_code():
         return jsonify({'success': False, 'message': '邮件发送失败，请检查桌面端日志'}), 500
     web_storage.log(f"移动端发送邮箱验证码至: {to_email}")
 
-    _store_email_code(client, code)
+    _store_email_code(_email_scope(purpose), code)
 
     return jsonify({'success': True, 'message': '验证码已发送'})
 
@@ -539,13 +640,9 @@ def start_web_server(storage, auth, enable_https=True):
             cert_path, key_path = _ensure_self_signed_cert()
             ssl_context = (cert_path, key_path)
             https_on = True
-        except ImportError as e:
-            print(f"[警告] 未安装 cryptography，无法生成 HTTPS 证书，回退到 HTTP: {e}")
-            print("       请运行：pip install cryptography")
-            ssl_context = None
         except Exception as e:
-            print(f"[警告] HTTPS 证书生成失败，回退到 HTTP: {e}")
-            ssl_context = None
+            print(f"HTTPS 初始化失败，已停止启动: {e}")
+            return False
 
     _configure_transport_security(https_on)
 
@@ -554,10 +651,13 @@ def start_web_server(storage, auth, enable_https=True):
             print("\n🔒 Web服务已启用 HTTPS（自签名证书）。")
             print("   浏览器会提示证书不受信任，请手动选择“继续访问”。")
         else:
-            print("\n⚠️ 警告：Web服务使用明文HTTP，仅限可信局域网。")
-            print("   同一网络下的其他人可能嗅探到会话数据，公共网络下请勿启用。")
+            print("\n⚠️ 警告：Web服务使用明文HTTP，仅允许本机访问。")
+            print("   手机或其他设备访问必须启用 HTTPS。")
 
-        bind_host = '0.0.0.0'
+        bind_host = '0.0.0.0' if https_on else '127.0.0.1'
+        flask_app.secret_key = os.urandom(32)
+        with _email_codes_lock:
+            _email_codes.clear()
         if ssl_context:
             _server = make_server(bind_host, WEB_PORT, flask_app, ssl_context=ssl_context)
         else:
@@ -577,6 +677,9 @@ def start_web_server(storage, auth, enable_https=True):
 
 def stop_web_server():
     global _server, _server_thread, _server_is_https
+    flask_app.secret_key = os.urandom(32)
+    with _email_codes_lock:
+        _email_codes.clear()
     if _server is not None:
         try:
             _server.shutdown()
@@ -606,6 +709,7 @@ WEB_LOGIN_TEMPLATE = """<!DOCTYPE html>
 <script>
 function toggleQuestion() {
     var method = document.getElementById('method').value;
+    document.getElementById('auth_input').type = (method === 'password' || method === 'question') ? 'password' : 'text';
     var qDiv = document.getElementById('question_div');
     var emailDiv = document.getElementById('email_div');
     if (method === 'question') { qDiv.style.display = 'block'; } else { qDiv.style.display = 'none'; }
@@ -615,7 +719,7 @@ function sendCode() {
     var btn = document.getElementById('send_code_btn');
     btn.disabled = true;
     btn.textContent = '发送中...';
-    fetch('/send_code', { method: 'POST' })
+    fetch('/send_code', { method: 'POST', headers: { 'X-CSRF-Token': {{ csrf_token|tojson }}, 'X-Email-Purpose': {{ email_purpose|tojson }} } })
         .then(response => response.json())
         .then(data => {
             if (data.success) { alert('验证码已发送至您的邮箱'); } else { alert('发送失败: ' + data.message); }
@@ -627,6 +731,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 </script>
 </head><body>
 <form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <h2>SecureVault 登录</h2>
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 <select id="method" name="method">
@@ -640,7 +745,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 <div id="email_div" style="display:none;">
 <button type="button" id="send_code_btn" onclick="sendCode()">发送验证码</button>
 </div>
-<input type="text" name="input" placeholder="输入验证信息">
+<input id="auth_input" type="password" name="input" placeholder="输入验证信息" autocomplete="off">
 <button type="submit">登录</button>
 </form>
 </body></html>"""
@@ -651,6 +756,7 @@ WEB_SECOND_AUTH_TEMPLATE = """<!DOCTYPE html>
 <script>
 function toggleQuestion() {
     var method = document.getElementById('method').value;
+    document.getElementById('auth_input').type = (method === 'password' || method === 'question') ? 'password' : 'text';
     var qDiv = document.getElementById('question_div');
     var emailDiv = document.getElementById('email_div');
     if (method === 'question') { qDiv.style.display = 'block'; } else { qDiv.style.display = 'none'; }
@@ -660,7 +766,7 @@ function sendCode() {
     var btn = document.getElementById('send_code_btn');
     btn.disabled = true;
     btn.textContent = '发送中...';
-    fetch('/send_code', { method: 'POST' })
+    fetch('/send_code', { method: 'POST', headers: { 'X-CSRF-Token': {{ csrf_token|tojson }}, 'X-Email-Purpose': {{ email_purpose|tojson }} } })
         .then(response => response.json())
         .then(data => {
             if (data.success) { alert('验证码已发送至您的邮箱'); } else { alert('发送失败: ' + data.message); }
@@ -672,6 +778,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 </script>
 </head><body>
 <form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <h2>二次验证 - {{ entry.original_name }}</h2>
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 <select id="method" name="method">
@@ -685,7 +792,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 <div id="email_div" style="display:none;">
 <button type="button" id="send_code_btn" onclick="sendCode()">发送验证码</button>
 </div>
-<input type="text" name="input" placeholder="输入验证信息">
+<input id="auth_input" type="password" name="input" placeholder="输入验证信息" autocomplete="off">
 <button type="submit">验证</button>
 </form>
 </body></html>"""

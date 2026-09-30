@@ -1,6 +1,7 @@
 import os
 import json
 import ctypes
+import tempfile
 from ctypes import wintypes
 
 # 加密文件默认目录（首次运行使用，用户可在设置中修改）
@@ -55,6 +56,10 @@ class SettingsManager:
                 raise ValueError("主密钥长度无效")
             return key
         else:
+            # Persist an unfinished first-run configuration before creating the
+            # key, so cancelling the setup wizard does not resemble lost config.
+            if not os.path.exists(self.CONFIG_PATH):
+                self.save_settings(self.load_settings())
             key = os.urandom(32)
             encrypted = self.dpapi.protect(key)
             self._atomic_write(self.MASTER_KEY_PATH, encrypted)
@@ -62,9 +67,9 @@ class SettingsManager:
 
     @staticmethod
     def _atomic_write(path, data):
-        temp_path = path + '.tmp'
+        fd, temp_path = tempfile.mkstemp(prefix='.sv-', dir=os.path.dirname(path))
         try:
-            with open(temp_path, 'wb') as f:
+            with os.fdopen(fd, 'wb') as f:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
@@ -84,11 +89,15 @@ class SettingsManager:
                 encrypted = f.read()
             try:
                 data = self.dpapi.unprotect(encrypted)
-                self._settings_cache = json.loads(data.decode('utf-8'))
+                parsed = json.loads(data.decode('utf-8'))
+                if not isinstance(parsed, dict):
+                    raise ValueError("配置根节点必须是对象")
+                self._settings_cache = parsed
                 return self._settings_cache
-            except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-                self._settings_cache = {}
-                return self._settings_cache
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                raise RuntimeError("安全配置损坏或无法解密；已停止启动，请恢复有效配置备份。") from exc
+        if os.path.exists(self.MASTER_KEY_PATH):
+            raise RuntimeError("检测到已有主密钥，但安全配置缺失；已停止启动，请恢复配置。")
         self._settings_cache = {}
         return self._settings_cache
 

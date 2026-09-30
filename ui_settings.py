@@ -96,10 +96,9 @@ class SettingsDialog(QDialog):
 
         # 修复 C2：用时间戳控制解锁有效期，而非永久 bool
         if is_recovery_login:
-            # L-A1：恢复登录模式下，用户在登录界面已通过恢复代码完成强验证，
-            # 且通常伴随紧急场景（忘记密码等）。此处视为整场会话都处于解锁状态。
-            # 10**9 秒 ≈ 31.7 年，远超一次会话可能持续的时间。
-            self._unlocked_until = time.time() + 10 ** 9
+            # A recovery grant expires 15 minutes after the code was used;
+            # reopening settings must not extend it.
+            self._unlocked_until = getattr(self.auth, 'recovery_verified_until', 0.0)
         else:
             self._unlocked_until = 0.0
         self._download_worker = None
@@ -508,7 +507,8 @@ class SettingsDialog(QDialog):
 
             # 用 URL 哈希做临时文件唯一标识，避免旧版本残留污染断点续传
             url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()[:8]
-            temp_dir = tempfile.gettempdir()
+            temp_dir = os.path.join(self.auth.settings.CONFIG_DIR, 'updates')
+            os.makedirs(temp_dir, exist_ok=True)
             temp_path = os.path.join(temp_dir, f"SecureVault_update_{url_hash}.exe")
 
             try:
@@ -620,7 +620,7 @@ class SettingsDialog(QDialog):
                 return
 
             try:
-                sig_ok = updater.verify_update_signature(path, sig_bytes)
+                sig_ok = updater.verified_update_sha256(path, sig_bytes)
             except Exception as e:
                 QMessageBox.critical(
                     self, tr("common.error"),
@@ -641,9 +641,13 @@ class SettingsDialog(QDialog):
                 self._cleanup_download_worker()
                 return
         else:
-            self.storage.log(
-                "警告：未配置 SIGNING_PUBLIC_KEY，跳过 Ed25519 签名校验。"
-                "建议在 updater.py 中配置发布者公钥以获得更强保护。")
+            QMessageBox.critical(self, tr("common.error"), "未配置发布者签名公钥，已拒绝自动安装。")
+            self._cleanup_download_worker()
+            return
+
+        # Pin the digest produced during signature verification; do not reopen
+        # the file and accidentally trust bytes swapped in after verification.
+        expected_sha = sig_ok
 
         # ---------- 3. 提示完成 ----------
         QMessageBox.information(
@@ -711,11 +715,11 @@ class SettingsDialog(QDialog):
         if not self._verify_identity(): return
         pw, ok = QInputDialog.getText(
             self, "修改密码",
-            "输入新密码（6-8 位，支持大小写字母、数字、符号）：",
+            "输入新密码（至少 6 个字符，UTF-8 编码不超过 72 字节，支持大小写字母、数字、符号）：",
             QLineEdit.Password)
         if not ok: return
-        if not (6 <= len(pw) <= 8):
-            QMessageBox.warning(self, tr("common.error"), "密码长度必须为 6-8 位")
+        if not (len(pw) >= 6 and len(pw.encode('utf-8')) <= 72):
+            QMessageBox.warning(self, tr("common.error"), "密码长度必须为 至少 6 个字符，UTF-8 编码不超过 72 字节")
             return
         confirm, ok = QInputDialog.getText(self, "修改密码", "再次输入新密码：", QLineEdit.Password)
         if not ok or pw != confirm:
@@ -741,6 +745,9 @@ class SettingsDialog(QDialog):
         if dialog.exec_() != QDialog.Accepted: return
         if not all([q1.text(), a1.text(), q2.text(), a2.text(), q3.text(), a3.text()]):
             QMessageBox.warning(self, tr("common.error"), "请完整填写"); return
+        if any(len(answer.text().encode('utf-8')) > 72 for answer in (a1, a2, a3)):
+            QMessageBox.warning(self, tr('common.error'), '答案的 UTF-8 编码不超过 72 字节')
+            return
         self.auth.set_questions([(q1.text(), a1.text()), (q2.text(), a2.text()), (q3.text(), a3.text())])
         self.storage.log("修改安全问题")
         QMessageBox.information(self, tr("common.success"), "安全问题已更新")
@@ -805,7 +812,7 @@ class SettingsDialog(QDialog):
         if not ok:
             QMessageBox.warning(self, tr("common.error"), f"测试失败: {result}"); return
         vc, ok = QInputDialog.getText(self, "验证邮箱", f"输入 {recv.text()} 收到的验证码")
-        if not ok or not secrets.compare_digest(vc.strip(), str(result)):
+        if not ok or not secrets.compare_digest(vc.strip().encode('utf-8'), str(result).encode('utf-8')):
             QMessageBox.warning(self, tr("common.error"), "验证码错误"); return
         self.auth.save_email_config(smtp.text(), port_i, sender.text(), pwd.text(), recv.text())
         self.storage.log("修改邮箱配置")

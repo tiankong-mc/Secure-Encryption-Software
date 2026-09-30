@@ -1,4 +1,4 @@
-import os, json, shutil, uuid, zipfile, tempfile, struct, time, hashlib, stat
+import os, json, shutil, uuid, zipfile, tempfile, struct, time, hashlib, stat, re
 import datetime
 from pathlib import PurePosixPath
 from collections import Counter
@@ -11,6 +11,11 @@ ENCRYPTED_FILE_KEY_SIZE = 12 + 32 + 16
 MIN_ENCRYPTED_DATA_SIZE = 12 + 16
 BACKUP_KEY_MAGIC = b'SVBK1'
 BACKUP_MEMBER_ALLOWLIST = ('meta.json', 'index.enc', 'migration.key', 'auth.enc')
+MAX_BACKUP_MEMBERS = 10000
+MAX_BACKUP_BYTES = 8 * 1024 ** 3
+MAX_BACKUP_FILE_BYTES = 1024 ** 3
+MAX_BACKUP_METADATA_BYTES = 16 * 1024 ** 2
+BACKUP_VAULT_NAME = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.vault\Z')
 
 # 修复 R2：安全擦除时使用分块写入，避免一次性 os.urandom(size) 造成内存爆掉
 DESTROY_CHUNK_SIZE = 1024 * 1024  # 1 MB
@@ -581,22 +586,53 @@ class StorageManager:
     @staticmethod
     def _validate_backup_members(zf):
         seen = set()
-        if len(zf.infolist()) > 100000:
+        total = 0
+        if len(zf.infolist()) > MAX_BACKUP_MEMBERS:
             raise ValueError("备份包文件数量异常")
         for info in zf.infolist():
             name = info.filename
-            path = PurePosixPath(name)
             mode = (info.external_attr >> 16) & 0xFFFF
-            if (not name or '\\' in name or ':' in name or path.is_absolute()
-                    or '..' in path.parts or len(path.parts) != 1 or stat.S_ISLNK(mode)):
-                raise ValueError(f"备份包包含不安全路径: {name}")
-            if name not in BACKUP_MEMBER_ALLOWLIST and not name.endswith('.vault'):
-                raise ValueError(f"备份包包含未知文件: {name}")
+            # Restrict to exact exporter-generated filenames. This also rejects
+            # Windows ADS, device names, trailing dots/spaces and path traversal.
+            if (name not in BACKUP_MEMBER_ALLOWLIST and not BACKUP_VAULT_NAME.fullmatch(name)):
+                raise ValueError(f"备份包包含不安全文件名: {name}")
+            if stat.S_ISLNK(mode) or info.is_dir():
+                raise ValueError("备份包不能包含链接或目录")
+            limit = (MAX_BACKUP_METADATA_BYTES if name in BACKUP_MEMBER_ALLOWLIST
+                     else MAX_BACKUP_FILE_BYTES)
+            if info.file_size < 0 or info.file_size > limit:
+                raise ValueError(f"备份成员超过大小限制: {name}")
+            total += info.file_size
+            if total > MAX_BACKUP_BYTES:
+                raise ValueError("备份解压后的总大小超过限制")
             if info.file_size > max(10 * 1024 * 1024, info.compress_size * 100):
                 raise ValueError(f"备份包中的文件压缩比例异常: {name}")
-            if name in seen:
+            if name.casefold() in seen:
                 raise ValueError(f"备份包包含重复文件: {name}")
-            seen.add(name)
+            seen.add(name.casefold())
+        if not {'meta.json', 'index.enc'}.issubset(seen):
+            raise ValueError("备份包缺少必要文件")
+
+    @staticmethod
+    def _extract_backup(zf, destination):
+        StorageManager._validate_backup_members(zf)
+        total = 0
+        for info in zf.infolist():
+            written = 0
+            limit = (MAX_BACKUP_METADATA_BYTES if info.filename in BACKUP_MEMBER_ALLOWLIST
+                     else MAX_BACKUP_FILE_BYTES)
+            with zf.open(info) as source, open(os.path.join(destination, info.filename), 'xb') as target:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    total += len(chunk)
+                    if written > limit or written > info.file_size or total > MAX_BACKUP_BYTES:
+                        raise ValueError("备份解压数据超过大小限制")
+                    target.write(chunk)
+            if written != info.file_size:
+                raise ValueError("备份成员大小与声明不一致")
 
     @staticmethod
     def _read_migration_key(path, password):
@@ -627,7 +663,7 @@ class StorageManager:
                     self._validate_backup_members(zf)
                     if password:
                         zf.setpassword(password.encode())
-                    zf.extractall(temp_dir)
+                    self._extract_backup(zf, temp_dir)
             except (RuntimeError, ValueError, zipfile.BadZipFile) as e:
                 raise ValueError(f"无法打开备份包，请检查文件和密码: {e}") from e
             meta_path = os.path.join(temp_dir, 'meta.json')
@@ -635,6 +671,8 @@ class StorageManager:
                 raise ValueError("无效的备份包：缺少 meta.json")
             with open(meta_path, 'r', encoding='utf-8') as f:
                 meta = json.load(f)
+            if not isinstance(meta, dict):
+                raise ValueError('备份元信息格式无效')
             index_path = os.path.join(temp_dir, 'index.enc')
             if not os.path.exists(index_path):
                 raise ValueError("无效的备份包：缺少 index.enc")
@@ -661,16 +699,17 @@ class StorageManager:
                     with open(auth_path, 'rb') as f:
                         raw = decrypt_data(f.read(), backup_master_key)
                     parsed = json.loads(raw.decode('utf-8'))
-                    if isinstance(parsed, dict):
-                        auth_settings = parsed
-                except Exception:
-                    auth_settings = None
+                    if not isinstance(parsed, dict):
+                        raise ValueError('验证配置格式无效')
+                    auth_settings = parsed
+                except Exception as exc:
+                    raise ValueError('备份验证配置损坏，已取消导入') from exc
 
             for entry in entries:
                 if not isinstance(entry, dict) or not isinstance(entry.get('original_name'), str):
                     raise ValueError("备份索引包含无效记录")
-                archive_name = os.path.basename(str(entry.get('secret_path', '')))
-                if not archive_name.endswith('.vault'):
+                archive_name = entry.get('secret_path', '')
+                if not isinstance(archive_name, str) or not BACKUP_VAULT_NAME.fullmatch(archive_name):
                     raise ValueError("备份索引中的文件名无效")
                 source_path = os.path.join(temp_dir, archive_name)
                 if not os.path.isfile(source_path):
@@ -688,7 +727,8 @@ class StorageManager:
                 new_id = str(uuid.uuid4())
                 dest_path = os.path.join(self.SECRET_DIR, new_id + '.vault')
                 temp_path = dest_path + '.tmp'
-                with open(temp_path, 'wb') as f:
+                created_paths.append(temp_path)
+                with open(temp_path, 'xb') as f:
                     f.write(data_pack)
                     f.flush()
                     os.fsync(f.fileno())

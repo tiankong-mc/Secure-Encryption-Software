@@ -23,7 +23,7 @@ GITEE_API = (
     f"/releases?{urlencode(_gitee_params)}"
 )
 
-# Ed25519 发布者公钥（base64 的 32 字节原始公钥）。留空则跳过签名校验。
+# Ed25519 发布者公钥（base64 的 32 字节原始公钥）。自动更新必须验证签名。
 SIGNING_PUBLIC_KEY = "nx697jofj6nw3UZhnJpKixo2E+lbf90pcpisC2v2GRw="
 
 DOWNLOAD_MIRRORS = [
@@ -462,7 +462,7 @@ def _verify_ed25519(signature, message, public_key_b64):
         "请安装 cryptography（推荐，pip install cryptography）或 PyNaCl（pip install pynacl）。")
 
 
-def verify_update_signature(file_path, signature_bytes, public_key_b64=None):
+def verified_update_sha256(file_path, signature_bytes, public_key_b64=None):
     key = public_key_b64 if public_key_b64 is not None else SIGNING_PUBLIC_KEY
     if not key:
         raise UpdateError("未配置签名公钥，无法进行签名校验")
@@ -476,14 +476,18 @@ def verify_update_signature(file_path, signature_bytes, public_key_b64=None):
     digest = sha.digest()
 
     if _verify_ed25519(sig, digest, key):
-        return True
+        return sha.hexdigest()
     try:
         if _verify_ed25519(sig, sha.hexdigest().encode('ascii'), key):
-            return True
+            return sha.hexdigest()
     except UpdateError:
         raise
 
-    return False
+    return None
+
+
+def verify_update_signature(file_path, signature_bytes, public_key_b64=None):
+    return verified_update_sha256(file_path, signature_bytes, public_key_b64) is not None
 
 
 def _decode_signature_blob(blob):
@@ -724,15 +728,20 @@ def _is_dir_writable(directory):
 
 
 def write_update_bat(exe_dir, temp_path, target_exe, expected_sha256=None):
-    bat_path = None
-    if _is_dir_writable(exe_dir):
-        bat_path = os.path.join(exe_dir, "SecureVault_update.bat")
-    else:
-        temp_dir = tempfile.gettempdir()
-        bat_path = os.path.join(temp_dir, f"SecureVault_update_{os.getpid()}.bat")
+    # These values are embedded in cmd.exe source. Reject expansion and
+    # control characters even when they occur inside quoted Windows paths.
+    for path in (exe_dir, temp_path, target_exe):
+        if not isinstance(path, str) or not path or any(c in path for c in '\r\n\x00"%!&|<>^'):
+            raise UpdateError("更新路径含有不安全的命令字符，请手动安装")
+    if not isinstance(expected_sha256, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', expected_sha256):
+        raise UpdateError("替换程序前必须提供已验证文件的 SHA-256")
+    directory = exe_dir if _is_dir_writable(exe_dir) else os.path.dirname(temp_path)
+    fd, bat_path = tempfile.mkstemp(prefix='SecureVault_update_', suffix='.bat', dir=directory)
+    os.close(fd)
 
     lines = []
     lines.append("@echo off")
+    lines.append("chcp 65001 > nul")
     lines.append("setlocal enabledelayedexpansion")
     lines.append("timeout /t 2 > nul")
     lines.append("")

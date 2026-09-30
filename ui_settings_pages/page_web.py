@@ -166,7 +166,7 @@ class WebPage(SettingsPage):
             # 服务运行中不允许修改 HTTPS 开关
             self.https_cb.setEnabled(False)
 
-            ip, is_loopback = self._get_ip()
+            ip, is_loopback = self._get_ip() if https_on else ('127.0.0.1', True)
             scheme = 'https' if https_on else 'http'
             url = f"{scheme}://{ip}:{WEB_PORT}"
             pixmap = self._make_qr_pixmap(url)

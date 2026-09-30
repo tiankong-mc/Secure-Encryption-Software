@@ -1,3 +1,4 @@
+from mail_security import secure_smtp
 import os
 import smtplib
 from email.mime.base import MIMEBase
@@ -36,8 +37,7 @@ class BackupManager:
         encoders.encode_base64(part)
         part.add_header('Content-Disposition', f'attachment; filename={display_name}')
         msg.attach(part)
-        with smtplib.SMTP(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
-            server.starttls()
+        with secure_smtp(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
             server.login(smtp_config['sender_email'], smtp_config['password'])
             server.sendmail(smtp_config['sender_email'], [to_email], msg.as_string())
 
