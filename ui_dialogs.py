@@ -4,14 +4,12 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                               QPushButton, QComboBox, QStackedWidget, QDialogButtonBox,
                               QMessageBox, QWidget, QCheckBox, QGroupBox, QFileDialog,
                               QApplication)
-# DeleteAuthDialog 中用到 Qt.AlignCenter，必须一并导入 Qt
 from PyQt5.QtCore import Qt, QTimer
 
 from auth_helpers import verify_email_code
 
 
 def _method_has_data(auth_manager, method):
-    """检查某个验证方式是否真正有可用数据。"""
     if method == 'password':
         return bool(auth_manager.password_hash)
     if method == 'question':
@@ -24,7 +22,6 @@ def _method_has_data(auth_manager, method):
 
 
 def _filter_methods(auth_manager, methods):
-    """过滤出既已启用又有可用数据的验证方式。"""
     enabled = set(auth_manager.get_enabled_methods())
     result = []
     for m in methods:
@@ -36,14 +33,7 @@ def _filter_methods(auth_manager, methods):
     return result
 
 
-# ============================================================
-#  验证对话框公共基类
-# ============================================================
 class _BaseAuthDialog(QDialog):
-    """
-    AuthDialog 与 DeleteAuthDialog 共享的验证 UI 与逻辑。
-    """
-
     def __init__(self, parent, auth_manager, allowed_methods):
         super().__init__(parent)
         self.auth = auth_manager
@@ -63,8 +53,8 @@ class _BaseAuthDialog(QDialog):
 
         if not self.allowed_methods:
             warn_label = QLabel(
-                "此操作当前没有可用的验证方式。\n"
-                "请在“设置 → 安全”中配置并启用至少一种验证方式后再试。")
+                "此操作当前没有可用的验证方式。\n\n"
+                "请到「设置 → 安全」中配置并启用至少一种验证方式后再试。")
             warn_label.setWordWrap(True)
             warn_label.setStyleSheet("color: #ffaa00; padding: 12px; font-size: 10pt;")
             layout.addWidget(warn_label)
@@ -75,11 +65,22 @@ class _BaseAuthDialog(QDialog):
             self.method_combo.setEnabled(False)
             layout.addWidget(self.method_combo)
 
-            self.btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            self.btn_box.button(QDialogButtonBox.Ok).setEnabled(False)
-            self.btn_box.accepted.connect(self.accept)
-            self.btn_box.rejected.connect(self.reject)
-            layout.addWidget(self.btn_box)
+            btn_row = QHBoxLayout()
+            open_settings_btn = QPushButton("打开设置")
+            open_settings_btn.clicked.connect(self._open_settings_page)
+
+            ok_btn = QPushButton("确定")
+            ok_btn.setEnabled(False)
+            cancel_btn = QPushButton("取消")
+            cancel_btn.clicked.connect(self.reject)
+
+            btn_row.addWidget(open_settings_btn)
+            btn_row.addStretch()
+            btn_row.addWidget(ok_btn)
+            btn_row.addWidget(cancel_btn)
+            layout.addLayout(btn_row)
+
+            self.btn_box = None
             self.setLayout(layout)
             return
 
@@ -107,6 +108,55 @@ class _BaseAuthDialog(QDialog):
         self.btn_box.rejected.connect(self.reject)
         layout.addWidget(self.btn_box)
         self.setLayout(layout)
+
+    def _find_main_window(self):
+        """
+        修复 M4：优先从 parent 链查找带 open_settings 的窗口；
+        找不到时回退到 QApplication.topLevelWidgets()。
+        """
+        # 1) parent 链
+        parent = self.parent()
+        while parent is not None:
+            if hasattr(parent, 'open_settings'):
+                return parent
+            try:
+                parent = parent.parent()
+            except Exception:
+                parent = None
+
+        # 2) 顶层窗口兜底
+        try:
+            for w in QApplication.topLevelWidgets():
+                if hasattr(w, 'open_settings'):
+                    try:
+                        if w.isVisible():
+                            return w
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        return None
+
+    def _open_settings_page(self):
+        """尝试打开主窗口的设置对话框并跳到安全页。"""
+        try:
+            parent = self._find_main_window()
+            if parent is None:
+                QMessageBox.information(
+                    self, "提示",
+                    "请手动打开「设置 → 安全」进行配置。")
+                return
+            parent.open_settings()
+            dlg = getattr(parent, '_settings_dialog', None)
+            if dlg is not None:
+                try:
+                    dlg.sidebar.setCurrentRow(0)
+                except Exception:
+                    pass
+            self.reject()
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法打开设置：{e}")
 
     def create_password_widget(self):
         w = QWidget(); l = QVBoxLayout()
@@ -149,7 +199,7 @@ class _BaseAuthDialog(QDialog):
             QMessageBox.warning(self, "错误", "邮件发送失败，请检查配置")
 
     def _check_credentials(self):
-        method = self.method_combo.currentText()
+        method = self.method_combo.currentText() if self.method_combo else ""
         if method == 'password':
             return self.auth.verify_password(self.pw_input.text())
         elif method == 'question':
@@ -170,9 +220,6 @@ class _BaseAuthDialog(QDialog):
         return False
 
 
-# ============================================================
-#  高级文件二次验证（带紧急处理）
-# ============================================================
 class AuthDialog(_BaseAuthDialog):
     MAX_ATTEMPTS = 5
 
@@ -311,12 +358,7 @@ class AuthDialog(_BaseAuthDialog):
         self._close_and_quit()
 
 
-# ============================================================
-#  敏感操作身份验证（带锁定机制）
-# ============================================================
 class DeleteAuthDialog(_BaseAuthDialog):
-    """身份验证（删除/修改敏感操作），失败 5 次触发锁定。"""
-
     def __init__(self, parent, auth_manager, allowed_methods):
         filtered = _filter_methods(auth_manager, allowed_methods)
         super().__init__(parent, auth_manager, filtered)
@@ -326,16 +368,17 @@ class DeleteAuthDialog(_BaseAuthDialog):
 
         self._setup_ui("请验证身份以继续操作：")
 
-        layout = self.layout()
-        self._lock_label = QLabel("")
-        self._lock_label.setAlignment(Qt.AlignCenter)  # 需要 Qt
-        self._lock_label.setStyleSheet(
-            "color: #ff6666; font-size: 11pt; padding: 6px; font-weight: bold;")
-        self._lock_label.setWordWrap(True)
-        self._lock_label.setVisible(False)
-        layout.insertWidget(0, self._lock_label)
+        if self.allowed_methods:
+            layout = self.layout()
+            self._lock_label = QLabel("")
+            self._lock_label.setAlignment(Qt.AlignCenter)
+            self._lock_label.setStyleSheet(
+                "color: #ff6666; font-size: 11pt; padding: 6px; font-weight: bold;")
+            self._lock_label.setWordWrap(True)
+            self._lock_label.setVisible(False)
+            layout.insertWidget(0, self._lock_label)
 
-        self._apply_lock_if_needed()
+            self._apply_lock_if_needed()
 
     def _apply_lock_if_needed(self):
         remaining = self.auth.get_op_lock_remaining()
@@ -344,10 +387,14 @@ class DeleteAuthDialog(_BaseAuthDialog):
 
     def _apply_lock(self, seconds):
         self._lock_seconds = seconds
-        self.stack.setEnabled(False)
-        self.method_combo.setEnabled(False)
-        self.btn_box.setEnabled(False)
-        self._lock_label.setVisible(True)
+        if self.stack is not None:
+            self.stack.setEnabled(False)
+        if self.method_combo is not None:
+            self.method_combo.setEnabled(False)
+        if self.btn_box is not None:
+            self.btn_box.setEnabled(False)
+        if self._lock_label is not None:
+            self._lock_label.setVisible(True)
         self._update_lock_label()
         if self._lock_timer is not None:
             self._lock_timer.stop()
@@ -366,14 +413,19 @@ class DeleteAuthDialog(_BaseAuthDialog):
             self._update_lock_label()
 
     def _update_lock_label(self):
-        self._lock_label.setText(
-            f"错误次数过多，请等待 {self._lock_seconds} 秒后再试")
+        if self._lock_label is not None:
+            self._lock_label.setText(
+                f"错误次数过多，请等待 {self._lock_seconds} 秒后再试")
 
     def _release_lock(self):
-        self._lock_label.setVisible(False)
-        self.stack.setEnabled(True)
-        self.method_combo.setEnabled(True)
-        self.btn_box.setEnabled(True)
+        if self._lock_label is not None:
+            self._lock_label.setVisible(False)
+        if self.stack is not None:
+            self.stack.setEnabled(True)
+        if self.method_combo is not None:
+            self.method_combo.setEnabled(True)
+        if self.btn_box is not None:
+            self.btn_box.setEnabled(True)
 
     def closeEvent(self, event):
         if self._lock_timer is not None:
@@ -411,9 +463,6 @@ class DeleteAuthDialog(_BaseAuthDialog):
             QMessageBox.warning(self, "验证失败", f"失败 {fail_count} 次")
 
 
-# ============================================================
-#  上传文件选项
-# ============================================================
 class UploadDialog(QDialog):
     """上传文件选项"""
     def __init__(self, parent, file_path):

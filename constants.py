@@ -1,11 +1,16 @@
 import os
 
-VERSION = "v2.5.2"
+VERSION = "v2.5.3"
 WEB_PORT = 8080
 ISSUES_URL = "https://github.com/tiankong-mc/Secure-Encryption-Software/issues"
 LANG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lang")
 
-ABOUT_TEXT = """SecureVault —— 一个专注于本地安全的加密文件保险库。
+# 项目主页链接（集中管理，方便一处修改）
+GITHUB_URL = "https://github.com/tiankong-mc/Secure-Encryption-Software"
+BILIBILI_URL = "https://space.bilibili.com/1974438557"
+AFDIAN_URL = "https://ifdian.net/a/tiankong_mc"
+
+ABOUT_TEXT = f"""SecureVault —— 一个专注于本地安全的加密文件保险库。
 
 我希望这个软件能成为你数字生活中一个小小的"保险柜"：
 文件加密与解密在本机完成，不会上传明文文件。

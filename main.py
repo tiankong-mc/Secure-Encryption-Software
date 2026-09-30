@@ -9,10 +9,10 @@ from storage import StorageManager
 from auth import AuthManager
 from settings import SettingsManager
 from single_instance import SingleInstanceServer, try_send_to_existing_instance
+from crash_reporter import install_excepthook
 
 
 def _get_icon_path():
-    """获取图标路径，兼容源码运行与 PyInstaller 打包后的路径"""
     if getattr(sys, 'frozen', False):
         base_path = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
     else:
@@ -21,7 +21,6 @@ def _get_icon_path():
 
 
 def _parse_encrypt_arg():
-    """解析 --encrypt <path> 参数。返回文件路径或 None。"""
     args = sys.argv[1:]
     for i, a in enumerate(args):
         if a == '--encrypt' and i + 1 < len(args):
@@ -29,10 +28,20 @@ def _parse_encrypt_arg():
     return None
 
 
+# 全局 settings 引用，供崩溃处理器延迟读取
+_settings_holder = {'sm': None}
+
+
+def _get_settings():
+    return _settings_holder['sm']
+
+
 def main():
+    # 尽早安装崩溃处理器（在 QApplication 之前）
+    install_excepthook(_get_settings)
+
     pending_encrypt_path = _parse_encrypt_arg()
 
-    # Windows 任务栏图标分组
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("tiankong.SecureVault")
     except Exception:
@@ -40,19 +49,14 @@ def main():
 
     app = QApplication(sys.argv)
 
-    # 设置全局应用图标
     icon_path = _get_icon_path()
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
-    # 修复 #1：无论是否带 --encrypt，都先尝试转发给已有实例。
-    # 不带参数时发送 "ping" 探测；如果已有主实例在运行，本进程直接退出，
-    # 避免双击两次 exe 启动两个独立主实例，导致索引竞争写入损坏。
     payload = f"encrypt:{pending_encrypt_path}" if pending_encrypt_path else "ping"
     if try_send_to_existing_instance(payload):
         return 0
 
-    # 只有确认没有主实例时才创建本地服务器
     instance_server = SingleInstanceServer()
 
     main_window_ref = [None]
@@ -74,6 +78,7 @@ def main():
     # ---------- 初始化 ----------
     try:
         settings = SettingsManager()
+        _settings_holder['sm'] = settings
         auth = AuthManager(settings)
         storage = StorageManager(settings)
     except Exception as e:

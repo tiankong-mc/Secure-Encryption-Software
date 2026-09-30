@@ -1,4 +1,4 @@
-import os, sys, shutil, secrets, threading
+import os, sys, shutil, secrets, threading, tempfile, hashlib, time
 from io import BytesIO
 import qrcode
 import pyotp
@@ -26,6 +26,10 @@ from ui_settings_pages.page_update import UpdatePage
 from ui_settings_pages.page_about import AboutPage
 
 
+# 敏感操作解锁有效期（秒）——修复 C2
+UNLOCK_TTL_SECONDS = 120
+
+
 def _is_subpath(child, parent):
     try:
         child = os.path.normcase(os.path.abspath(child))
@@ -37,15 +41,12 @@ def _is_subpath(child, parent):
         return False
 
 
-# ============================================================
-#  后台下载线程
-# ============================================================
 class DownloadWorker(QThread):
     """在后台线程执行下载，避免阻塞主线程导致 UI 卡死。"""
 
-    progress = pyqtSignal(int, int, str, float)   # (downloaded, total, source_name, speed_kbps)
-    finished_ok = pyqtSignal(str)                  # dest_path
-    failed = pyqtSignal(str)                       # error message
+    progress = pyqtSignal(int, int, str, float)
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
 
     def __init__(self, url, dest_path, parent=None):
         super().__init__(parent)
@@ -54,7 +55,6 @@ class DownloadWorker(QThread):
         self._cancel_event = threading.Event()
 
     def cancel(self):
-        """请求取消。设置事件后，下载循环会在下一个 chunk 检查时立即退出。"""
         self._cancel_event.set()
 
     def run(self):
@@ -67,7 +67,6 @@ class DownloadWorker(QThread):
                     self.progress.emit(int(done), int(total),
                                        str(source_name), float(speed_kbps))
                 except RuntimeError:
-                    # 接收方已销毁
                     pass
 
             updater.download_file(
@@ -95,7 +94,14 @@ class SettingsDialog(QDialog):
         self.parent_main = parent
         self.storage = parent.storage
 
-        self._unlocked = bool(is_recovery_login)
+        # 修复 C2：用时间戳控制解锁有效期，而非永久 bool
+        if is_recovery_login:
+            # L-A1：恢复登录模式下，用户在登录界面已通过恢复代码完成强验证，
+            # 且通常伴随紧急场景（忘记密码等）。此处视为整场会话都处于解锁状态。
+            # 10**9 秒 ≈ 31.7 年，远超一次会话可能持续的时间。
+            self._unlocked_until = time.time() + 10 ** 9
+        else:
+            self._unlocked_until = 0.0
         self._download_worker = None
 
         self.setWindowTitle(tr("settings.title"))
@@ -143,43 +149,39 @@ class SettingsDialog(QDialog):
 
         self.apply_style()
 
+    # ---------- 解锁状态查询（供子页面调用）----------
+    def _is_unlocked(self):
+        """修复 C2：统一的解锁状态查询接口。"""
+        return time.time() < self._unlocked_until
+
     # ---------- 关闭时清理下载线程 ----------
     def closeEvent(self, event):
-        """
-        关闭设置对话框前，必须先停掉下载线程。
-        否则 QThread 在 C++ 对象已销毁的情况下仍在 emit 信号，
-        会导致主程序崩溃。
-        """
         self._stop_download_worker()
         super().closeEvent(event)
 
     def _stop_download_worker(self):
-        """主动停止下载线程并等待其退出。"""
         worker = self._download_worker
         if worker is None:
             return
         self._download_worker = None
 
-        # 1. 先断开所有信号，防止 closeEvent 过程中触发槽函数
         for sig in (worker.progress, worker.finished_ok, worker.failed):
             try:
                 sig.disconnect()
             except Exception:
                 pass
 
-        # 2. 请求取消
         try:
             worker.cancel()
         except Exception:
             pass
 
-        # 3. 等待线程真正结束（最多 5 秒）
         try:
             if worker.isRunning():
-                if not worker.wait(5000):
-                    # 5 秒还没退，强制终止（不优雅但避免崩溃）
-                    worker.terminate()
-                    worker.wait(1000)
+                if not worker.wait(10000):
+                    self.storage.log(
+                        "下载线程未能在 10 秒内退出，将放弃等待；"
+                        "残留的临时文件按 URL 哈希隔离，不会污染下次下载")
         except Exception:
             pass
 
@@ -213,6 +215,8 @@ class SettingsDialog(QDialog):
         if self._ignore_change or row < 0:
             return
         item = self.sidebar.item(row)
+        if item is None:
+            return
         key = item.data(Qt.UserRole)
         if key == 'feedback':
             self._ignore_change = True
@@ -244,7 +248,11 @@ class SettingsDialog(QDialog):
         self.apply_style()
         self._build_sidebar()
         self._ignore_change = True
-        self.sidebar.setCurrentRow(self._last_row)
+        # 修复 M2：防止 _last_row 越界
+        count = self.sidebar.count()
+        safe_row = max(0, min(self._last_row, count - 1))
+        self.sidebar.setCurrentRow(safe_row)
+        self._last_row = safe_row
         self._ignore_change = False
         for page in self.pages.values():
             if hasattr(page, 'retranslate'):
@@ -255,7 +263,8 @@ class SettingsDialog(QDialog):
 
     # ---------- 权限验证 ----------
     def _verify_identity(self):
-        if self._unlocked:
+        # 修复 C2：用时间戳判断是否仍处于解锁有效期
+        if time.time() < self._unlocked_until:
             return True
         methods = self.auth.get_enabled_methods()
         if not methods:
@@ -263,7 +272,7 @@ class SettingsDialog(QDialog):
             return False
         dialog = DeleteAuthDialog(self, self.auth, methods)
         if dialog.exec_() == QDialog.Accepted:
-            self._unlocked = True
+            self._unlocked_until = time.time() + UNLOCK_TTL_SECONDS
             return True
         return False
 
@@ -297,6 +306,12 @@ class SettingsDialog(QDialog):
         self.auth.settings_dict['secure_delete'] = enabled
         self.auth._save()
         self.storage.log(f"安全擦除: {'启用' if enabled else '禁用'}")
+
+    def toggle_crash_report(self, state):
+        enabled = (state == Qt.Checked)
+        self.auth.settings_dict['crash_report_enabled'] = enabled
+        self.auth._save()
+        self.storage.log(f"崩溃报告: {'启用' if enabled else '禁用'}")
 
     def toggle_context_menu(self, enabled):
         from context_menu import register_context_menu, unregister_context_menu
@@ -355,7 +370,6 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"生成恢复代码失败: {e}")
 
-    # ---------- 保险库备份 ----------
     def export_vault_backup(self):
         if not self._verify_identity():
             return
@@ -434,7 +448,6 @@ class SettingsDialog(QDialog):
         self.storage.log("导入保险库备份")
         QMessageBox.information(self, tr("common.success"), "备份已合并到当前保险库")
 
-    # ---------- 检查更新 ----------
     def check_update(self):
         import updater
 
@@ -469,7 +482,6 @@ class SettingsDialog(QDialog):
             if update_page:
                 update_page.set_result(f"{tr('common.error')}: {e}", "#ff4444")
 
-    # ---------- 下载更新（后台线程） ----------
     def download_update(self, data):
         import updater
 
@@ -493,19 +505,24 @@ class SettingsDialog(QDialog):
             expected_sha = updater.extract_sha256(data)
 
             self.storage.log(f"开始下载更新: {latest}")
-            exe_dir = os.path.dirname(sys.executable)
-            temp_path = os.path.join(exe_dir, "SecureVault_update.exe")
 
-            # 注意：不删除已有的 temp_path，让断点续传能继续
-            # 如果上一轮下载已完成，会在 finished 时被替换掉
-            if os.path.exists(temp_path):
-                # 如果文件已存在但大小异常小，认为是脏数据，清掉
-                try:
-                    sz = os.path.getsize(temp_path)
-                    if sz == 0:
-                        os.remove(temp_path)
-                except OSError:
-                    pass
+            # 用 URL 哈希做临时文件唯一标识，避免旧版本残留污染断点续传
+            url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()[:8]
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, f"SecureVault_update_{url_hash}.exe")
+
+            try:
+                for name in os.listdir(temp_dir):
+                    if (name.startswith("SecureVault_update_")
+                            and name.endswith(".exe")):
+                        old_path = os.path.join(temp_dir, name)
+                        if os.path.normcase(old_path) != os.path.normcase(temp_path):
+                            try:
+                                os.remove(old_path)
+                            except OSError:
+                                pass
+            except OSError:
+                pass
 
             progress = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
             progress.setWindowModality(Qt.WindowModal)
@@ -521,7 +538,7 @@ class SettingsDialog(QDialog):
                     progress, done, total, src, spd))
             self._download_worker.finished_ok.connect(
                 lambda path: self._on_download_finished(
-                    path, expected_sha, latest, progress))
+                    path, expected_sha, latest, data, progress))
             self._download_worker.failed.connect(
                 lambda err: self._on_download_failed(err, progress))
             progress.canceled.connect(self._download_worker.cancel)
@@ -530,29 +547,40 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, tr("common.error"), f"更新失败: {e}")
 
+    # 修复 H1：包 RuntimeError 保护，避免队列中的信号回调访问已销毁的 dialog
     def _on_download_progress(self, progress, done, total, source_name, speed_kbps):
-        if total:
-            progress.setValue(int(done / total * 100))
-        done_mb = done / 1024 / 1024
-        total_mb = total / 1024 / 1024 if total else 0
-        speed_str = f"{speed_kbps:.1f} KB/s" if speed_kbps > 0 else "计算中..."
-        progress.setLabelText(
-            f"正在从 {source_name} 下载...\n"
-            f"{done_mb:.1f} MB / {total_mb:.1f} MB\n"
-            f"速度: {speed_str}")
+        try:
+            if total:
+                progress.setValue(int(done / total * 100))
+            done_mb = done / 1024 / 1024
+            total_mb = total / 1024 / 1024 if total else 0
+            speed_str = f"{speed_kbps:.1f} KB/s" if speed_kbps > 0 else "计算中..."
+            progress.setLabelText(
+                f"正在从 {source_name} 下载...\n"
+                f"{done_mb:.1f} MB / {total_mb:.1f} MB\n"
+                f"速度: {speed_str}")
+        except RuntimeError:
+            pass
 
-    def _on_download_finished(self, path, expected_sha, latest, progress):
+    def _on_download_finished(self, path, expected_sha, latest, release_data, progress):
         import updater
         import subprocess as sp
 
-        progress.setValue(100)
-        progress.close()
+        try:
+            progress.setValue(100)
+        except RuntimeError:
+            pass
+        try:
+            progress.close()
+        except RuntimeError:
+            pass
 
+        # ---------- 1. SHA-256 校验 ----------
         if expected_sha:
             if not updater.verify_sha256(path, expected_sha):
                 QMessageBox.critical(self, tr("common.error"), "SHA-256 校验失败")
                 try: os.remove(path)
-                except: pass
+                except OSError: pass
                 self._cleanup_download_worker()
                 return
         else:
@@ -561,50 +589,122 @@ class SettingsDialog(QDialog):
                     "未提供 SHA-256，继续？",
                     QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
                 try: os.remove(path)
-                except: pass
+                except OSError: pass
                 self._cleanup_download_worker()
                 return
 
+        # ---------- 2. Ed25519 签名校验（如果配置了公钥） ----------
+        if updater.SIGNING_PUBLIC_KEY:
+            sig_asset = updater.find_signature_asset(release_data)
+            if not sig_asset:
+                QMessageBox.critical(
+                    self, tr("common.error"),
+                    "当前版本已配置签名公钥，但此 Release 未提供 .sig 签名文件。\n\n"
+                    "出于安全考虑，拒绝安装未签名的更新。\n"
+                    "请联系发布者重新发布带签名的版本。")
+                try: os.remove(path)
+                except OSError: pass
+                self._cleanup_download_worker()
+                return
+
+            try:
+                sig_bytes = updater.download_signature(
+                    sig_asset['browser_download_url'], timeout=15)
+            except Exception as e:
+                QMessageBox.critical(
+                    self, tr("common.error"),
+                    f"下载签名文件失败：{e}\n\n出于安全考虑，拒绝安装。")
+                try: os.remove(path)
+                except OSError: pass
+                self._cleanup_download_worker()
+                return
+
+            try:
+                sig_ok = updater.verify_update_signature(path, sig_bytes)
+            except Exception as e:
+                QMessageBox.critical(
+                    self, tr("common.error"),
+                    f"签名校验过程出错：{e}\n\n出于安全考虑，拒绝安装。")
+                try: os.remove(path)
+                except OSError: pass
+                self._cleanup_download_worker()
+                return
+
+            if not sig_ok:
+                QMessageBox.critical(
+                    self, tr("common.error"),
+                    "Ed25519 签名校验失败。\n\n"
+                    "此文件可能被篡改或伪造，已拒绝安装。\n"
+                    "请从官方渠道重新下载。")
+                try: os.remove(path)
+                except OSError: pass
+                self._cleanup_download_worker()
+                return
+        else:
+            self.storage.log(
+                "警告：未配置 SIGNING_PUBLIC_KEY，跳过 Ed25519 签名校验。"
+                "建议在 updater.py 中配置发布者公钥以获得更强保护。")
+
+        # ---------- 3. 提示完成 ----------
         QMessageBox.information(
             self, "更新完成",
             f"新版本 {latest} 已下载并准备替换。\n\n"
             "请手动关闭本程序，然后双击运行 SecureVault.exe 启动新版本。")
 
+        # ---------- 4. 启动替换脚本（带 SHA-256 二次校验） ----------
         exe_dir = os.path.dirname(sys.executable)
-        bat_path = updater.write_update_bat(exe_dir, path, sys.executable)
-        sp.Popen([bat_path], creationflags=sp.CREATE_NEW_CONSOLE)
-        self.storage.log("更新替换完成，用户手动启动")
+        try:
+            bat_path = updater.write_update_bat(
+                exe_dir, path, sys.executable, expected_sha256=expected_sha)
+            sp.Popen([bat_path], creationflags=sp.CREATE_NEW_CONSOLE)
+            self.storage.log("更新替换完成，用户手动启动")
+        except Exception as e:
+            self.storage.log(f"启动替换脚本失败: {e}")
+            QMessageBox.warning(
+                self, tr("common.warning"),
+                f"启动替换脚本失败：{e}\n\n"
+                f"新版本已下载到：\n{path}\n"
+                f"请手动将文件复制到：\n{sys.executable}")
+            self._cleanup_download_worker()
+            return
+
         self._cleanup_download_worker()
         QApplication.quit()
 
     def _on_download_failed(self, err, progress):
         try:
             progress.close()
-        except Exception:
+        except RuntimeError:
             pass
         self._cleanup_download_worker()
         if err == "__cancelled__":
             try:
                 QMessageBox.information(self, tr("common.info"), "已取消下载")
-            except Exception:
+            except RuntimeError:
                 pass
         else:
             try:
                 QMessageBox.critical(self, tr("common.error"), f"更新失败: {err}")
-            except Exception:
+            except RuntimeError:
                 pass
 
     def _cleanup_download_worker(self):
-        """下载线程结束后释放引用（不 wait，只断信号）。"""
         worker = self._download_worker
         if worker is None:
             return
         self._download_worker = None
+
         for sig in (worker.progress, worker.finished_ok, worker.failed):
             try:
                 sig.disconnect()
             except Exception:
                 pass
+
+        try:
+            if worker.isRunning():
+                worker.wait(2000)
+        except Exception:
+            pass
 
     # ---------- 修改验证信息 ----------
     def change_password(self):
@@ -712,9 +812,6 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, tr("common.success"), "邮箱配置已更新")
         self._refresh_security_page()
 
-    # ============================================================
-    #  修改加密文件目录
-    # ============================================================
     def change_secret_dir(self):
         if not self._verify_identity():
             return
@@ -736,6 +833,36 @@ class SettingsDialog(QDialog):
         if os.path.exists(new_dir) and os.listdir(new_dir):
             QMessageBox.warning(self, "错误", f"目标目录不为空：\n{new_dir}")
             return
+
+        # 修复 H2：迁移前检查磁盘空间（所有 .vault + 10% 余量）
+        try:
+            total_needed = 0
+            for entry in self.storage.index:
+                for key in ('secret_path', 'user_path'):
+                    p = entry.get(key)
+                    if p and os.path.exists(p):
+                        try:
+                            total_needed += os.path.getsize(p)
+                        except OSError:
+                            pass
+            for name in ('index.enc', 'index.enc.bak', 'securevault.log'):
+                p = os.path.join(current, name)
+                if os.path.exists(p):
+                    try:
+                        total_needed += os.path.getsize(p)
+                    except OSError:
+                        pass
+            needed_with_margin = int(total_needed * 1.1)
+            free = shutil.disk_usage(new_dir).free
+            if free < needed_with_margin:
+                QMessageBox.warning(
+                    self, "磁盘空间不足",
+                    f"目标目录剩余空间 {free / (1024*1024):.1f} MB\n"
+                    f"预计需要 {needed_with_margin / (1024*1024):.1f} MB\n\n"
+                    f"请清理空间后重试。")
+                return
+        except Exception as e:
+            self.storage.log(f"磁盘空间检查失败（将继续迁移）: {e}")
 
         n = len(self.storage.index)
         reply = QMessageBox.question(
@@ -803,6 +930,7 @@ class SettingsDialog(QDialog):
 
         copied = []
         copied_aux = []
+        failed_cleanup = []
         try:
             for old_path, new_path, entry, key in tasks:
                 shutil.copy2(old_path, new_path)
@@ -821,7 +949,7 @@ class SettingsDialog(QDialog):
                 entry[key] = new_path
             self.storage.settings.set_secret_dir(new_dir)
             self.storage._save_index()
-        except Exception:
+        except Exception as e:
             self.storage.SECRET_DIR = orig_secret_dir
             self.storage.INDEX_PATH = orig_index_path
             self.storage.INDEX_BACKUP_PATH = orig_backup_path
@@ -833,14 +961,19 @@ class SettingsDialog(QDialog):
                 try:
                     if os.path.exists(new_path):
                         os.remove(new_path)
-                except OSError:
-                    pass
+                except OSError as ce:
+                    failed_cleanup.append((new_path, str(ce)))
+                    self.storage.log(f"迁移回滚清理失败: {new_path} ({ce})")
             for dst in copied_aux:
                 try:
                     if os.path.exists(dst):
                         os.remove(dst)
-                except OSError:
-                    pass
+                except OSError as ce:
+                    failed_cleanup.append((dst, str(ce)))
+                    self.storage.log(f"迁移回滚清理失败: {dst} ({ce})")
+            if failed_cleanup:
+                msg = f"{e}\n\n注意：新目录中有 {len(failed_cleanup)} 个文件未能清理，请手动检查：\n{new_dir}"
+                raise RuntimeError(msg) from e
             raise
 
         for old_path, _, _, _ in copied:
@@ -850,7 +983,6 @@ class SettingsDialog(QDialog):
             except OSError:
                 pass
 
-    # ---------- 内部辅助 ----------
     def _refresh_security_page(self):
         page = self.pages.get('security')
         if page and hasattr(page, 'on_config_changed'):

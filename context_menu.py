@@ -15,19 +15,35 @@ MENU_LABEL = "加密该文件（SecureVault）"
 SHELL_KEY = r"Software\Classes\*\shell"
 
 
+def _find_pythonw():
+    """查找 pythonw.exe；找不到返回 None。"""
+    exe_dir = os.path.dirname(sys.executable)
+    candidates = [
+        os.path.join(exe_dir, 'pythonw.exe'),
+        os.path.join(exe_dir, '..', 'pythonw.exe'),
+    ]
+    for c in candidates:
+        c = os.path.abspath(c)
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def _get_executable_command():
     """
     返回注册表里 command 的模板。
     打包后：'exe路径' --encrypt %1
     源码运行：'pythonw.exe' 'main.py' --encrypt %1
+              若 pythonw.exe 不存在则返回 None（拒绝注册）
     """
     if getattr(sys, 'frozen', False):
         exe = sys.executable
         return f'"{exe}" --encrypt %1'
     else:
-        pythonw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
-        if not os.path.exists(pythonw):
-            pythonw = sys.executable
+        # 修复 M6：源码模式下找不到 pythonw.exe 就拒绝注册，避免黑框
+        pythonw = _find_pythonw()
+        if not pythonw:
+            return None
         main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'main.py')
         return f'"{pythonw}" "{main_py}" --encrypt %1'
 
@@ -54,6 +70,11 @@ def register_context_menu():
     """注册右键菜单。返回 (成功?, 消息)"""
     try:
         command = _get_executable_command()
+        if command is None:
+            # 修复 M6：pythonw.exe 不存在，明确告知用户
+            return False, ("未找到 pythonw.exe，无法注册右键菜单。\n"
+                           "建议打包为 exe 后再使用此功能，\n"
+                           "或安装包含 pythonw.exe 的标准 Python。")
         icon = _get_icon_path()
         menu_path = SHELL_KEY + "\\" + MENU_KEY
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, menu_path) as k:

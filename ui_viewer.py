@@ -16,6 +16,7 @@ class FileViewer(QDialog):
     def __init__(self, parent, data, ftype, original_name):
         super().__init__(parent)
         self.parent_window = parent
+        self.original_name = original_name  # 保留 M1：直接用原始文件名
         self.setWindowTitle(f"查看: {original_name}")
         self.setModal(False)
         self.resize(700, 500)
@@ -153,8 +154,9 @@ class FileViewer(QDialog):
                     self.position_label.setText(f"{pos//60000:02d}:{(pos%60000)//1000:02d} / {dur//60000:02d}:{(dur%60000)//1000:02d}")
 
     def export_and_view(self):
+        # M1：用保存的 original_name 而非从 windowTitle 里猜扩展名
         if hasattr(self, 'file_data') and self.file_data:
-            ext = os.path.splitext(self.windowTitle().replace("查看: ", ""))[1] if hasattr(self, 'windowTitle') else '.bin'
+            ext = os.path.splitext(self.original_name)[1] or '.bin'
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                 tmp.write(self.file_data)
                 export_path = tmp.name
@@ -168,11 +170,22 @@ class FileViewer(QDialog):
         if hasattr(self, 'tmp_path') and self.tmp_path and os.path.exists(self.tmp_path):
             try:
                 os.unlink(self.tmp_path)
-            except:
-                pass
+            except OSError as e:
+                print(f"临时文件清理失败: {self.tmp_path} ({e})")
+                self._record_for_later_cleanup(self.tmp_path)
+
+    @staticmethod
+    def _record_for_later_cleanup(path):
+        """把删除失败的临时文件路径记录到 %TEMP%\\SecureVault_pending_cleanup.txt。"""
+        try:
+            marker = os.path.join(tempfile.gettempdir(), 'SecureVault_pending_cleanup.txt')
+            with open(marker, 'a', encoding='utf-8') as f:
+                f.write(path + '\n')
+        except Exception:
+            pass
 
     def closeEvent(self, event):
-        # 修复 #8：先停止播放器并清空 media，释放 Windows 媒体管道对临时文件的句柄，
+        # 修复 R1：先停止播放器并清空 media，释放 Windows 媒体管道对临时文件的句柄，
         # 否则 cleanup_tmp 中的 os.unlink 可能因文件被占用而失败。
         if self.player is not None:
             try:
@@ -180,11 +193,18 @@ class FileViewer(QDialog):
                 self.player.setMedia(QMediaContent())
             except Exception:
                 pass
+        # 停止音频进度定时器（避免访问已销毁的控件）
+        if hasattr(self, 'timer') and self.timer is not None:
+            try:
+                self.timer.stop()
+            except Exception:
+                pass
         self.cleanup_tmp()
         for path in self.exported_tmp_files:
             try:
                 if os.path.exists(path):
                     os.remove(path)
-            except:
-                pass
+            except OSError as e:
+                print(f"导出临时文件清理失败: {path} ({e})")
+                self._record_for_later_cleanup(path)
         event.accept()

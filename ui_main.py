@@ -3,7 +3,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QPushButton, QListWidget, QListWidgetItem, QLabel,
                               QMessageBox, QFileDialog, QDialog, QCheckBox,
                               QDialogButtonBox, QInputDialog, QAbstractItemView,
-                              QTreeWidget, QTreeWidgetItem, QMenu)
+                              QTreeWidget, QTreeWidgetItem, QMenu, QLineEdit)
 from PyQt5.QtCore import Qt, QMimeData
 
 from constants import VERSION
@@ -108,8 +108,6 @@ class MainWindow(QMainWindow):
             self.setStyleSheet(DARK_STYLE)
         else:
             self.setStyleSheet(LIGHT_STYLE)
-        # 修复 #6：tip_label 颜色由 QSS 中的 QLabel#HintLabel 统一控制，
-        # 主题切换时无需再手动设置样式
 
     def apply_screenshot_protection(self):
         protect_window(self, self.screenshot_protection)
@@ -138,17 +136,17 @@ class MainWindow(QMainWindow):
         tag_btn_layout.addWidget(del_tag_btn)
         left_layout.addLayout(tag_btn_layout)
 
-        # 修复 #6：使用 objectName 由主题 QSS 控制颜色，避免硬编码
-        self.tip_label = QLabel("提示：把右侧文件拖到标签上即可归类")
-        self.tip_label.setObjectName("HintLabel")
-        self.tip_label.setWordWrap(True)
-        left_layout.addWidget(self.tip_label)
+        tip_label = QLabel("提示：把右侧文件拖到标签上即可归类")
+        tip_label.setObjectName("HintLabel")
+        tip_label.setWordWrap(True)
+        left_layout.addWidget(tip_label)
 
         left_panel.setLayout(left_layout)
         main_layout.addWidget(left_panel)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout()
+
         top_bar = QHBoxLayout()
         self.upload_btn = QPushButton("上传加密")
         self.import_btn = QPushButton("导入加密文件")
@@ -162,6 +160,14 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.settings_btn); top_bar.addWidget(self.delete_btn)
         top_bar.addWidget(self.log_btn)
         right_layout.addLayout(top_bar)
+
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索文件名...")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self.on_search_changed)
+        search_layout.addWidget(self.search_input)
+        right_layout.addLayout(search_layout)
 
         self.file_list = EntryListWidget()
         self.file_list.setDragEnabled(True)
@@ -189,7 +195,9 @@ class MainWindow(QMainWindow):
         dialog = LogDialog(self, self.storage)
         dialog.show()
 
-    # ---------- 标签（树状） ----------
+    def on_search_changed(self, text):
+        self.load_files()
+
     def load_tags(self):
         self.tag_list.clear()
         root_item = QTreeWidgetItem(self.tag_list, ["全部"])
@@ -266,7 +274,6 @@ class MainWindow(QMainWindow):
             self.load_files()
             self.storage.log(f"删除标签: {tag_path}")
 
-    # ---------- 拖拽上传 ----------
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -313,12 +320,23 @@ class MainWindow(QMainWindow):
     def load_files(self):
         self.file_list.clear()
         entries = self.storage.get_all_entries()
+
         if self.current_tag:
             entries = [
                 e for e in entries
                 if any(t == self.current_tag or t.startswith(self.current_tag + "/")
                        for t in e.get('tags', []))
             ]
+
+        keyword = ''
+        if hasattr(self, 'search_input'):
+            keyword = self.search_input.text().strip().lower()
+        if keyword:
+            entries = [
+                e for e in entries
+                if keyword in (e.get('original_name', '') or '').lower()
+            ]
+
         for entry in entries:
             tags_str = "[" + ", ".join(entry.get('tags', [])) + "] " if entry.get('tags') else ""
             item_text = f"{tags_str}{entry['original_name']}  {'[高级]' if entry['is_advanced'] else ''}"
@@ -331,7 +349,6 @@ class MainWindow(QMainWindow):
         if file_path:
             self._do_upload(file_path)
 
-    # ---------- 文件右键菜单 ----------
     def show_file_context_menu(self, pos):
         item = self.file_list.itemAt(pos)
         if not item:
@@ -396,19 +413,18 @@ class MainWindow(QMainWindow):
             cb_totp = QCheckBox("TOTP"); cb_email = QCheckBox("邮箱")
             cb_question = QCheckBox("问题"); cb_password = QCheckBox("密码")
 
-            configured = set(self.auth.get_configured_methods())
+            # 修复 M1：只允许勾选已启用的方法；未启用的直接禁用
             enabled_set = set(self._get_available_auth_methods())
             for method, checkbox in (
                     ('totp', cb_totp), ('email', cb_email),
                     ('question', cb_question), ('password', cb_password)):
-                if method in configured:
+                if method in enabled_set:
                     checkbox.setEnabled(True)
-                    if method not in enabled_set:
-                        checkbox.setToolTip(
-                            "此方式当前未启用，勾选后需到“设置 → 安全”中启用才会生效")
                 else:
                     checkbox.setEnabled(False)
-                    checkbox.setToolTip("此验证方式尚未配置")
+                    checkbox.setToolTip(
+                        "此验证方式当前未启用，无法为高级文件指定。\n"
+                        "如需使用，请先到「设置 → 安全」中启用后重新导入。")
 
             layout.addWidget(cb_totp); layout.addWidget(cb_email)
             layout.addWidget(cb_question); layout.addWidget(cb_password)
@@ -499,8 +515,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开失败: {e}")
 
-    # ---------- 修复 #3：接受 destroyed(QObject*) 信号的多余参数 ----------
-    def _on_settings_dialog_destroyed(self, *args):
+    # 修复 L3：用绑定方法代替 lambda
+    def _on_settings_destroyed(self, *args):
         self._settings_dialog = None
 
     def open_settings(self):
@@ -514,7 +530,7 @@ class MainWindow(QMainWindow):
                 self._settings_dialog = None
         self._settings_dialog = SettingsDialog(self, self.auth, self.is_recovery_login)
         self._settings_dialog.setAttribute(Qt.WA_DeleteOnClose)
-        self._settings_dialog.destroyed.connect(self._on_settings_dialog_destroyed)
+        self._settings_dialog.destroyed.connect(self._on_settings_destroyed)
         self._settings_dialog.show()
 
     def delete_file(self):

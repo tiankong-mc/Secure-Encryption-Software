@@ -1,5 +1,7 @@
 import os, json, shutil, uuid, zipfile, tempfile, struct, time, hashlib, stat
+import datetime
 from pathlib import PurePosixPath
+from collections import Counter
 from crypto import encrypt_data, decrypt_data, generate_key
 from settings import SettingsManager, DEFAULT_SECRET_DIR
 
@@ -10,7 +12,7 @@ MIN_ENCRYPTED_DATA_SIZE = 12 + 16
 BACKUP_KEY_MAGIC = b'SVBK1'
 BACKUP_MEMBER_ALLOWLIST = ('meta.json', 'index.enc', 'migration.key', 'auth.enc')
 
-# 修复 #4：覆写文件时的分块大小，避免一次性 os.urandom(size) 造成内存爆掉
+# 修复 R2：安全擦除时使用分块写入，避免一次性 os.urandom(size) 造成内存爆掉
 DESTROY_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 
@@ -82,6 +84,10 @@ class StorageManager:
             if any(not isinstance(entry.get(key), str) or not entry[key]
                    for key in required):
                 raise ValueError("索引记录缺少必要字段")
+            # 校验 user_path 类型（L3）
+            up = entry.get('user_path')
+            if up is not None and (not isinstance(up, str) or not up):
+                raise ValueError("索引 user_path 格式无效")
             if not isinstance(entry.get('tags', []), list):
                 raise ValueError("索引标签格式无效")
             if not isinstance(entry.get('second_auth_methods', []), list):
@@ -124,8 +130,12 @@ class StorageManager:
                 f.write(encrypted)
                 f.flush()
                 os.fsync(f.fileno())
+            # M3：备份失败时打日志但不阻断主写入
             if os.path.exists(self.INDEX_PATH):
-                shutil.copy2(self.INDEX_PATH, self.INDEX_BACKUP_PATH)
+                try:
+                    shutil.copy2(self.INDEX_PATH, self.INDEX_BACKUP_PATH)
+                except OSError as e:
+                    self.log(f"索引备份失败（不影响主索引写入）: {e}")
             os.replace(temp_path, self.INDEX_PATH)
         finally:
             if os.path.exists(temp_path):
@@ -192,13 +202,19 @@ class StorageManager:
                 'second_auth_methods': list(second_auth_methods or []),
                 'type': self._get_file_type(ext),
                 'ext': ext,
-                'tags': list(tags or [])
+                'tags': list(tags or []),
+                'created_at': datetime.datetime.now().isoformat(timespec='seconds'),
             }
             self.index.append(entry)
             self._save_index()
         except Exception:
-            if self.index and self.index[-1].get('id') == uid:
-                self.index.pop()
+            # C3：显式按 uid 查找并删除，而非依赖"最后一条"假设
+            try:
+                idx = next(i for i, e in enumerate(self.index)
+                           if isinstance(e, dict) and e.get('id') == uid)
+                del self.index[idx]
+            except StopIteration:
+                pass
             for path in (temp_secret_path, secret_path, user_path, temp_user_path):
                 if path and os.path.exists(path):
                     try:
@@ -292,7 +308,7 @@ class StorageManager:
                 for _, staged in moved:
                     try:
                         if destroy:
-                            # 修复 #4：分块覆写，避免大文件一次性 os.urandom 造成 MemoryError
+                            # 修复 R2：分块覆写，避免大文件一次性 os.urandom 造成 MemoryError
                             size = os.path.getsize(staged)
                             with open(staged, 'r+b') as f:
                                 for _ in range(3):
@@ -346,7 +362,8 @@ class StorageManager:
             'second_auth_methods': second_auth_methods or [],
             'type': ftype,
             'ext': ext,
-            'tags': tags or []
+            'tags': tags or [],
+            'created_at': datetime.datetime.now().isoformat(timespec='seconds'),
         }
         try:
             shutil.copy2(vault_path, temp_path)
@@ -354,8 +371,12 @@ class StorageManager:
             self.index.append(entry)
             self._save_index()
         except Exception:
-            if self.index and self.index[-1].get('id') == uid:
-                self.index.pop()
+            try:
+                idx = next(i for i, e in enumerate(self.index)
+                           if isinstance(e, dict) and e.get('id') == uid)
+                del self.index[idx]
+            except StopIteration:
+                pass
             for path in (temp_path, secret_path):
                 if os.path.exists(path):
                     try:
@@ -428,6 +449,72 @@ class StorageManager:
     def get_entries_by_tag(self, tag):
         return [entry for entry in self.index if tag in entry.get('tags', [])]
 
+    # ---------- 存储统计 ----------
+    def _resolve_entry_path(self, entry):
+        path = entry.get('secret_path')
+        user_path = entry.get('user_path')
+        if path and os.path.exists(path):
+            return path
+        if user_path and os.path.exists(user_path):
+            return user_path
+        return None
+
+    def get_storage_statistics(self):
+        file_count = 0
+        total_size = 0
+        tag_counter = Counter()
+        recent_30d = 0
+        estimated_time = 0
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=30)
+
+        for entry in self.index:
+            file_count += 1
+            path = self._resolve_entry_path(entry)
+            if path:
+                try:
+                    total_size += os.path.getsize(path)
+                except OSError:
+                    pass
+            for tag in entry.get('tags', []):
+                tag_counter[tag] += 1
+
+            dt = None
+            created = entry.get('created_at')
+            if created:
+                try:
+                    dt = datetime.datetime.fromisoformat(created)
+                except (ValueError, TypeError):
+                    dt = None
+            if dt is None and path:
+                try:
+                    dt = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+                    estimated_time += 1
+                except OSError:
+                    dt = None
+            if dt is not None and dt >= cutoff:
+                recent_30d += 1
+
+        directory_size = 0
+        try:
+            for name in os.listdir(self.SECRET_DIR):
+                full = os.path.join(self.SECRET_DIR, name)
+                if os.path.isfile(full):
+                    try:
+                        directory_size += os.path.getsize(full)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        return {
+            'file_count': file_count,
+            'total_size': total_size,
+            'directory_size': directory_size,
+            'tag_distribution': dict(tag_counter.most_common()),
+            'recent_30d': recent_30d,
+            'estimated_time': estimated_time,
+        }
+
     # ---------- 保险库备份 ----------
     def export_vault(self, export_path, password, auth_settings=None):
         if not password:
@@ -463,7 +550,8 @@ class StorageManager:
 
             meta = {
                 'version': '2.3',
-                'timestamp': __import__('datetime').datetime.now().isoformat(),
+                # L1：不再使用 __import__('datetime')
+                'timestamp': datetime.datetime.now().isoformat(),
                 'portable': True,
                 'includes_auth': has_auth,
             }
@@ -625,6 +713,8 @@ class StorageManager:
                     'is_advanced': bool(entry.get('is_advanced', False)),
                     'second_auth_methods': methods,
                     'tags': tags,
+                    'created_at': entry.get('created_at')
+                                  or datetime.datetime.now().isoformat(timespec='seconds'),
                 })
                 imported['ext'] = os.path.splitext(imported['original_name'])[1].lower()
                 imported['type'] = self._get_file_type(imported['ext'])

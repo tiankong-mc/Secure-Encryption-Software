@@ -10,3 +10,4 @@ pycryptodome
 bcrypt
 python-docx
 PyPDF2
+cryptography

@@ -14,9 +14,6 @@ from settings import DEFAULT_SECRET_DIR
 from auth_helpers import verify_email_code
 
 
-# ============================================================
-#  登录对话框
-# ============================================================
 class LoginDialog(QDialog):
     def __init__(self, auth_manager, storage):
         super().__init__()
@@ -72,6 +69,23 @@ class LoginDialog(QDialog):
 
         self._apply_lock_if_needed()
 
+    # ---------- 修复 M7：关闭时清理定时器 ----------
+    def closeEvent(self, event):
+        self._cleanup_lock_timer()
+        super().closeEvent(event)
+
+    def _cleanup_lock_timer(self):
+        if self._lock_timer is not None:
+            try:
+                self._lock_timer.stop()
+            except Exception:
+                pass
+            try:
+                self._lock_timer.deleteLater()
+            except Exception:
+                pass
+            self._lock_timer = None
+
     def _apply_lock_if_needed(self):
         remaining = self.auth.get_login_lock_remaining()
         if remaining > 0:
@@ -85,8 +99,8 @@ class LoginDialog(QDialog):
         self.recovery_btn.setEnabled(False)
         self.lock_label.setVisible(True)
         self._update_lock_label()
-        if self._lock_timer is not None:
-            self._lock_timer.stop()
+        # 修复 M7：先清理旧定时器，再创建新的
+        self._cleanup_lock_timer()
         self._lock_timer = QTimer(self)
         self._lock_timer.timeout.connect(self._on_lock_tick)
         self._lock_timer.start(1000)
@@ -94,9 +108,7 @@ class LoginDialog(QDialog):
     def _on_lock_tick(self):
         self._lock_seconds -= 1
         if self._lock_seconds <= 0:
-            if self._lock_timer is not None:
-                self._lock_timer.stop()
-                self._lock_timer = None
+            self._cleanup_lock_timer()
             self._release_lock()
         else:
             self._update_lock_label()
@@ -220,9 +232,6 @@ class LoginDialog(QDialog):
             QMessageBox.warning(self, "验证失败", f"失败 {fail_count} 次")
 
 
-# ============================================================
-#  首次运行设置向导
-# ============================================================
 class SetupWizard(QWizard):
     def __init__(self, auth_manager, storage_manager=None):
         super().__init__()
@@ -559,14 +568,12 @@ class SetupWizard(QWizard):
 
     def accept(self):
         if not self._imported_auth:
-            # 密码：未勾选时清空旧配置，与 QA / TOTP 保持一致
             if self.pw_enable.isChecked():
                 self.auth.set_password(self.pw_input.text())
             else:
                 self.auth.password_hash = None
                 self.auth.settings_dict.pop('password_hash', None)
 
-            # 安全问题：未勾选时清空
             if self.qa_enable.isChecked():
                 qa_list = [
                     (self.q1.text().strip(), self.a1.text().strip()),
@@ -578,14 +585,12 @@ class SetupWizard(QWizard):
                 self.auth.qa = {}
                 self.auth.settings_dict.pop('qa', None)
 
-            # TOTP：未勾选时清空
             if self.totp_enable.isChecked():
                 self.auth.save_totp_secret(self.totp_secret)
             else:
                 self.auth.settings_dict.pop('totp_secret', None)
                 self.auth.totp_secret = None
 
-            # 邮箱：未勾选时清空
             if self.email_enable.isChecked():
                 self.auth.save_email_config(
                     self.smtp_server.text().strip(),

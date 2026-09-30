@@ -1,5 +1,6 @@
+import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                              QStackedWidget, QMessageBox, QCheckBox)
+                              QStackedWidget, QMessageBox, QCheckBox, QSizePolicy)
 from PyQt5.QtCore import Qt
 from i18n import tr
 from ui_settings_style import (SettingsPage, make_page_title, make_section_title,
@@ -12,6 +13,63 @@ METHOD_LABELS = {
     'totp':     ('security.totp', 'totp'),
     'email':    ('security.email', 'email'),
 }
+
+
+class TipLabel(QLabel):
+    """
+    自适应高度的多行提示 label。
+    在 resizeEvent 里根据实际宽度用 QFontMetrics.boundingRect 精确计算
+    多行文字所需的高度，然后 setMinimumHeight，避免被压扁。
+    """
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.setStyleSheet("color: #888; font-size: 8pt; padding: 4px 10px 8px 10px;")
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.MinimumExpanding)
+        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+    def _recalc_height(self):
+        w = self.width()
+        if w <= 0:
+            return
+        inner_width = max(80, w - 24)
+        fm = self.fontMetrics()
+        rect = fm.boundingRect(
+            0, 0, inner_width, 100000,
+            Qt.TextWordWrap | Qt.TextExpandTabs,
+            self.text())
+        needed = rect.height() + 16
+        self.setMinimumHeight(needed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._recalc_height()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._recalc_height()
+
+    def setText(self, text):
+        super().setText(text)
+        self._recalc_height()
+
+
+def _is_dialog_unlocked(settings_dialog):
+    """
+    修复 C2：统一查询解锁状态。
+    兼容新旧两种 SettingsDialog：
+      - 新版本有 _is_unlocked() 方法（基于时间戳）
+      - 老版本有 _unlocked 布尔属性
+    """
+    fn = getattr(settings_dialog, '_is_unlocked', None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return bool(getattr(settings_dialog, '_unlocked', False))
 
 
 class SecurityPage(SettingsPage):
@@ -47,7 +105,8 @@ class SecurityPage(SettingsPage):
         # ----- 解锁视图 -----
         self.stack.addWidget(self._build_unlocked_view())
 
-        if getattr(settings_dialog, '_unlocked', False):
+        # 修复 C2：用统一的解锁状态查询
+        if _is_dialog_unlocked(settings_dialog):
             self.stack.setCurrentIndex(1)
 
     def _build_unlocked_view(self):
@@ -88,6 +147,7 @@ class SecurityPage(SettingsPage):
         ul.addWidget(make_section_title(tr("security.section_protection")))
         card3, c3 = make_card()
 
+        # 截屏保护
         self.screenshot_cb = QCheckBox()
         self.screenshot_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('screenshot_protection', False))
@@ -97,6 +157,7 @@ class SecurityPage(SettingsPage):
         c3.addWidget(row_screenshot)
         c3.addWidget(make_hline())
 
+        # 日志记录
         self.log_cb = QCheckBox()
         self.log_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('log_enabled', True))
@@ -105,6 +166,7 @@ class SecurityPage(SettingsPage):
         c3.addWidget(row_log)
         c3.addWidget(make_hline())
 
+        # 安全擦除
         self.secure_delete_cb = QCheckBox()
         self.secure_delete_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('secure_delete', False))
@@ -112,10 +174,26 @@ class SecurityPage(SettingsPage):
             self.settings_dialog.toggle_secure_delete)
         row_secure, _ = make_setting_row(tr("security.secure_delete"), self.secure_delete_cb)
         c3.addWidget(row_secure)
-        tip = QLabel(tr("security.secure_delete_tip"))
-        tip.setStyleSheet("color: #888; font-size: 8pt; padding: 4px 10px;")
-        tip.setWordWrap(True)
-        c3.addWidget(tip)
+        self.secure_delete_tip = TipLabel(tr("security.secure_delete_tip"))
+        c3.addWidget(self.secure_delete_tip)
+        c3.addWidget(make_hline())
+
+        # 崩溃报告
+        self.crash_report_cb = QCheckBox()
+        self.crash_report_cb.setChecked(
+            self.settings_dialog.auth.settings_dict.get('crash_report_enabled', False))
+        self.crash_report_cb.stateChanged.connect(
+            self.settings_dialog.toggle_crash_report)
+        row_crash, _ = make_setting_row(tr("security.crash_report"), self.crash_report_cb)
+        c3.addWidget(row_crash)
+        self.crash_report_tip = TipLabel(tr("security.crash_report_tip"))
+        c3.addWidget(self.crash_report_tip)
+
+        crash_view_btn = QPushButton(tr("security.crash_view"))
+        crash_view_btn.setMinimumWidth(160)
+        crash_view_btn.clicked.connect(self.open_crash_folder)
+        row_crash_view, _ = make_setting_row("", crash_view_btn)
+        c3.addWidget(row_crash_view)
 
         ul.addWidget(card3)
 
@@ -137,6 +215,23 @@ class SecurityPage(SettingsPage):
 
         ul.addStretch()
         return unlocked
+
+    def open_crash_folder(self):
+        try:
+            from crash_reporter import get_crash_dir
+            folder = get_crash_dir()
+            if not os.path.isdir(folder):
+                QMessageBox.information(
+                    self, tr("common.info"),
+                    "暂无崩溃报告记录，或目录尚未创建。")
+                return
+            if os.name == 'nt':
+                os.startfile(folder)
+            else:
+                import webbrowser
+                webbrowser.open('file://' + folder)
+        except Exception as e:
+            QMessageBox.warning(self, tr("common.error"), str(e))
 
     def _build_storage_card(self):
         card, c = make_card()
@@ -200,7 +295,6 @@ class SecurityPage(SettingsPage):
         if not ok:
             self.settings_dialog.auth.set_method_enabled(method_name, True)
             self.refresh_rows()
-            # 修复 #4：使用 i18n
             QMessageBox.warning(self, tr("common.warning"),
                                 tr("security.need_at_least_one"))
             return
@@ -224,7 +318,8 @@ class SecurityPage(SettingsPage):
             self.stack.removeWidget(old)
             old.deleteLater()
         self.stack.addWidget(self._build_unlocked_view())
-        if was_unlocked or getattr(self.settings_dialog, '_unlocked', False):
+        # 修复 C2：用统一的解锁状态查询
+        if was_unlocked or _is_dialog_unlocked(self.settings_dialog):
             self.stack.setCurrentIndex(1)
 
     def do_verify(self):

@@ -7,7 +7,8 @@ init_i18n(LANG_DIR)
 
 from ui_styles import DARK_STYLE, LIGHT_STYLE
 from ui_utils import set_window_display_affinity, protect_window
-from ui_web import start_web_server, stop_web_server, is_web_running, flask_app
+from ui_web import (start_web_server, stop_web_server, is_web_running,
+                    is_https_enabled, flask_app)
 from ui_viewer import FileViewer
 from ui_log import LogDialog
 from ui_dialogs import AuthDialog, DeleteAuthDialog, UploadDialog
@@ -20,7 +21,8 @@ __all__ = [
     'init_i18n', 'tr', 'get_manager',
     'DARK_STYLE', 'LIGHT_STYLE',
     'set_window_display_affinity', 'protect_window',
-    'start_web_server', 'stop_web_server', 'is_web_running', 'flask_app',
+    'start_web_server', 'stop_web_server', 'is_web_running',
+    'is_https_enabled', 'flask_app',
     'FileViewer', 'LogDialog',
     'AuthDialog', 'DeleteAuthDialog', 'UploadDialog',
     'SettingsDialog',

@@ -49,7 +49,6 @@ class AuthManager:
         return result
 
     def set_method_enabled(self, name, value):
-        """返回 True 表示成功，False 表示拒绝（不能禁用最后一个）。"""
         enabled = dict(self.settings_dict.get('method_enabled', {}))
         enabled[name] = value
         configured = self.get_configured_methods()
@@ -164,7 +163,7 @@ class AuthManager:
     def save_email_config(self, smtp_server, port, sender_email, password, receiver_email):
         self.set_email_config(smtp_server, port, sender_email, password, receiver_email)
 
-    # ================= 高级文件二次验证失败计数 =================
+    # ================= 二次验证失败计数 =================
     def increment_fail_count(self):
         self.fail_count += 1
         self.settings_dict['fail_count'] = self.fail_count
@@ -179,7 +178,7 @@ class AuthManager:
     # ================= 登录失败锁定 =================
     LOGIN_MAX_ATTEMPTS = 5
     LOGIN_BASE_LOCK = 60
-    # 修复 #2：锁定时长上限，避免翻倍导致用户实际上被永久锁死
+    # 修复 M2：锁定时长上限 1 小时
     LOGIN_MAX_LOCK = 3600
 
     def get_login_lock_remaining(self):
@@ -206,7 +205,7 @@ class AuthManager:
                 last_duration = int(self.settings_dict.get('login_lock_duration',
                                                             self.LOGIN_BASE_LOCK))
                 duration = last_duration * 2
-            # 修复 #2：限制上限
+            # 修复 M2：限制上限
             duration = min(duration, self.LOGIN_MAX_LOCK)
             self.settings_dict['login_lock_duration'] = duration
             self.settings_dict['login_lock_count'] = lock_count + 1
@@ -219,16 +218,19 @@ class AuthManager:
         return count, 0
 
     def reset_login_lock(self):
+        """
+        登录成功后清除当前锁定，但**保留 login_lock_count** 和 login_lock_duration，
+        避免攻击者熬过一次锁定后回到"从 60 秒重新开始"的状态。
+        """
         self.settings_dict.pop('login_fail_count', None)
         self.settings_dict.pop('login_lock_until', None)
-        self.settings_dict.pop('login_lock_duration', None)
-        self.settings_dict.pop('login_lock_count', None)
+        # 保留 login_lock_count 和 login_lock_duration
         self._save()
 
-    # ================= 敏感操作失败锁定（与登录独立） =================
+    # ================= 敏感操作失败锁定 =================
     OP_MAX_ATTEMPTS = 5
     OP_BASE_LOCK = 60
-    # 修复 #2：上限同样限制为 1 小时
+    # 修复 M2：上限 1 小时
     OP_MAX_LOCK = 3600
 
     def get_op_lock_remaining(self):
@@ -267,10 +269,9 @@ class AuthManager:
         return count, 0
 
     def reset_op_lock(self):
+        """同 reset_login_lock：保留 lock_count 和 lock_duration。"""
         self.settings_dict.pop('op_fail_count', None)
         self.settings_dict.pop('op_lock_until', None)
-        self.settings_dict.pop('op_lock_duration', None)
-        self.settings_dict.pop('op_lock_count', None)
         self._save()
 
     # ================= 恢复代码 =================

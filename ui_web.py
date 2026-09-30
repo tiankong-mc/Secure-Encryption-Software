@@ -1,5 +1,5 @@
-import os, secrets, smtplib, threading, time, ipaddress
-from datetime import datetime
+import os, secrets, smtplib, threading, time, ipaddress, socket, tempfile
+from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from io import BytesIO
 from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, send_file
@@ -16,16 +16,165 @@ web_storage = None
 web_auth = None
 _server = None
 _server_thread = None
+_server_is_https = False
+
 EMAIL_CODE_TTL = 300
 EMAIL_CODE_COOLDOWN = 60
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_SECONDS = 60
 MAX_RATE_ENTRIES = 1000
+MAX_EMAIL_CODE_ATTEMPTS = 5
+# M3：服务端验证码字典的软上限，超过后按最旧清理
+MAX_EMAIL_CODES = 10000
+
 _rate_lock = threading.Lock()
 _login_rates = {}
 _email_rates = {}
 
+# ---------- A2：服务端邮箱验证码存储 ----------
+# 结构：{client_ip: {'code': str, 'expiry': ts, 'attempts': int, 'created_at': ts}}
+# 验证码不写入 session cookie，避免明文 HTTP 下 cookie 被嗅探后直接复用。
+# M5（已知局限，有意保留）：second_auth 绑定 client IP，但 NAT 场景下多设备可能共享 remote_addr。
+#   HTTPS 已对 cookie 加上 Secure 属性，大幅提高 cookie 嗅探难度，因此判定为可接受风险。
+_email_codes = {}
+_email_codes_lock = threading.Lock()
 
+_CERT_DIR_CACHE = None
+
+
+# ============================================================
+#  自签名证书（A1）
+# ============================================================
+def _get_cert_dir():
+    global _CERT_DIR_CACHE
+    if _CERT_DIR_CACHE is None:
+        appdata = os.environ.get('APPDATA') or tempfile.gettempdir()
+        _CERT_DIR_CACHE = os.path.join(appdata, 'SecureVault')
+        os.makedirs(_CERT_DIR_CACHE, exist_ok=True)
+    return _CERT_DIR_CACHE
+
+
+def _get_lan_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
+
+
+def _cert_not_after(cert_obj):
+    """
+    修复 M1：兼容 cryptography < 42。
+
+    - cryptography 42+ 提供 not_valid_after_utc（带时区）
+    - 41 及更早版本只有 not_valid_after（naive datetime）
+    统一返回带 UTC 时区的 datetime。
+    """
+    try:
+        not_after = cert_obj.not_valid_after_utc
+    except AttributeError:
+        not_after = cert_obj.not_valid_after
+    if not_after.tzinfo is None:
+        not_after = not_after.replace(tzinfo=timezone.utc)
+    return not_after
+
+
+def _ensure_self_signed_cert():
+    """
+    生成（或复用）自签名证书，返回 (cert_path, key_path)。
+
+    依赖 cryptography。若不可用，会抛 ImportError，调用方应回退到 HTTP。
+    证书有效期 1 年，SAN 含 localhost / 127.0.0.1 / 当前局域网 IP。
+    """
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    cert_dir = _get_cert_dir()
+    cert_path = os.path.join(cert_dir, 'web_cert.pem')
+    key_path = os.path.join(cert_dir, 'web_key.pem')
+
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        # 检查证书是否仍然有效（未过期）
+        try:
+            with open(cert_path, 'rb') as f:
+                cert_obj = x509.load_pem_x509_certificate(f.read())
+            now = datetime.now(timezone.utc)
+            not_after = _cert_not_after(cert_obj)
+            if not_after > now + timedelta(days=7):
+                return cert_path, key_path
+        except Exception:
+            # 证书损坏或解析失败 → 重新生成
+            pass
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SecureVault"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "SecureVault Self-Signed"),
+    ])
+
+    san_entries = [x509.DNSName("localhost")]
+
+    lan_ip = _get_lan_ip()
+    if lan_ip:
+        try:
+            san_entries.append(x509.IPAddress(ipaddress.ip_address(lan_ip)))
+        except ValueError:
+            san_entries.append(x509.DNSName(lan_ip))
+
+    for loopback in ('127.0.0.1', '::1'):
+        try:
+            san_entries.append(x509.IPAddress(ipaddress.ip_address(loopback)))
+        except ValueError:
+            pass
+
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=365))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+
+    with open(key_path, 'wb') as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()))
+    try:
+        os.chmod(key_path, 0o600)
+    except Exception:
+        pass
+
+    with open(cert_path, 'wb') as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+    return cert_path, key_path
+
+
+def _configure_transport_security(https_on):
+    flask_app.config['SESSION_COOKIE_SECURE'] = bool(https_on)
+
+
+def is_https_enabled():
+    return bool(_server_is_https)
+
+
+# ============================================================
+#  限流辅助
+# ============================================================
 def _cleanup_rates_locked(rates, ttl_seconds):
     if len(rates) <= MAX_RATE_ENTRIES:
         return
@@ -70,16 +219,6 @@ def _enabled_methods():
     return web_auth.get_enabled_methods() if web_auth else []
 
 
-def _email_code_matches(value):
-    code = session.get('email_code')
-    expiry = session.get('email_code_expires', 0)
-    session.pop('email_code', None)
-    session.pop('email_code_expires', None)
-    return bool(code and expiry >= time.time()
-                and secrets.compare_digest(value, code))
-
-
-# 修复 #11：更清晰的锁定剩余检查逻辑
 def _login_lock_remaining(client):
     with _rate_lock:
         state = _login_rates.get(client)
@@ -105,6 +244,81 @@ def _record_login_result(client, succeeded):
                 state['failures'] = 0
                 state['lock_until'] = time.time() + LOGIN_LOCK_SECONDS
         _cleanup_rates_locked(_login_rates, LOGIN_LOCK_SECONDS * 2)
+
+
+# ============================================================
+#  A2：服务端邮箱验证码管理
+# ============================================================
+def _store_email_code(client, code):
+    """
+    把验证码存到服务端（不写 session）。
+    M3：超过 MAX_EMAIL_CODES 时按创建时间最旧的清理。
+    """
+    now = time.time()
+    with _email_codes_lock:
+        _email_codes[client] = {
+            'code': code,
+            'expiry': now + EMAIL_CODE_TTL,
+            'attempts': 0,
+            'created_at': now,
+        }
+        # 清理已过期的
+        expired = [k for k, v in _email_codes.items()
+                   if v.get('expiry', 0) < now]
+        for k in expired:
+            _email_codes.pop(k, None)
+        # M3：软上限，按最旧的清理
+        if len(_email_codes) > MAX_EMAIL_CODES:
+            overflow = len(_email_codes) - MAX_EMAIL_CODES
+            oldest = sorted(_email_codes.items(),
+                            key=lambda kv: kv[1].get('created_at', 0))[:overflow]
+            for k, _ in oldest:
+                _email_codes.pop(k, None)
+
+
+def _email_code_matches(client, value):
+    """
+    从服务端校验验证码：
+      - 过期即失效
+      - 超过 MAX_EMAIL_CODE_ATTEMPTS 次失败即作废（防暴力）
+      - 校验成功后立即消费
+    """
+    now = time.time()
+    with _email_codes_lock:
+        entry = _email_codes.get(client)
+        if not entry:
+            return False
+        if entry.get('expiry', 0) < now:
+            _email_codes.pop(client, None)
+            return False
+        entry['attempts'] = entry.get('attempts', 0) + 1
+        if entry['attempts'] > MAX_EMAIL_CODE_ATTEMPTS:
+            _email_codes.pop(client, None)
+            return False
+        if secrets.compare_digest(str(value), str(entry.get('code', ''))):
+            _email_codes.pop(client, None)
+            return True
+    return False
+
+
+def _reserve_email_send(client):
+    """
+    预占位：锁内检查+写入，避免并发请求全部通过冷却检查。
+    返回 0 表示已占用成功；否则返回还需等待的秒数。
+    """
+    now = time.time()
+    with _rate_lock:
+        last_sent = _email_rates.get(client, 0)
+        if now - last_sent < EMAIL_CODE_COOLDOWN:
+            return max(1, int(EMAIL_CODE_COOLDOWN - (now - last_sent)) + 1)
+        _email_rates[client] = now
+        _cleanup_rates_locked(_email_rates, EMAIL_CODE_TTL * 2)
+    return 0
+
+
+def _rollback_email_send(client):
+    with _rate_lock:
+        _email_rates.pop(client, None)
 
 
 @flask_app.template_filter('b64encode')
@@ -145,7 +359,7 @@ def web_login():
         elif method == 'totp':
             ok = web_auth.verify_totp(inp) if web_auth else False
         elif method == 'email':
-            ok = _email_code_matches(inp)
+            ok = _email_code_matches(client, inp)
         if ok:
             web_storage.log("移动端登录成功")
             _record_login_result(client, True)
@@ -213,12 +427,15 @@ def web_second_auth(entry_id):
         elif method == 'totp':
             ok = web_auth.verify_totp(inp) if web_auth else False
         elif method == 'email':
-            ok = _email_code_matches(inp)
+            ok = _email_code_matches(client, inp)
         if ok:
             web_storage.log(f"移动端二次验证成功 (文件ID: {entry_id})")
             _record_login_result(client, True)
             second_auth = dict(session.get('second_auth', {}))
-            second_auth[entry_id] = datetime.now().timestamp() + 3600
+            second_auth[entry_id] = {
+                'expiry': datetime.now(timezone.utc).timestamp() + 3600,
+                'client': client,
+            }
             session['second_auth'] = second_auth
             data = web_storage.get_file_data(entry_id)
             return render_template_string(WEB_VIEW_TEMPLATE, data=data, entry=entry)
@@ -248,9 +465,21 @@ def web_download(entry_id):
 
 
 def check_second_auth(entry_id):
+    """
+    M5（已知局限，有意保留）：本函数把 entry_id 的二次验证结果绑定到 client IP，
+    但 NAT 场景下同一 IP 可能对应多台物理设备。这不是本项目的漏洞——
+    HTTPS 已给 session cookie 加上 Secure 属性，cookie 嗅探难度大幅提高。
+    """
     second_auth = session.get('second_auth', {})
-    expiry = second_auth.get(entry_id, 0)
-    return expiry > datetime.now().timestamp()
+    record = second_auth.get(entry_id, 0)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if isinstance(record, dict):
+        expiry = record.get('expiry', 0)
+        client_in_record = record.get('client')
+        current_client = request.remote_addr or 'unknown'
+        return (expiry > now_ts) and (client_in_record == current_client)
+    else:
+        return record > now_ts
 
 
 @flask_app.route('/send_code', methods=['POST'])
@@ -259,14 +488,17 @@ def send_code():
         return jsonify({'success': False, 'message': '邮箱未配置或未启用'}), 400
     now = time.time()
     client = request.remote_addr or 'unknown'
-    with _rate_lock:
-        last_sent = _email_rates.get(client, 0)
-        if now - last_sent < EMAIL_CODE_COOLDOWN:
-            return jsonify({'success': False, 'message': '发送过于频繁，请稍后再试'}), 429
+
+    wait = _reserve_email_send(client)
+    if wait:
+        return jsonify({'success': False,
+                        'message': f'发送过于频繁，请 {wait} 秒后再试'}), 429
+
     code = ''.join(secrets.choice('0123456789') for _ in range(6))
     config = web_auth.email_config
     to_email = config.get('receiver_email')
     if not to_email:
+        _rollback_email_send(client)
         return jsonify({'success': False, 'message': '未设置收件邮箱'}), 400
     msg = MIMEText(f'您的SecureVault验证码是：{code}')
     msg['Subject'] = 'SecureVault验证码'
@@ -278,39 +510,73 @@ def send_code():
             server.login(config['sender_email'], config['password'])
             server.sendmail(config['sender_email'], [to_email], msg.as_string())
     except Exception as e:
+        _rollback_email_send(client)
         if web_storage:
             web_storage.log(f"移动端邮箱验证码发送失败: {e}")
         return jsonify({'success': False, 'message': '邮件发送失败，请检查桌面端日志'}), 500
     web_storage.log(f"移动端发送邮箱验证码至: {to_email}")
-    session['email_code'] = code
-    session['email_code_expires'] = now + EMAIL_CODE_TTL
-    with _rate_lock:
-        _email_rates[client] = now
-        _cleanup_rates_locked(_email_rates, EMAIL_CODE_TTL * 2)
+
+    _store_email_code(client, code)
+
     return jsonify({'success': True, 'message': '验证码已发送'})
 
 
-def start_web_server(storage, auth):
-    global web_storage, web_auth, _server, _server_thread
+# ============================================================
+#  服务启动/停止
+# ============================================================
+def start_web_server(storage, auth, enable_https=True):
+    global web_storage, web_auth, _server, _server_thread, _server_is_https
     web_storage = storage
     web_auth = auth
     if _server is not None:
         return True
+
+    ssl_context = None
+    https_on = False
+
+    if enable_https:
+        try:
+            cert_path, key_path = _ensure_self_signed_cert()
+            ssl_context = (cert_path, key_path)
+            https_on = True
+        except ImportError as e:
+            print(f"[警告] 未安装 cryptography，无法生成 HTTPS 证书，回退到 HTTP: {e}")
+            print("       请运行：pip install cryptography")
+            ssl_context = None
+        except Exception as e:
+            print(f"[警告] HTTPS 证书生成失败，回退到 HTTP: {e}")
+            ssl_context = None
+
+    _configure_transport_security(https_on)
+
     try:
-        print("\n⚠️ 警告：Web服务使用明文HTTP，仅限可信局域网，公共网络下请勿启用。")
-        _server = make_server('0.0.0.0', WEB_PORT, flask_app)
+        if https_on:
+            print("\n🔒 Web服务已启用 HTTPS（自签名证书）。")
+            print("   浏览器会提示证书不受信任，请手动选择“继续访问”。")
+        else:
+            print("\n⚠️ 警告：Web服务使用明文HTTP，仅限可信局域网。")
+            print("   同一网络下的其他人可能嗅探到会话数据，公共网络下请勿启用。")
+
+        bind_host = '0.0.0.0'
+        if ssl_context:
+            _server = make_server(bind_host, WEB_PORT, flask_app, ssl_context=ssl_context)
+        else:
+            _server = make_server(bind_host, WEB_PORT, flask_app)
+
+        _server_is_https = https_on
         _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
         _server_thread.start()
         return True
     except Exception as e:
         _server = None
         _server_thread = None
+        _server_is_https = False
         print(f"Web server error: {e}")
         return False
 
 
 def stop_web_server():
-    global _server, _server_thread
+    global _server, _server_thread, _server_is_https
     if _server is not None:
         try:
             _server.shutdown()
@@ -318,6 +584,7 @@ def stop_web_server():
             pass
         _server = None
         _server_thread = None
+        _server_is_https = False
 
 
 def is_web_running():

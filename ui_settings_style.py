@@ -1,7 +1,7 @@
 """设置界面统一样式和辅助控件。"""
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                              QFrame, QSizePolicy, QStackedWidget)
+                              QFrame, QSizePolicy, QPushButton)
 from PyQt5.QtCore import Qt
 
 
@@ -200,11 +200,6 @@ def make_hline():
 
 
 def make_setting_row(label_text, control_widget=None):
-    """
-    一行设置：左边文字，右边控件。
-    返回 (row_widget, row_layout)。
-    如果 control_widget 为 None，可以自己往 row_layout 里添加。
-    """
     row = QWidget()
     row_layout = QHBoxLayout(row)
     row_layout.setContentsMargins(10, 8, 10, 8)
@@ -221,11 +216,8 @@ def make_setting_row(label_text, control_widget=None):
 
 
 def make_action_button(text):
+    # 修复 M3：QPushButton 已在文件顶部导入
     btn = QPushButton(text)
     btn.setObjectName("ActionBtn")
     btn.setCursor(Qt.PointingHandCursor)
     return btn
-
-
-# 需要从 PyQt5.QtWidgets 导入 QPushButton
-from PyQt5.QtWidgets import QPushButton
