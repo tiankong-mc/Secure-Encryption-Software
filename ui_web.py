@@ -263,9 +263,23 @@ def restrict_to_local_network():
     except ValueError:
         return "请求主机无效", 403
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        # 修复主要 BUG：加回 Origin 校验，但放宽匹配规则。
+        # 部分手机浏览器会将 Origin 置为 null、省略端口号或格式存在差异，
+        # 直接校验 Origin 会导致移动端请求被拦截报错。
+        # 但同时也不能完全不校验，否则恶意网站可以通过伪造 Origin 发起 CSRF 攻击。
+        # 因此采用方案 B：如果 Origin 存在且不为 null，则提取其 hostname 和当前主机对比。
+        # 这样可以兼容 Origin 为 null、格式略有差异的移动端场景，同时拦截恶意跨域来源。
         origin = request.headers.get('Origin')
-        if origin and origin.rstrip('/') != request.host_url.rstrip('/'):
-            return "请求来源无效", 403
+        if origin and origin != 'null':
+            expected_host = urlsplit(request.host_url).hostname
+            try:
+                origin_host = urlsplit(origin).hostname
+            except Exception:
+                return "请求来源无效", 403
+            if origin_host and origin_host != expected_host:
+                return "请求来源无效", 403
+
+        # CSRF Token 校验：这是更强的防线，所有 POST 请求必须携带正确 token。
         expected = session.get('csrf_token')
         supplied = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token', '')
         if not expected or not supplied.isascii() or not secrets.compare_digest(expected, supplied):

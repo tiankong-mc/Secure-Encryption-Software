@@ -620,7 +620,8 @@ class SettingsDialog(QDialog):
                 return
 
             try:
-                sig_ok = updater.verified_update_sha256(path, sig_bytes)
+                # 修复 M2：将 sig_ok 改名为 verified_digest，它实际是 hex 摘要字符串而不是 bool
+                verified_digest = updater.verified_update_sha256(path, sig_bytes)
             except Exception as e:
                 QMessageBox.critical(
                     self, tr("common.error"),
@@ -630,7 +631,7 @@ class SettingsDialog(QDialog):
                 self._cleanup_download_worker()
                 return
 
-            if not sig_ok:
+            if not verified_digest:
                 QMessageBox.critical(
                     self, tr("common.error"),
                     "Ed25519 签名校验失败。\n\n"
@@ -647,7 +648,7 @@ class SettingsDialog(QDialog):
 
         # Pin the digest produced during signature verification; do not reopen
         # the file and accidentally trust bytes swapped in after verification.
-        expected_sha = sig_ok
+        expected_sha = verified_digest
 
         # ---------- 3. 提示完成 ----------
         QMessageBox.information(

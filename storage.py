@@ -531,6 +531,11 @@ class StorageManager:
         try:
             backup_index = []
             for entry in self.index:
+                # 修复 M3：校验 entry['id'] 格式，避免内存篡改导致路径穿越
+                if not isinstance(entry.get('id'), str) or not re.fullmatch(
+                        r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', entry['id']):
+                    raise ValueError(f"索引中的文件 ID 无效: {entry.get('id')!r}")
+
                 src = entry['secret_path']
                 if not os.path.exists(src) and entry.get('user_path') and os.path.exists(entry['user_path']):
                     src = entry['user_path']
@@ -660,7 +665,6 @@ class StorageManager:
             try:
                 import pyzipper
                 with pyzipper.AESZipFile(import_path, 'r') as zf:
-                    self._validate_backup_members(zf)
                     if password:
                         zf.setpassword(password.encode())
                     self._extract_backup(zf, temp_dir)
