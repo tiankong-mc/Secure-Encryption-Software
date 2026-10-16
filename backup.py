@@ -15,7 +15,12 @@ class BackupManager:
     def send_vault_file(cls, file_path, to_email, smtp_config, display_name=None):
         if display_name is None:
             display_name = os.path.basename(file_path)
-        display_name = os.path.basename(display_name).replace('\r', '_').replace('\n', '_')
+        # 修复 L3：清理所有控制字符，不只是 \r 和 \n
+        display_name = os.path.basename(display_name)
+        display_name = ''.join(
+            c if ord(c) >= 32 and ord(c) != 127 else '_'
+            for c in display_name
+        )
 
         # 修复 #2：在同一 open() 上下文中完成大小检查与读取，
         # 避免 getsize() 与 read() 之间文件被替换或追加的 TOCTOU 窗口。
@@ -35,7 +40,9 @@ class BackupManager:
         part = MIMEBase('application', 'octet-stream')
         part.set_payload(payload)
         encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f'attachment; filename={display_name}')
+        # 修复 BUG：使用标准 add_header 方法，让 email 库自动处理编码，
+        # 避免手动拼接字符串导致非 ASCII 文件名被邮件网关重命名为 ATT00001.bi
+        part.add_header('Content-Disposition', 'attachment', filename=display_name)
         msg.attach(part)
         with secure_smtp(smtp_config['smtp_server'], smtp_config['port'], timeout=20) as server:
             server.login(smtp_config['sender_email'], smtp_config['password'])

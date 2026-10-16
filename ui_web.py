@@ -32,7 +32,6 @@ LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_SECONDS = 60
 MAX_RATE_ENTRIES = 1000
 MAX_EMAIL_CODE_ATTEMPTS = 5
-# M3：服务端验证码字典的软上限，超过后按最旧清理
 MAX_EMAIL_CODES = 1000
 SESSION_TTL = 1800
 SECOND_AUTH_TTL = 300
@@ -43,17 +42,12 @@ _rate_lock = threading.Lock()
 _login_rates = {}
 _email_rates = {}
 
-# ---------- A2：服务端邮箱验证码存储 ----------
-# Codes are bound to an unpredictable browser session ID and operation.
 _email_codes = {}
 _email_codes_lock = threading.Lock()
 
 _CERT_DIR_CACHE = None
 
 
-# ============================================================
-#  自签名证书（A1）
-# ============================================================
 def _get_cert_dir():
     global _CERT_DIR_CACHE
     if _CERT_DIR_CACHE is None:
@@ -76,13 +70,6 @@ def _get_lan_ip():
 
 
 def _cert_not_after(cert_obj):
-    """
-    修复 M1：兼容 cryptography < 42。
-
-    - cryptography 42+ 提供 not_valid_after_utc（带时区）
-    - 41 及更早版本只有 not_valid_after（naive datetime）
-    统一返回带 UTC 时区的 datetime。
-    """
     try:
         not_after = cert_obj.not_valid_after_utc
     except AttributeError:
@@ -93,12 +80,6 @@ def _cert_not_after(cert_obj):
 
 
 def _ensure_self_signed_cert():
-    """
-    生成（或复用）自签名证书，返回 (cert_path, key_path)。
-
-    依赖 cryptography。若不可用，调用方必须停止启动。
-    证书有效期 1 年，SAN 含 localhost / 127.0.0.1 / 当前局域网 IP。
-    """
     from cryptography import x509
     from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
@@ -109,7 +90,6 @@ def _ensure_self_signed_cert():
     key_path = os.path.join(cert_dir, 'web_key.pem')
 
     if os.path.exists(cert_path) and os.path.exists(key_path):
-        # 检查证书是否仍然有效（未过期）
         try:
             with open(cert_path, 'rb') as f:
                 cert_obj = x509.load_pem_x509_certificate(f.read())
@@ -118,7 +98,6 @@ def _ensure_self_signed_cert():
             if not_after > now + timedelta(days=7):
                 return cert_path, key_path
         except Exception:
-            # 证书损坏或解析失败 → 重新生成
             pass
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -181,9 +160,6 @@ def is_https_enabled():
     return bool(_server_is_https)
 
 
-# ============================================================
-#  限流辅助
-# ============================================================
 def _cleanup_rates_locked(rates, ttl_seconds):
     if len(rates) <= MAX_RATE_ENTRIES:
         return
@@ -252,8 +228,6 @@ def restrict_to_local_network():
         return "拒绝访问", 403
     if not (address.is_private or address.is_loopback or address.is_link_local):
         return "仅允许局域网访问", 403
-    # Host must be a local IP literal or localhost, never an arbitrary DNS name.
-    # This prevents a hostile website from rebinding its domain to this service.
     try:
         hostname = urlsplit(request.host_url).hostname
         host_address = ipaddress.ip_address(hostname) if hostname != 'localhost' else None
@@ -263,12 +237,7 @@ def restrict_to_local_network():
     except ValueError:
         return "请求主机无效", 403
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
-        # 修复主要 BUG：加回 Origin 校验，但放宽匹配规则。
-        # 部分手机浏览器会将 Origin 置为 null、省略端口号或格式存在差异，
-        # 直接校验 Origin 会导致移动端请求被拦截报错。
-        # 但同时也不能完全不校验，否则恶意网站可以通过伪造 Origin 发起 CSRF 攻击。
-        # 因此采用方案 B：如果 Origin 存在且不为 null，则提取其 hostname 和当前主机对比。
-        # 这样可以兼容 Origin 为 null、格式略有差异的移动端场景，同时拦截恶意跨域来源。
+        # 修复主要 BUG：加回 Origin 校验，但放宽匹配规则（兼容 Origin: null 等移动端场景）。
         origin = request.headers.get('Origin')
         if origin and origin != 'null':
             expected_host = urlsplit(request.host_url).hostname
@@ -279,7 +248,6 @@ def restrict_to_local_network():
             if origin_host and origin_host != expected_host:
                 return "请求来源无效", 403
 
-        # CSRF Token 校验：这是更强的防线，所有 POST 请求必须携带正确 token。
         expected = session.get('csrf_token')
         supplied = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token', '')
         if not expected or not supplied.isascii() or not secrets.compare_digest(expected, supplied):
@@ -343,14 +311,7 @@ def _record_login_result(client, succeeded, operation=False):
         _cleanup_rates_locked(rates, LOGIN_LOCK_SECONDS * 2)
 
 
-# ============================================================
-#  A2：服务端邮箱验证码管理
-# ============================================================
 def _store_email_code(client, code):
-    """
-    把验证码存到服务端（不写 session）。
-    M3：超过 MAX_EMAIL_CODES 时按创建时间最旧的清理。
-    """
     now = time.time()
     with _email_codes_lock:
         _email_codes[client] = {
@@ -359,12 +320,10 @@ def _store_email_code(client, code):
             'attempts': 0,
             'created_at': now,
         }
-        # 清理已过期的
         expired = [k for k, v in _email_codes.items()
                    if v.get('expiry', 0) < now]
         for k in expired:
             _email_codes.pop(k, None)
-        # M3：软上限，按最旧的清理
         if len(_email_codes) > MAX_EMAIL_CODES:
             overflow = len(_email_codes) - MAX_EMAIL_CODES
             oldest = sorted(_email_codes.items(),
@@ -374,12 +333,6 @@ def _store_email_code(client, code):
 
 
 def _email_code_matches(client, value):
-    """
-    从服务端校验验证码：
-      - 过期即失效
-      - 超过 MAX_EMAIL_CODE_ATTEMPTS 次失败即作废（防暴力）
-      - 校验成功后立即消费
-    """
     now = time.time()
     with _email_codes_lock:
         entry = _email_codes.get(client)
@@ -400,10 +353,6 @@ def _email_code_matches(client, value):
 
 
 def _reserve_email_send(client):
-    """
-    预占位：锁内检查+写入，避免并发请求全部通过冷却检查。
-    返回 0 表示已占用成功；否则返回还需等待的秒数。
-    """
     global _email_global_last_sent
     now = time.time()
     with _rate_lock:
@@ -570,7 +519,6 @@ def web_download(entry_id):
 
 
 def check_second_auth(entry_id):
-    """Only a current authenticated session can hold a recent per-file grant."""
     if not _is_authenticated():
         return False
     second_auth = session.get('second_auth', {})
@@ -636,9 +584,6 @@ def send_code():
     return jsonify({'success': True, 'message': '验证码已发送'})
 
 
-# ============================================================
-#  服务启动/停止
-# ============================================================
 def start_web_server(storage, auth, enable_https=True):
     global web_storage, web_auth, _server, _server_thread, _server_is_https
     web_storage = storage
@@ -764,6 +709,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 </form>
 </body></html>"""
 
+# 修复 M3：将内部方法名映射为用户可读的中文名称
 WEB_SECOND_AUTH_TEMPLATE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>二次验证 - SecureVault</title>
 <style>body{background:#1e1e1e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}form{background:#2b2b2b;padding:30px;border-radius:10px;width:300px}input,select,button{width:100%;padding:8px;margin:5px 0;background:#3c3c3c;border:1px solid #555;color:#eee;border-radius:3px}button{background:#5a8cbf;cursor:pointer}.error{color:#ff6b6b}</style>
@@ -796,7 +742,7 @@ window.onload = function() { toggleQuestion(); document.getElementById('method')
 <h2>二次验证 - {{ entry.original_name }}</h2>
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 <select id="method" name="method">
-{% for m in methods %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+{% for m in methods %}<option value="{{ m }}">{{ {'password':'密码','question':'安全问题','totp':'TOTP','email':'邮箱验证码'}.get(m, m) }}</option>{% endfor %}
 </select>
 <div id="question_div" style="display:none;">
 <select name="question">

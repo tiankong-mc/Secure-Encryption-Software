@@ -13,6 +13,7 @@ from ui_viewer import FileViewer
 from ui_log import LogDialog
 from ui_dialogs import AuthDialog, DeleteAuthDialog, UploadDialog
 from ui_settings import SettingsDialog
+from update_manager import UpdateManager
 
 
 MIME_TYPE = 'application/x-securevault-entry'
@@ -93,6 +94,10 @@ class MainWindow(QMainWindow):
         self.current_tag = None
         self.screenshot_protection = self.auth.settings_dict.get('screenshot_protection', False)
         self._settings_dialog = None
+
+        # 全局更新管理器（独立于设置窗口的生命周期）
+        self.update_manager = UpdateManager(self)
+
         self.setWindowTitle(f"SecureVault {VERSION}")
         self.setGeometry(100, 100, 900, 600)
         self.initUI()
@@ -413,7 +418,6 @@ class MainWindow(QMainWindow):
             cb_totp = QCheckBox("TOTP"); cb_email = QCheckBox("邮箱")
             cb_question = QCheckBox("问题"); cb_password = QCheckBox("密码")
 
-            # 修复 M1：只允许勾选已启用的方法；未启用的直接禁用
             enabled_set = set(self._get_available_auth_methods())
             for method, checkbox in (
                     ('totp', cb_totp), ('email', cb_email),
@@ -431,13 +435,17 @@ class MainWindow(QMainWindow):
             btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
             btn_box.accepted.connect(dialog.accept); btn_box.rejected.connect(dialog.reject)
             layout.addWidget(btn_box); dialog.setLayout(layout)
-            if dialog.exec_() == QDialog.Accepted:
-                if cb_totp.isChecked(): second_methods.append('totp')
-                if cb_email.isChecked(): second_methods.append('email')
-                if cb_question.isChecked(): second_methods.append('question')
-                if cb_password.isChecked(): second_methods.append('password')
-                if not second_methods:
-                    QMessageBox.warning(self, "提示", "至少选一种"); return
+
+            if dialog.exec_() != QDialog.Accepted:
+                return
+
+            if cb_totp.isChecked(): second_methods.append('totp')
+            if cb_email.isChecked(): second_methods.append('email')
+            if cb_question.isChecked(): second_methods.append('question')
+            if cb_password.isChecked(): second_methods.append('password')
+            if not second_methods:
+                QMessageBox.warning(self, "提示", "至少选一种")
+                return
         try:
             uid = self.storage.import_vault_file(file_path, is_advanced=is_advanced,
                                                   second_auth_methods=second_methods)
@@ -515,7 +523,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开失败: {e}")
 
-    # 修复 L3：用绑定方法代替 lambda
     def _on_settings_destroyed(self, *args):
         self._settings_dialog = None
 

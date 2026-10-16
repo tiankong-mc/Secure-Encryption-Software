@@ -1,6 +1,6 @@
 import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                              QStackedWidget, QMessageBox, QCheckBox, QSizePolicy)
+                              QMessageBox, QCheckBox, QSizePolicy)
 from PyQt5.QtCore import Qt
 from i18n import tr
 from ui_settings_style import (SettingsPage, make_page_title, make_section_title,
@@ -18,10 +18,7 @@ METHOD_LABELS = {
 class TipLabel(QLabel):
     """
     自适应高度的多行提示 label。
-    在 resizeEvent 里根据实际宽度用 QFontMetrics.boundingRect 精确计算
-    多行文字所需的高度，然后 setMinimumHeight，避免被压扁。
     """
-
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
         self.setWordWrap(True)
@@ -56,58 +53,12 @@ class TipLabel(QLabel):
         self._recalc_height()
 
 
-def _is_dialog_unlocked(settings_dialog):
-    """
-    修复 C2：统一查询解锁状态。
-    兼容新旧两种 SettingsDialog：
-      - 新版本有 _is_unlocked() 方法（基于时间戳）
-      - 老版本有 _unlocked 布尔属性
-    """
-    fn = getattr(settings_dialog, '_is_unlocked', None)
-    if callable(fn):
-        try:
-            return bool(fn())
-        except Exception:
-            return False
-    return bool(getattr(settings_dialog, '_unlocked', False))
-
-
 class SecurityPage(SettingsPage):
     def __init__(self, settings_dialog):
         super().__init__()
         self.settings_dialog = settings_dialog
         self.method_rows = {}
-
-        self.stack = QStackedWidget()
-        self.layout().addWidget(self.stack)
-
-        # ----- 锁定视图 -----
-        locked = QWidget()
-        ll = QVBoxLayout(locked)
-        ll.addStretch()
-        self.locked_hint = QLabel(tr("security.locked_hint"))
-        self.locked_hint.setAlignment(Qt.AlignCenter)
-        self.locked_hint.setStyleSheet("font-size: 14pt; color: #888;")
-        ll.addWidget(self.locked_hint)
-        ll.addSpacing(20)
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self.verify_btn = QPushButton(tr("security.verify_button"))
-        self.verify_btn.setFixedWidth(180)
-        self.verify_btn.setMinimumHeight(38)
-        self.verify_btn.clicked.connect(self.do_verify)
-        btn_row.addWidget(self.verify_btn)
-        btn_row.addStretch()
-        ll.addLayout(btn_row)
-        ll.addStretch()
-        self.stack.addWidget(locked)
-
-        # ----- 解锁视图 -----
-        self.stack.addWidget(self._build_unlocked_view())
-
-        # 修复 C2：用统一的解锁状态查询
-        if _is_dialog_unlocked(settings_dialog):
-            self.stack.setCurrentIndex(1)
+        self.layout().addWidget(self._build_unlocked_view())
 
     def _build_unlocked_view(self):
         unlocked = QWidget()
@@ -147,7 +98,6 @@ class SecurityPage(SettingsPage):
         ul.addWidget(make_section_title(tr("security.section_protection")))
         card3, c3 = make_card()
 
-        # 截屏保护
         self.screenshot_cb = QCheckBox()
         self.screenshot_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('screenshot_protection', False))
@@ -157,7 +107,6 @@ class SecurityPage(SettingsPage):
         c3.addWidget(row_screenshot)
         c3.addWidget(make_hline())
 
-        # 日志记录
         self.log_cb = QCheckBox()
         self.log_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('log_enabled', True))
@@ -166,7 +115,6 @@ class SecurityPage(SettingsPage):
         c3.addWidget(row_log)
         c3.addWidget(make_hline())
 
-        # 安全擦除
         self.secure_delete_cb = QCheckBox()
         self.secure_delete_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('secure_delete', False))
@@ -178,7 +126,6 @@ class SecurityPage(SettingsPage):
         c3.addWidget(self.secure_delete_tip)
         c3.addWidget(make_hline())
 
-        # 崩溃报告
         self.crash_report_cb = QCheckBox()
         self.crash_report_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('crash_report_enabled', False))
@@ -312,21 +259,12 @@ class SecurityPage(SettingsPage):
                 child.blockSignals(False)
 
     def on_config_changed(self):
-        was_unlocked = (self.stack.currentIndex() == 1)
-        if self.stack.count() >= 2:
-            old = self.stack.widget(1)
-            self.stack.removeWidget(old)
-            old.deleteLater()
-        self.stack.addWidget(self._build_unlocked_view())
-        # 修复 C2：用统一的解锁状态查询
-        if was_unlocked or _is_dialog_unlocked(self.settings_dialog):
-            self.stack.setCurrentIndex(1)
-
-    def do_verify(self):
-        if self.settings_dialog._verify_identity():
-            self.stack.setCurrentIndex(1)
+        # 重建布局
+        while self.layout().count():
+            item = self.layout().takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.layout().addWidget(self._build_unlocked_view())
 
     def retranslate(self):
-        self.locked_hint.setText(tr("security.locked_hint"))
-        self.verify_btn.setText(tr("security.verify_button"))
         self.on_config_changed()

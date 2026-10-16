@@ -69,10 +69,29 @@ class StorageManager:
 
     # ---------- 索引管理 ----------
     def _ensure_tags_list(self):
+        """
+        修复 H1：补全可能缺失的字段，防止旧版本索引或异常备份包导致 KeyError。
+        """
         modified = False
         for entry in self.index:
             if 'tags' not in entry:
                 entry['tags'] = []
+                modified = True
+            if 'is_advanced' not in entry:
+                entry['is_advanced'] = False
+                modified = True
+            if 'type' not in entry:
+                ext = (entry.get('ext') or '').lower()
+                entry['type'] = self._get_file_type(ext)
+                modified = True
+            if 'ext' not in entry:
+                entry['ext'] = os.path.splitext(entry.get('original_name', ''))[1].lower()
+                modified = True
+            if 'second_auth_methods' not in entry:
+                entry['second_auth_methods'] = []
+                modified = True
+            if 'created_at' not in entry:
+                entry['created_at'] = datetime.datetime.now().isoformat(timespec='seconds')
                 modified = True
         if modified:
             self._save_index()
@@ -93,10 +112,6 @@ class StorageManager:
             up = entry.get('user_path')
             if up is not None and (not isinstance(up, str) or not up):
                 raise ValueError("索引 user_path 格式无效")
-            if not isinstance(entry.get('tags', []), list):
-                raise ValueError("索引标签格式无效")
-            if not isinstance(entry.get('second_auth_methods', []), list):
-                raise ValueError("索引验证方式格式无效")
             if entry['id'] in seen_ids:
                 raise ValueError("索引包含重复文件 ID")
             seen_ids.add(entry['id'])
@@ -292,44 +307,54 @@ class StorageManager:
         return None
 
     def remove_entry(self, entry_id, destroy=False):
-        for i, entry in enumerate(self.index):
+        # 修复 L5：先构建新索引列表，保存成功后再替换引用，避免多线程/多开场景下顺序回退。
+        new_index = []
+        target_entry = None
+        for entry in self.index:
             if entry['id'] == entry_id:
-                moved = []
-                try:
-                    for p in dict.fromkeys((entry['secret_path'], entry.get('user_path'))):
-                        if p and os.path.exists(p):
-                            staged = p + f'.delete-{uuid.uuid4().hex}'
-                            os.replace(p, staged)
-                            moved.append((p, staged))
-                    del self.index[i]
-                    self._save_index()
-                except Exception:
-                    if entry not in self.index:
-                        self.index.insert(i, entry)
-                    for original, staged in reversed(moved):
-                        if os.path.exists(staged):
-                            os.replace(staged, original)
-                    raise
-                for _, staged in moved:
-                    try:
-                        if destroy:
-                            # 修复 R2：分块覆写，避免大文件一次性 os.urandom 造成 MemoryError
-                            size = os.path.getsize(staged)
-                            with open(staged, 'r+b') as f:
-                                for _ in range(3):
-                                    f.seek(0)
-                                    remaining = size
-                                    while remaining > 0:
-                                        n = min(DESTROY_CHUNK_SIZE, remaining)
-                                        f.write(os.urandom(n))
-                                        remaining -= n
-                                    f.flush()
-                                    os.fsync(f.fileno())
-                        os.remove(staged)
-                    except OSError as e:
-                        self.log(f"删除暂存文件失败: {staged} ({e})")
-                return True
-        return False
+                target_entry = entry
+            else:
+                new_index.append(entry)
+
+        if target_entry is None:
+            return False
+
+        moved = []
+        try:
+            for p in dict.fromkeys((target_entry['secret_path'], target_entry.get('user_path'))):
+                if p and os.path.exists(p):
+                    staged = p + f'.delete-{uuid.uuid4().hex}'
+                    os.replace(p, staged)
+                    moved.append((p, staged))
+
+            self.index = new_index
+            self._save_index()
+        except Exception:
+            self.index = [target_entry] + self.index  # 回滚
+            for original, staged in reversed(moved):
+                if os.path.exists(staged):
+                    os.replace(staged, original)
+            raise
+
+        for _, staged in moved:
+            try:
+                if destroy:
+                    # 修复 R2：分块覆写，避免大文件一次性 os.urandom 造成 MemoryError
+                    size = os.path.getsize(staged)
+                    with open(staged, 'r+b') as f:
+                        for _ in range(3):
+                            f.seek(0)
+                            remaining = size
+                            while remaining > 0:
+                                n = min(DESTROY_CHUNK_SIZE, remaining)
+                                f.write(os.urandom(n))
+                                remaining -= n
+                            f.flush()
+                            os.fsync(f.fileno())
+                os.remove(staged)
+            except OSError as e:
+                self.log(f"删除暂存文件失败: {staged} ({e})")
+        return True
 
     def import_vault_file(self, vault_path, original_name=None, is_advanced=False, second_auth_methods=None, tags=None):
         if not os.path.exists(vault_path):
@@ -666,9 +691,18 @@ class StorageManager:
                 import pyzipper
                 with pyzipper.AESZipFile(import_path, 'r') as zf:
                     if password:
-                        zf.setpassword(password.encode())
+                        zf.setpassword(password.encode('utf-8'))
                     self._extract_backup(zf, temp_dir)
             except (RuntimeError, ValueError, zipfile.BadZipFile) as e:
+                err_msg = str(e)
+                if "Bad password" in err_msg:
+                    raise ValueError(
+                        "无法打开备份包：密码错误，或备份文件已损坏。\n\n"
+                        "请确认：\n"
+                        "1. 密码是否正确（区分大小写）。\n"
+                        "2. 如果密码确认无误，可能是当前 Python 版本（如 3.14）与 pyzipper 库不兼容。\n"
+                        "   请尝试安装 Python 3.12 或 3.11 后重新导入。"
+                    ) from e
                 raise ValueError(f"无法打开备份包，请检查文件和密码: {e}") from e
             meta_path = os.path.join(temp_dir, 'meta.json')
             if not os.path.exists(meta_path):

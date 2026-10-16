@@ -70,7 +70,8 @@ class WebPage(SettingsPage):
 
         self.qr_label = QLabel()
         self.qr_label.setAlignment(Qt.AlignCenter)
-        self.qr_label.setMinimumSize(260, 260)
+        # 去掉之前强制的 260x260 最小尺寸，改为较小的限制，允许随窗口缩小
+        self.qr_label.setMinimumSize(100, 100)
         qc.addWidget(self.qr_label, 0, Qt.AlignHCenter)
 
         self.url_label = QLabel("")
@@ -90,6 +91,8 @@ class WebPage(SettingsPage):
 
         self.layout().addWidget(self.qr_card)
         self.layout().addStretch()
+
+        self._qr_pixmap = None  # 保存原始大小的二维码 Pixmap
 
         self.refresh_state()
 
@@ -119,6 +122,23 @@ class WebPage(SettingsPage):
         pixmap = QPixmap()
         pixmap.loadFromData(buf.getvalue())
         return pixmap
+
+    def _update_qr_display(self):
+        """根据当前控件大小缩放二维码图片。"""
+        if self._qr_pixmap is None:
+            return
+        # 获取当前标签的可用大小
+        w = self.qr_label.width()
+        h = self.qr_label.height()
+        if w < 50 or h < 50:
+            return  # 太小了，不绘制，等 resizeEvent 再处理
+        scaled = self._qr_pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.qr_label.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        """窗口大小变化时，自动缩放二维码。"""
+        super().resizeEvent(event)
+        self._update_qr_display()
 
     def on_https_toggled(self, state):
         """保存 HTTPS 首选项。运行时不允许切换。"""
@@ -169,8 +189,9 @@ class WebPage(SettingsPage):
             ip, is_loopback = self._get_ip() if https_on else ('127.0.0.1', True)
             scheme = 'https' if https_on else 'http'
             url = f"{scheme}://{ip}:{WEB_PORT}"
-            pixmap = self._make_qr_pixmap(url)
-            self.qr_label.setPixmap(pixmap)
+            self._qr_pixmap = self._make_qr_pixmap(url)
+            self._update_qr_display()
+
             self.url_label.setText(url)
 
             if is_loopback:
@@ -193,6 +214,7 @@ class WebPage(SettingsPage):
             self.status_label.setStyleSheet("color: #888; font-size: 11pt;")
             self.toggle_btn.setText(tr("web.start"))
             self.https_cb.setEnabled(True)
+            self._qr_pixmap = None
             self.qr_label.clear()
             self.qr_label.setText(tr("web.status_stopped"))
             self.qr_label.setStyleSheet("color: #666; font-size: 12pt;")

@@ -69,9 +69,10 @@ def sanitize_text(text):
     if not isinstance(text, str):
         text = str(text)
 
-    # 1. 先替换环境变量里的具体字符串（长度 >= 3 避免误伤）
+    # 1. 先替换环境变量里的具体字符串（长度 >= 5 避免误伤短词）
+    # 修复 L4：将阈值从 3 提高到 5，避免常见短用户名导致堆栈可读性急剧下降。
     for s in _collect_sensitive_strings():
-        if len(s) >= 3:
+        if len(s) >= 5:
             text = text.replace(s, '<USER>')
 
     # 2. 替换 UNC 路径

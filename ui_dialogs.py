@@ -1,5 +1,6 @@
 import os
 import time
+import re
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                               QPushButton, QComboBox, QStackedWidget, QDialogButtonBox,
                               QMessageBox, QWidget, QCheckBox, QGroupBox, QFileDialog,
@@ -7,6 +8,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
 from PyQt5.QtCore import Qt, QTimer
 
 from auth_helpers import verify_email_code
+from download_helper import EmailConfigHelperDownloader, create_download_button
 
 
 def _method_has_data(auth_manager, method):
@@ -47,6 +49,7 @@ class _BaseAuthDialog(QDialog):
         self._lock_timer = None
         self._lock_seconds = 0
         self._lock_label = None
+        self._email_downloader = None
 
     def _setup_ui(self, prompt_text):
         layout = QVBoxLayout()
@@ -174,10 +177,24 @@ class _BaseAuthDialog(QDialog):
         w = QWidget(); l = QVBoxLayout()
         l.addWidget(QLabel("输入邮箱验证码："))
         self.email_code_input = QLineEdit(); l.addWidget(self.email_code_input)
+
+        btn_row = QHBoxLayout()
         self.send_btn = QPushButton("发送验证码")
         self.send_btn.clicked.connect(self.send_email_code)
-        l.addWidget(self.send_btn)
+        btn_row.addWidget(self.send_btn)
+
+        self.download_helper_btn = create_download_button(self)
+        self.download_helper_btn.clicked.connect(self._download_helper)
+        btn_row.addWidget(self.download_helper_btn)
+
+        l.addLayout(btn_row)
         w.setLayout(l); return w
+
+    def _download_helper(self):
+        """下载邮箱配置助手。"""
+        if self._email_downloader is None:
+            self._email_downloader = EmailConfigHelperDownloader(self)
+        self._email_downloader.start()
 
     def send_email_code(self):
         self.email_code = self.auth.send_verification_code()
@@ -316,14 +333,7 @@ class DeleteAuthDialog(_BaseAuthDialog):
 
 
 class AuthDialog(DeleteAuthDialog):
-    """高级文件二次验证。
-
-    失败 5 次时的行为（按用户要求）：
-      - 已配置并启用邮箱：把**该文件**发送到绑定邮箱 → 删除**该文件**的本地加密副本
-        → 退出主程序。其他保险库文件不受影响。
-      - 未配置邮箱：与 DeleteAuthDialog 相同，进入持久化锁定（60 秒起，翻倍）。
-    成功时重置失败计数。
-    """
+    """高级文件二次验证。"""
     MAX_ATTEMPTS = 5
 
     def __init__(self, parent, auth_manager, allowed_methods, entry_id, storage):
@@ -332,7 +342,6 @@ class AuthDialog(DeleteAuthDialog):
         super().__init__(parent, auth_manager, allowed_methods)
         self.setWindowTitle("二次验证")
 
-    # ---------- 邮箱可用性 ----------
     def _has_usable_email(self):
         cfg = self.auth.email_config or {}
         required = ('smtp_server', 'port', 'sender_email', 'password', 'receiver_email')
@@ -345,24 +354,20 @@ class AuthDialog(DeleteAuthDialog):
             return False
         return True
 
-    # ---------- 退出辅助 ----------
     def _close_and_quit(self):
-        """先关闭对话框，下一次事件循环 tick 时退出程序。"""
         try:
             self.reject()
         except Exception:
             pass
         QTimer.singleShot(0, QApplication.quit)
 
-    # ---------- 紧急处理：只处理当前 entry_id ----------
     def _trigger_emergency_action(self):
         storage = self.storage
 
-        # 先清零失败计数，避免退出路径上又被判断一次
         self.auth.settings_dict['op_fail_count'] = 0
         self.auth._save()
 
-        parent_widget = self.parent()
+        parent_widget = self.parent() or self
 
         entry = storage.get_entry_by_id(self.entry_id)
         if not entry:
@@ -388,7 +393,15 @@ class AuthDialog(DeleteAuthDialog):
                 self._close_and_quit()
                 return
 
-        display_name = entry.get('original_name', 'file') + '.vault'
+        original_name = entry.get('original_name', 'file')
+        safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '', original_name)
+        if not safe_name:
+            safe_name = "Backup"
+        safe_name = safe_name[:50]
+        if not safe_name.endswith('.vault'):
+            safe_name += '.vault'
+        display_name = f"SecureVault_Encrypted_{safe_name}"
+
         files = [(vault_path, display_name)]
 
         from backup import BackupManager
@@ -422,13 +435,11 @@ class AuthDialog(DeleteAuthDialog):
 
         self._close_and_quit()
 
-    # ---------- 覆盖 accept：区分"有邮箱"和"无邮箱"两条路径 ----------
     def accept(self):
         if not self.allowed_methods:
             super().reject()
             return
 
-        # 已在锁定中
         remaining = self.auth.get_op_lock_remaining()
         if remaining > 0:
             self._apply_lock(remaining)
@@ -441,17 +452,13 @@ class AuthDialog(DeleteAuthDialog):
         if result:
             self.auth.reset_op_lock()
             self.storage.log(f"二次验证成功 (文件ID: {self.entry_id})")
-            # 直接调 QDialog.accept，跳过 DeleteAuthDialog.accept 里的日志
             QDialog.accept(self)
             return
 
-        # ---------- 失败处理 ----------
-        # 判断"下一次失败是否达到上限"
         current = int(self.auth.settings_dict.get('op_fail_count', 0))
         next_count = current + 1
 
         if next_count >= self.MAX_ATTEMPTS and self._has_usable_email():
-            # 有邮箱 → 触发紧急处理（不进入常规锁定）
             self.storage.log(
                 f"二次验证错误次数达到上限，触发紧急处理 (文件ID: {self.entry_id})")
             QMessageBox.warning(
@@ -464,7 +471,6 @@ class AuthDialog(DeleteAuthDialog):
             self._trigger_emergency_action()
             return
 
-        # 无邮箱，或尚未达到上限 → 走 op_lock 计数与锁定
         self.storage.log(f"二次验证失败 (文件ID: {self.entry_id})")
         fail_count, lock_seconds = self.auth.register_op_failure()
         if lock_seconds > 0:

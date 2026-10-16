@@ -12,6 +12,7 @@ from PyQt5.QtGui import QPixmap
 
 from settings import DEFAULT_SECRET_DIR
 from auth_helpers import verify_email_code
+from download_helper import EmailConfigHelperDownloader, create_download_button
 
 
 class LoginDialog(QDialog):
@@ -69,7 +70,6 @@ class LoginDialog(QDialog):
 
         self._apply_lock_if_needed()
 
-    # ---------- 修复 M7：关闭时清理定时器 ----------
     def closeEvent(self, event):
         self._cleanup_lock_timer()
         super().closeEvent(event)
@@ -99,7 +99,6 @@ class LoginDialog(QDialog):
         self.recovery_btn.setEnabled(False)
         self.lock_label.setVisible(True)
         self._update_lock_label()
-        # 修复 M7：先清理旧定时器，再创建新的
         self._cleanup_lock_timer()
         self._lock_timer = QTimer(self)
         self._lock_timer.timeout.connect(self._on_lock_tick)
@@ -240,6 +239,7 @@ class SetupWizard(QWizard):
         self.setWindowTitle("SecureVault 首次设置")
         self.setWizardStyle(QWizard.ModernStyle)
         self._imported_auth = False
+        self._email_downloader = None
         self._build_pages()
 
     def _build_pages(self):
@@ -377,6 +377,12 @@ class SetupWizard(QWizard):
         l.addWidget(self.sender_password)
         self.receiver_email = QLineEdit(); self.receiver_email.setPlaceholderText("收件邮箱（用于接收验证码）")
         l.addWidget(self.receiver_email)
+
+        # 下载配置助手按钮
+        self.download_helper_btn = create_download_button(self)
+        self.download_helper_btn.clicked.connect(self._download_email_helper)
+        l.addWidget(self.download_helper_btn)
+
         p6_email.setLayout(l); self.addPage(p6_email)
 
         p7_done = QWizardPage()
@@ -385,6 +391,12 @@ class SetupWizard(QWizard):
         l = QVBoxLayout()
         l.addWidget(QLabel("所有设置将加密存储，请牢记您的安全信息。"))
         p7_done.setLayout(l); self.addPage(p7_done)
+
+    def _download_email_helper(self):
+        """下载邮箱配置助手。"""
+        if self._email_downloader is None:
+            self._email_downloader = EmailConfigHelperDownloader(self)
+        self._email_downloader.start()
 
     def nextId(self):
         if self.currentId() == 2 and self._imported_auth:
@@ -571,46 +583,50 @@ class SetupWizard(QWizard):
 
     def accept(self):
         if not self._imported_auth:
-            if self.pw_enable.isChecked():
-                self.auth.set_password(self.pw_input.text())
-            else:
-                self.auth.password_hash = None
-                self.auth.settings_dict.pop('password_hash', None)
+            try:
+                if self.pw_enable.isChecked():
+                    self.auth.set_password(self.pw_input.text())
+                else:
+                    self.auth.password_hash = None
+                    self.auth.settings_dict.pop('password_hash', None)
 
-            if self.qa_enable.isChecked():
-                qa_list = [
-                    (self.q1.text().strip(), self.a1.text().strip()),
-                    (self.q2.text().strip(), self.a2.text().strip()),
-                    (self.q3.text().strip(), self.a3.text().strip()),
-                ]
-                self.auth.set_questions(qa_list)
-            else:
-                self.auth.qa = {}
-                self.auth.settings_dict.pop('qa', None)
+                if self.qa_enable.isChecked():
+                    qa_list = [
+                        (self.q1.text().strip(), self.a1.text().strip()),
+                        (self.q2.text().strip(), self.a2.text().strip()),
+                        (self.q3.text().strip(), self.a3.text().strip()),
+                    ]
+                    self.auth.set_questions(qa_list)
+                else:
+                    self.auth.qa = {}
+                    self.auth.settings_dict.pop('qa', None)
 
-            if self.totp_enable.isChecked():
-                self.auth.save_totp_secret(self.totp_secret)
-            else:
-                self.auth.settings_dict.pop('totp_secret', None)
-                self.auth.totp_secret = None
+                if self.totp_enable.isChecked():
+                    self.auth.save_totp_secret(self.totp_secret)
+                else:
+                    self.auth.settings_dict.pop('totp_secret', None)
+                    self.auth.totp_secret = None
 
-            if self.email_enable.isChecked():
-                self.auth.save_email_config(
-                    self.smtp_server.text().strip(),
-                    int(self.smtp_port.text().strip()),
-                    self.sender_email.text().strip(),
-                    self.sender_password.text(),
-                    self.receiver_email.text().strip())
-            else:
-                self.auth.email_config = {}
-                self.auth.settings_dict.pop('email', None)
+                if self.email_enable.isChecked():
+                    self.auth.save_email_config(
+                        self.smtp_server.text().strip(),
+                        int(self.smtp_port.text().strip()),
+                        self.sender_email.text().strip(),
+                        self.sender_password.text(),
+                        self.receiver_email.text().strip())
+                else:
+                    self.auth.email_config = {}
+                    self.auth.settings_dict.pop('email', None)
 
-            enabled_map = {}
-            if self.pw_enable.isChecked(): enabled_map['password'] = True
-            if self.qa_enable.isChecked(): enabled_map['question'] = True
-            if self.totp_enable.isChecked(): enabled_map['totp'] = True
-            if self.email_enable.isChecked(): enabled_map['email'] = True
-            self.auth.settings_dict['method_enabled'] = enabled_map
+                enabled_map = {}
+                if self.pw_enable.isChecked(): enabled_map['password'] = True
+                if self.qa_enable.isChecked(): enabled_map['question'] = True
+                if self.totp_enable.isChecked(): enabled_map['totp'] = True
+                if self.email_enable.isChecked(): enabled_map['email'] = True
+                self.auth.settings_dict['method_enabled'] = enabled_map
+            except ValueError as e:
+                QMessageBox.warning(self, "错误", str(e))
+                return
 
         new_dir = self.secret_dir_input.text().strip()
         if new_dir and os.path.normcase(os.path.abspath(new_dir)) != \

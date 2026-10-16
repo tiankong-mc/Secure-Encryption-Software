@@ -90,7 +90,11 @@ def _ensure_key():
 def _sign():
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-    k = Ed25519PrivateKey.from_private_bytes(open(KEY_PATH, 'rb').read())
+    # 修复 M1：显式关闭文件句柄，避免在 Windows 上长时间占用私钥文件
+    with open(KEY_PATH, 'rb') as f:
+        key_bytes = f.read()
+    k = Ed25519PrivateKey.from_private_bytes(key_bytes)
+
     with open(EXE_PATH, 'rb') as f:
         digest = hashlib.sha256(f.read()).digest()
     sig = k.sign(digest)
