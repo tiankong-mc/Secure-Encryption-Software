@@ -1,7 +1,7 @@
 import os, tempfile
 from io import BytesIO
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QTextEdit, QLabel, QPushButton,
-                              QHBoxLayout, QMessageBox)
+from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                              QPushButton, QTextEdit, QMessageBox, QFileDialog)
 from PyQt5.QtCore import Qt, QUrl, QTimer
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -11,235 +11,172 @@ import docx, PyPDF2
 from ui_utils import protect_window
 
 
-class FileViewer(QDialog):
-    """文件预览（文本/图片/视频/音频/文档）"""
+def _auto_decode_text(data):
+    if not data: return "", "utf-8", "\n"
+    newline = "\r\n" if b"\r\n" in data else "\n"
+    if data.startswith(b'\xef\xbb\xbf'): return data[3:].decode('utf-8', errors='replace'), "utf-8-sig", newline
+    if data.startswith(b'\xff\xfe'): return data[2:].decode('utf-16-le', errors='replace'), "utf-16-le", newline
+    if data.startswith(b'\xfe\xff'): return data[2:].decode('utf-16-be', errors='replace'), "utf-16-be", newline
+    # 编码探测顺序：utf-8 → big5 → gb18030 → gbk（Big5 先于 gb18030，避免繁体被误判）
+    for enc in ('utf-8', 'big5', 'gb18030', 'gbk'):
+        try: return data.decode(enc), enc, newline
+        except UnicodeDecodeError: pass
+    return data.decode('utf-8', errors='replace'), "utf-8", newline
 
-    def __init__(self, parent, data, ftype, original_name):
+
+class FileViewer(QDialog):
+    def __init__(self, parent, entry, storage, auth, data):
         super().__init__(parent)
         self.parent_window = parent
-        self.original_name = original_name
-        self.setWindowTitle(f"查看: {original_name}")
-        self.setModal(False)
-        self.resize(700, 500)
-        layout = QVBoxLayout()
+        self.entry = entry
+        self.storage = storage
+        self.auth = auth
+        self.original_name = entry['original_name']
+        self.file_data = data
+        self.is_editing = False
         self.tmp_path = None
         self.player = None
-        self.file_data = data
         self.exported_tmp_files = []
-
+        self._encoding = "utf-8"
+        self._newline = "\n"
+        self.setWindowTitle(f"查看: {self.original_name}")
+        self.setModal(False)
+        self.resize(700, 500)
+        self.main_layout = QVBoxLayout()
+        self.toolbar = QHBoxLayout()
+        self.toolbar.addStretch()
+        self.edit_btn = QPushButton("编辑"); self.edit_btn.setVisible(False); self.edit_btn.clicked.connect(self._start_edit)
+        self.save_btn = QPushButton("保存"); self.save_btn.setVisible(False); self.save_btn.clicked.connect(self._save_edit)
+        self.history_btn = QPushButton("历史版本"); self.history_btn.setVisible(False); self.history_btn.clicked.connect(self._show_history)
+        self.toolbar.addWidget(self.edit_btn); self.toolbar.addWidget(self.history_btn); self.toolbar.addWidget(self.save_btn)
+        self.main_layout.addLayout(self.toolbar)
+        ftype = entry.get('type', 'other')
         if ftype == 'text':
-            te = QTextEdit()
-            te.setPlainText(data.decode('utf-8', errors='replace'))
-            te.setReadOnly(True)
-            layout.addWidget(te)
+            self.text_edit = QTextEdit()
+            decoded, self._encoding, self._newline = _auto_decode_text(data)
+            self.text_edit.setPlainText(decoded)
+            self.text_edit.setReadOnly(True)
+            self.main_layout.addWidget(self.text_edit)
+            if entry.get('is_editable'):
+                self.edit_btn.setVisible(True); self.history_btn.setVisible(True)
         elif ftype == 'image':
             pixmap = QPixmap()
             if pixmap.loadFromData(data):
-                label = QLabel()
-                label.setPixmap(pixmap.scaled(600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                layout.addWidget(label)
-            else:
-                try:
-                    img = Image.open(BytesIO(data))
-                    qimg = ImageQt.ImageQt(img)
-                    pixmap = QPixmap.fromImage(qimg)
-                    label = QLabel()
-                    label.setPixmap(pixmap.scaled(600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                    layout.addWidget(label)
-                except:
-                    layout.addWidget(QLabel("无法显示该图片"))
+                label = QLabel(); label.setPixmap(pixmap.scaled(600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self.main_layout.addWidget(label)
         elif ftype in ['video', 'audio']:
             try:
-                ext = os.path.splitext(original_name)[1]
-                fd, path = tempfile.mkstemp(suffix=ext)
-                os.close(fd)
-                with open(path, 'wb') as f:
-                    f.write(data)
+                ext = os.path.splitext(self.original_name)[1]
+                fd, path = tempfile.mkstemp(suffix=ext); os.close(fd)
+                with open(path, 'wb') as f: f.write(data)
                 self.tmp_path = path
-                abs_path = os.path.abspath(path)
                 self.player = QMediaPlayer()
                 if ftype == 'video':
-                    self.video_widget = QVideoWidget()
-                    layout.addWidget(self.video_widget)
+                    self.video_widget = QVideoWidget(); self.main_layout.addWidget(self.video_widget)
                     self.player.setVideoOutput(self.video_widget)
-                self.player.setMedia(QMediaContent(QUrl.fromLocalFile(abs_path)))
-                self.load_ok = False
-                self.player.mediaStatusChanged.connect(self.check_media_status)
-                QTimer.singleShot(5000, self.check_load_timeout)
+                self.player.setMedia(QMediaContent(QUrl.fromLocalFile(os.path.abspath(path))))
                 cl = QHBoxLayout()
-                pb = QPushButton("播放/暂停")
-                pb.clicked.connect(self.toggle_play)
-                cl.addWidget(pb)
-                sb = QPushButton("停止")
-                sb.clicked.connect(self.player.stop)
-                cl.addWidget(sb)
-                if ftype == 'audio':
-                    self.position_label = QLabel("00:00 / 00:00")
-                    cl.addWidget(self.position_label)
-                    self.timer = QTimer(self)
-                    self.timer.timeout.connect(self.update_position)
-                    self.timer.start(1000)
-                eb = QPushButton("导出并观看")
-                eb.clicked.connect(self.export_and_view)
-                cl.addWidget(eb)
-                layout.addLayout(cl)
-                self.status_label = QLabel("正在加载媒体...")
-                layout.addWidget(self.status_label)
+                pb = QPushButton("播放/暂停"); pb.clicked.connect(lambda: self.player.pause() if self.player.state() == QMediaPlayer.PlayingState else self.player.play())
+                cl.addWidget(pb); self.main_layout.addLayout(cl)
                 self.player.play()
-                self.finished.connect(self.cleanup_tmp)
-            except Exception as e:
-                layout.addWidget(QLabel(f"播放器初始化失败: {e}"))
-                btn = QPushButton("导出并观看")
-                btn.clicked.connect(self.export_and_view)
-                layout.addWidget(btn)
+            except Exception as e: self.main_layout.addWidget(QLabel(f"播放失败: {e}"))
         elif ftype == 'document':
-            ext = os.path.splitext(original_name)[1].lower()
+            ext = os.path.splitext(self.original_name)[1].lower()
             text_content = ""
             try:
                 if ext in ['.docx']:
-                    doc = docx.Document(BytesIO(data))
-                    for para in doc.paragraphs:
-                        text_content += para.text + "\n"
+                    for para in docx.Document(BytesIO(data)).paragraphs: text_content += para.text + "\n"
                 elif ext in ['.pdf']:
-                    pdf_reader = PyPDF2.PdfReader(BytesIO(data))
-                    for page in pdf_reader.pages:
-                        text_content += (page.extract_text() or "") + "\n"
-                else:
-                    text_content = "此文档格式暂不支持预览"
-            except Exception as e:
-                text_content = f"文档解析失败: {e}"
-            te = QTextEdit()
-            te.setPlainText(text_content)
-            te.setReadOnly(True)
-            layout.addWidget(te)
+                    for page in PyPDF2.PdfReader(BytesIO(data)).pages: text_content += (page.extract_text() or "") + "\n"
+            except Exception as e: text_content = f"解析失败: {e}"
+            te = QTextEdit(); te.setPlainText(text_content); te.setReadOnly(True)
+            self.main_layout.addWidget(te)
         else:
-            layout.addWidget(QLabel("不支持预览此文件类型"))
-        self.setLayout(layout)
+            self.main_layout.addWidget(QLabel("不支持预览"))
+        self.setLayout(self.main_layout)
 
     def showEvent(self, event):
         super().showEvent(event)
-        if getattr(self.parent_window, 'screenshot_protection', False):
-            protect_window(self, True)
+        if getattr(self.parent_window, 'screenshot_protection', False): protect_window(self, True)
 
-    def check_media_status(self, status):
-        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
-            self.load_ok = True
-            if hasattr(self, 'status_label'):
-                self.status_label.setText("媒体已加载，正在播放...")
-        elif status == QMediaPlayer.InvalidMedia:
-            if hasattr(self, 'status_label'):
-                self.status_label.setText("❌ 媒体格式不支持，请导出观看")
-            self.load_ok = False
-        elif status == QMediaPlayer.NoMedia:
-            if hasattr(self, 'status_label'):
-                self.status_label.setText("无媒体")
-            self.load_ok = False
+    def _start_edit(self):
+        methods = self.entry.get('second_auth_methods', [])
+        enabled = set(self.auth.get_enabled_methods())
+        valid_methods = [m for m in methods if m in enabled]
+        if not valid_methods and enabled:
+            valid_methods = list(enabled)  # 空方法列表时使用全局启用方法
+        if not valid_methods:
+            QMessageBox.warning(self, "提示", "此文件要求的验证方式当前均未启用。"); return
+        from ui_dialogs import DeleteAuthDialog
+        dialog = DeleteAuthDialog(self, self.auth, valid_methods)
+        if dialog.exec_() == QDialog.Accepted:
+            self.text_edit.setReadOnly(False)
+            self.is_editing = True
+            self.edit_btn.setVisible(False); self.history_btn.setVisible(False); self.save_btn.setVisible(True)
+            self.setWindowTitle(f"编辑中: {self.original_name}")
 
-    def check_load_timeout(self):
-        if not hasattr(self, 'load_ok') or not self.load_ok:
-            if hasattr(self, 'status_label'):
-                self.status_label.setText("⚠️ 加载超时，请尝试导出观看")
-
-    def toggle_play(self):
-        if self.player and self.player.state() == QMediaPlayer.PlayingState:
-            self.player.pause()
-        else:
-            self.player.play()
-
-    def update_position(self):
-        if hasattr(self, 'player') and self.player:
-            if self.player.state() != QMediaPlayer.StoppedState:
-                pos = self.player.position()
-                dur = self.player.duration()
-                if dur > 0:
-                    self.position_label.setText(f"{pos//60000:02d}:{(pos%60000)//1000:02d} / {dur//60000:02d}:{(dur%60000)//1000:02d}")
-
-    def export_and_view(self):
-        """
-        导出文件并调用系统默认程序打开。
-        修复 M5：导出路径保持不动（在 closeEvent 中只在用户已关闭查看器时才清理），
-        并在清理失败时弹窗告知用户，避免临时文件无声堆积。
-        """
-        if hasattr(self, 'file_data') and self.file_data:
-            ext = os.path.splitext(self.original_name)[1] or '.bin'
-            # 修复 M5：放到用户可见的临时目录（而不是系统 TEMP 深层目录），
-            # 便于用户在清理失败时手动找到该文件。
-            safe_stem = os.path.splitext(os.path.basename(self.original_name))[0]
-            if not safe_stem:
-                safe_stem = 'SecureVault_export'
-            fd, export_path = tempfile.mkstemp(
-                prefix=f'SecureVault_view_{safe_stem}_', suffix=ext)
-            os.close(fd)
-            with open(export_path, 'wb') as f:
-                f.write(self.file_data)
-            self.exported_tmp_files.append(export_path)
-            try:
-                os.startfile(export_path)
-            except Exception as e:
-                QMessageBox.warning(self, "提示",
-                    f"无法自动打开文件：{e}\n\n"
-                    f"文件已导出到：\n{export_path}")
-                return
-            QMessageBox.information(self, "提示",
-                f"文件已导出到：\n{export_path}\n\n"
-                "关闭预览窗口后将尝试自动清理。")
-        else:
-            QMessageBox.warning(self, "错误", "没有可导出的数据")
-
-    def cleanup_tmp(self):
-        if hasattr(self, 'tmp_path') and self.tmp_path and os.path.exists(self.tmp_path):
-            try:
-                os.unlink(self.tmp_path)
-            except OSError as e:
-                print(f"临时文件清理失败: {self.tmp_path} ({e})")
-                self._record_for_later_cleanup(self.tmp_path)
-
-    @staticmethod
-    def _record_for_later_cleanup(path):
-        """把删除失败的临时文件路径记录到 %TEMP%\\SecureVault_pending_cleanup.txt。"""
+    def _save_edit(self):
+        text = self.text_edit.toPlainText()
+        if self._newline == "\r\n": text = text.replace("\n", "\r\n")
         try:
-            marker = os.path.join(tempfile.gettempdir(), 'SecureVault_pending_cleanup.txt')
-            with open(marker, 'a', encoding='utf-8') as f:
-                f.write(path + '\n')
+            new_data = text.encode(self._encoding)
+            if self._encoding == 'utf-8-sig': new_data = b'\xef\xbb\xbf' + new_data
+            elif self._encoding == 'utf-16-le': new_data = b'\xff\xfe' + new_data
+            elif self._encoding == 'utf-16-be': new_data = b'\xfe\xff' + new_data
         except Exception:
-            pass
+            new_data = text.encode('utf-8')
+        try:
+            self.storage.update_file_content(self.entry['id'], new_data)
+            self.file_data = new_data
+            QMessageBox.information(self, "成功", "文件已保存。")
+            self.text_edit.setReadOnly(True)
+            self.is_editing = False
+            self.save_btn.setVisible(False); self.edit_btn.setVisible(True); self.history_btn.setVisible(True)
+            self.setWindowTitle(f"查看: {self.original_name}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {e}")
+
+    def _show_history(self):
+        history = self.storage.get_file_history(self.entry['id'])
+        if not history:
+            QMessageBox.information(self, "提示", "暂无历史版本（仅保留3天内）。"); return
+        from PyQt5.QtWidgets import QInputDialog
+        import datetime
+        items = [f"{datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}" for ts, p in history]
+        item, ok = QInputDialog.getItem(self, "历史版本", "选择要回滚的版本:", items, 0, False)
+        if ok and item:
+            idx = items.index(item)
+            hist_path = history[idx][1]
+            methods = self.entry.get('second_auth_methods', [])
+            valid_methods = [m for m in methods if m in set(self.auth.get_enabled_methods())]
+            if not valid_methods and self.auth.get_enabled_methods():
+                valid_methods = self.auth.get_enabled_methods()
+            if valid_methods:
+                from ui_dialogs import DeleteAuthDialog
+                dlg = DeleteAuthDialog(self, self.auth, valid_methods)
+                if dlg.exec_() != QDialog.Accepted: return
+            else:
+                if not self.auth.get_enabled_methods():
+                    QMessageBox.warning(self, "提示", "没有可用的验证方式"); return
+            if self.is_editing:
+                if QMessageBox.question(self, "警告", "回滚将放弃当前未保存的修改，是否继续？", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+                self.is_editing = False
+                self.save_btn.setVisible(False); self.edit_btn.setVisible(True); self.history_btn.setVisible(True)
+                self.text_edit.setReadOnly(True)
+                self.setWindowTitle(f"查看: {self.original_name}")
+            if QMessageBox.question(self, "确认", "回滚将覆盖当前内容，是否继续？", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                self.storage.rollback_file(self.entry['id'], hist_path)
+                self.file_data = self.storage.get_file_data(self.entry['id'])
+                decoded, self._encoding, self._newline = _auto_decode_text(self.file_data)
+                self.text_edit.setPlainText(decoded)
+                QMessageBox.information(self, "成功", "已回滚。")
 
     def closeEvent(self, event):
-        if self.player is not None:
-            try:
-                self.player.stop()
-                self.player.setMedia(QMediaContent())
-            except Exception:
-                pass
-        if hasattr(self, 'timer') and self.timer is not None:
-            try:
-                self.timer.stop()
-            except Exception:
-                pass
-        self.cleanup_tmp()
-
-        # 修复 M5：收集清理失败的文件，关闭窗口时统一弹一次提示，避免无声堆积
-        failed_cleanup = []
-        for path in self.exported_tmp_files:
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError as e:
-                print(f"导出临时文件清理失败: {path} ({e})")
-                self._record_for_later_cleanup(path)
-                failed_cleanup.append(path)
-
-        if failed_cleanup:
-            try:
-                joined = "\n".join(failed_cleanup[:3])
-                if len(failed_cleanup) > 3:
-                    joined += f"\n...（共 {len(failed_cleanup)} 个文件）"
-                QMessageBox.information(
-                    self, "临时文件提示",
-                    "以下临时文件被其他程序占用，未能自动删除：\n\n"
-                    f"{joined}\n\n"
-                    "您可以在关闭相应程序后手动删除这些文件。")
-            except Exception:
-                pass
-
+        if self.is_editing:
+            reply = QMessageBox.question(self, "提示", "有未保存的修改，是否放弃编辑？", QMessageBox.Yes|QMessageBox.No)
+            if reply == QMessageBox.No: event.ignore(); return
+        if self.player: self.player.stop()
+        if self.tmp_path and os.path.exists(self.tmp_path):
+            try: os.remove(self.tmp_path)
+            except OSError: pass
         event.accept()

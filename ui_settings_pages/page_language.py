@@ -11,7 +11,6 @@ class LanguagePage(SettingsPage):
         self._codes = []
 
         self.layout().addWidget(make_page_title(tr("language.title")))
-
         self.layout().addWidget(make_section_title(tr("language.select")))
         card, c = make_card()
 
@@ -44,12 +43,15 @@ class LanguagePage(SettingsPage):
         self.lang_combo.blockSignals(False)
 
     def on_language_changed(self, idx):
-        if idx < 0 or idx >= len(self._codes):
-            return
+        if idx < 0 or idx >= len(self._codes): return
         code = self._codes[idx]
         m = get_manager()
         if m and code != m.current_code:
-            m.load(code)
+            # 只有加载成功才保存
+            if not m.load(code):
+                QMessageBox.warning(self, tr("common.error"), f"无法加载语言包：{code}")
+                self._reload_languages()
+                return
             self.settings_dialog.auth.settings_dict['language'] = code
             self.settings_dialog.auth._save()
             self.settings_dialog.storage.log(f"切换语言为: {code}")
@@ -58,14 +60,18 @@ class LanguagePage(SettingsPage):
 
     def import_pack(self):
         path, _ = QFileDialog.getOpenFileName(self, tr("language.import"), "", "JSON (*.json)")
-        if not path:
-            return
+        if not path: return
         try:
             m = get_manager()
             code, name = m.import_pack(path)
             self.settings_dialog.storage.log(f"导入语言包: {code}")
             QMessageBox.information(self, tr("common.success"), tr("language.import_success") + name)
             self._reload_languages()
+            # 导入后自动切换到新语言
+            if m.load(code):
+                self.settings_dialog.auth.settings_dict['language'] = code
+                self.settings_dialog.auth._save()
+                self.settings_dialog.retranslate_all()
         except Exception as e:
             QMessageBox.warning(self, tr("common.error"), tr("language.import_failed") + str(e))
 

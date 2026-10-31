@@ -1,18 +1,131 @@
 from io import BytesIO
-import os
-import time
-import secrets
+import os, time, secrets
 import pyotp, qrcode
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                               QPushButton, QComboBox, QStackedWidget, QDialogButtonBox,
                               QMessageBox, QWidget, QCheckBox, QInputDialog,
-                              QWizard, QWizardPage, QFileDialog)
+                              QWizard, QWizardPage, QFileDialog, QApplication)
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap
-
 from settings import DEFAULT_SECRET_DIR
 from auth_helpers import verify_email_code
 from download_helper import EmailConfigHelperDownloader, create_download_button
+
+
+class HighSecurityUnlockDialog(QDialog):
+    def __init__(self, settings_manager, auth_manager, storage_manager=None):
+        super().__init__()
+        self.settings = settings_manager
+        self.auth = auth_manager
+        self.storage = storage_manager
+        self.master_key = None
+        self.recovery_accepted = False
+        self._pending_new_password = None
+
+        self.setWindowTitle("SecureVault 高安全解锁")
+        self.setModal(True)
+        self.resize(400, 280)
+        layout = QVBoxLayout()
+        tip = QLabel("高安全模式已启用。\n请输入主密码（或使用恢复代码）解锁保险库：")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("font-size: 11pt; font-weight: bold;")
+        layout.addWidget(tip)
+        self.pw_input = QLineEdit()
+        self.pw_input.setEchoMode(QLineEdit.Password)
+        self.pw_input.setPlaceholderText("输入主密码")
+        layout.addWidget(self.pw_input)
+        btn_layout = QHBoxLayout()
+        self.ok_btn = QPushButton("解锁")
+        self.ok_btn.clicked.connect(self._on_unlock)
+        self.recovery_btn = QPushButton("使用恢复代码")
+        self.recovery_btn.clicked.connect(self._on_recovery)
+        btn_layout.addWidget(self.ok_btn)
+        btn_layout.addWidget(self.recovery_btn)
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+        self._apply_lock_if_needed()
+
+    def _log(self, msg):
+        if self.storage:
+            self.storage.log(msg)
+
+    def _apply_lock_if_needed(self):
+        remaining = self.auth.get_login_lock_remaining()
+        if remaining > 0:
+            self.ok_btn.setEnabled(False)
+            self.recovery_btn.setEnabled(False)
+            QMessageBox.warning(self, "已锁定", f"错误次数过多，请等待 {remaining} 秒后再试。")
+            QTimer.singleShot(remaining * 1000, self._release_lock)
+
+    def _release_lock(self):
+        if self.isVisible():
+            self.ok_btn.setEnabled(True)
+            self.recovery_btn.setEnabled(True)
+
+    def _record_failure(self):
+        fail, lock_sec = self.auth.register_login_failure()
+        if lock_sec > 0:
+            QMessageBox.critical(self, "锁定", f"错误次数过多，已锁定 {lock_sec} 秒。")
+            self.reject()
+        else:
+            QMessageBox.warning(self, "失败", f"错误，剩余 {self.auth.LOGIN_MAX_ATTEMPTS - fail} 次机会。")
+
+    def _force_reset_password(self):
+        while True:
+            new_pw, ok = QInputDialog.getText(self, "必须重设主密码", "恢复代码已使用，为了安全，请立即设置新的主密码：", QLineEdit.Password)
+            if not ok:
+                QMessageBox.critical(self, "退出", "必须设置新主密码才能继续使用。程序将退出。")
+                QApplication.quit()
+                return False
+            if len(new_pw) < 6:
+                QMessageBox.warning(self, "错误", "主密码长度至少 6 个字符。")
+                continue
+            confirm, ok2 = QInputDialog.getText(self, "确认主密码", "再次输入新主密码：", QLineEdit.Password)
+            if not ok2 or new_pw != confirm:
+                QMessageBox.warning(self, "错误", "两次输入不一致。")
+                continue
+            try:
+                new_code = self.auth.generate_recovery_code(send_email=False)
+                self.settings.update_high_security_password(self.master_key, new_pw, new_code)
+                self.auth.clear_recovery_code()
+                self.auth.set_password(new_pw)
+                self._log("恢复码使用后已强制重设高安全主密码")
+                QMessageBox.information(
+                    self, "主密码已更新",
+                    f"主密码已重设。\n\n您的新紧急恢复代码是：\n{new_code}\n\n请务必妥善保存！")
+                self._pending_new_password = new_pw
+                return True
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"重设失败：{e}")
+
+    def _on_unlock(self):
+        pw = self.pw_input.text()
+        if not pw:
+            return
+        try:
+            self.master_key = self.settings.unlock_master_key(password=pw)
+            self.auth.reset_login_lock()
+            self._log("高安全模式解锁成功")
+            self.accept()
+        except Exception:
+            self._log("高安全模式解锁失败")
+            self._record_failure()
+
+    def _on_recovery(self):
+        code, ok = QInputDialog.getText(self, "紧急恢复", "请输入 20 位恢复代码：")
+        if not ok or not code:
+            return
+        try:
+            self.master_key = self.settings.unlock_master_key(recovery_code=code.strip().upper())
+            self.recovery_accepted = True
+            self.auth.clear_recovery_code()
+            self.auth.reset_login_lock()
+            self._log("高安全模式使用恢复代码解锁成功")
+            if self._force_reset_password():
+                self.accept()
+        except Exception:
+            self._log("高安全模式使用恢复代码解锁失败")
+            self._record_failure()
 
 
 class LoginDialog(QDialog):
@@ -28,31 +141,30 @@ class LoginDialog(QDialog):
         self.resize(420, 400)
         layout = QVBoxLayout()
         layout.addWidget(QLabel("请通过以下任一方式验证身份"))
-
         self.lock_label = QLabel("")
         self.lock_label.setAlignment(Qt.AlignCenter)
-        self.lock_label.setStyleSheet(
-            "color: #ff6666; font-size: 11pt; padding: 8px; font-weight: bold;")
+        self.lock_label.setStyleSheet("color: #ff6666; font-size: 11pt; padding: 8px; font-weight: bold;")
         self.lock_label.setWordWrap(True)
         self.lock_label.setVisible(False)
         layout.addWidget(self.lock_label)
 
         self.stack = QStackedWidget()
         self.methods = []
-
         enabled = self.auth.get_enabled_methods()
-
         if 'password' in enabled:
-            w = self.create_password_widget(); self.stack.addWidget(w); self.methods.append('password')
+            self.stack.addWidget(self.create_password_widget())
+            self.methods.append('password')
         if 'question' in enabled:
-            w = self.create_question_widget(); self.stack.addWidget(w); self.methods.append('question')
+            self.stack.addWidget(self.create_question_widget())
+            self.methods.append('question')
         if 'totp' in enabled:
-            w = self.create_totp_widget(); self.stack.addWidget(w); self.methods.append('totp')
+            self.stack.addWidget(self.create_totp_widget())
+            self.methods.append('totp')
         if 'email' in enabled:
-            w = self.create_email_widget(); self.stack.addWidget(w); self.methods.append('email')
-
+            self.stack.addWidget(self.create_email_widget())
+            self.methods.append('email')
         if not self.methods:
-            QMessageBox.critical(self, "错误", "没有已启用的验证方式，请检查设置。")
+            QMessageBox.critical(self, "错误", "没有已启用的验证方式。")
 
         layout.addWidget(self.stack)
         self.method_combo = QComboBox()
@@ -67,7 +179,6 @@ class LoginDialog(QDialog):
         self.recovery_btn.clicked.connect(self.recovery_login)
         layout.addWidget(self.recovery_btn)
         self.setLayout(layout)
-
         self._apply_lock_if_needed()
 
     def closeEvent(self, event):
@@ -113,8 +224,7 @@ class LoginDialog(QDialog):
             self._update_lock_label()
 
     def _update_lock_label(self):
-        self.lock_label.setText(
-            f"错误次数过多，请等待 {self._lock_seconds} 秒后再试")
+        self.lock_label.setText(f"错误次数过多，请等待 {self._lock_seconds} 秒后再试")
 
     def _release_lock(self):
         self.lock_label.setVisible(False)
@@ -122,52 +232,80 @@ class LoginDialog(QDialog):
         self.method_combo.setEnabled(True)
         self.btn_box.setEnabled(True)
         self.recovery_btn.setEnabled(True)
-        self.storage.log("登录锁定已解除，可以再次尝试")
 
     def recovery_login(self):
-        code, ok = QInputDialog.getText(
-            self, "紧急恢复",
-            "请输入紧急恢复代码（格式：XXXX-XXXX-XXXX-XXXX-XXXX）:")
-        if not ok or not code: return
+        code, ok = QInputDialog.getText(self, "紧急恢复", "请输入紧急恢复代码:")
+        if not ok or not code:
+            return
         if self.auth.verify_recovery_code(code):
             self.recovery_accepted = True
             self.auth.reset_login_lock()
+            self.storage.log("使用恢复代码登录成功")
+            while True:
+                new_pw, ok2 = QInputDialog.getText(self, "必须重设密码", "恢复代码已使用，请设置新的登录密码：", QLineEdit.Password)
+                if not ok2:
+                    QMessageBox.critical(self, "退出", "必须设置新密码才能继续使用。程序将退出。")
+                    QApplication.quit()
+                    return
+                if len(new_pw) < 6:
+                    QMessageBox.warning(self, "错误", "密码长度至少 6 个字符。")
+                    continue
+                confirm, ok3 = QInputDialog.getText(self, "确认密码", "再次输入新密码：", QLineEdit.Password)
+                if not ok3 or new_pw != confirm:
+                    QMessageBox.warning(self, "错误", "两次输入不一致。")
+                    continue
+                self.auth.set_password(new_pw)
+                QMessageBox.information(self, "成功", "密码已更新。")
+                break
             self.accept()
         else:
+            self.storage.log("使用恢复代码登录失败")
             QMessageBox.warning(self, "错误", "恢复代码无效或已使用")
 
     def create_password_widget(self):
-        w = QWidget(); l = QVBoxLayout()
+        w = QWidget()
+        l = QVBoxLayout()
         l.addWidget(QLabel("输入密码："))
-        self.pw_input = QLineEdit(); self.pw_input.setEchoMode(QLineEdit.Password)
-        l.addWidget(self.pw_input); w.setLayout(l); return w
+        self.pw_input = QLineEdit()
+        self.pw_input.setEchoMode(QLineEdit.Password)
+        l.addWidget(self.pw_input)
+        w.setLayout(l)
+        return w
 
     def create_question_widget(self):
-        w = QWidget(); l = QVBoxLayout()
+        w = QWidget()
+        l = QVBoxLayout()
         l.addWidget(QLabel("选择安全问题："))
         self.question_combo = QComboBox()
         self.question_combo.addItems(self.auth.get_questions())
         l.addWidget(self.question_combo)
         l.addWidget(QLabel("输入答案："))
-        self.answer_input = QLineEdit(); self.answer_input.setEchoMode(QLineEdit.Password)
-        l.addWidget(self.answer_input); w.setLayout(l); return w
+        self.answer_input = QLineEdit()
+        self.answer_input.setEchoMode(QLineEdit.Password)
+        l.addWidget(self.answer_input)
+        w.setLayout(l)
+        return w
 
     def create_totp_widget(self):
-        w = QWidget(); l = QVBoxLayout()
+        w = QWidget()
+        l = QVBoxLayout()
         l.addWidget(QLabel("输入 Authenticator 动态码："))
-        self.totp_input = QLineEdit(); l.addWidget(self.totp_input)
-        w.setLayout(l); return w
+        self.totp_input = QLineEdit()
+        l.addWidget(self.totp_input)
+        w.setLayout(l)
+        return w
 
     def create_email_widget(self):
-        w = QWidget(); l = QVBoxLayout()
+        w = QWidget()
+        l = QVBoxLayout()
         l.addWidget(QLabel("输入邮箱验证码："))
-        self.email_code_input = QLineEdit(); l.addWidget(self.email_code_input)
+        self.email_code_input = QLineEdit()
+        l.addWidget(self.email_code_input)
         self.send_btn = QPushButton("发送验证码")
         self.send_btn.clicked.connect(self.send_email_code)
         l.addWidget(self.send_btn)
-        self.email_code = None
-        self.email_code_time = 0
-        w.setLayout(l); return w
+        w.setLayout(l)
+        return w
 
     def send_email_code(self):
         self.email_code = self.auth.send_verification_code()
@@ -180,13 +318,11 @@ class LoginDialog(QDialog):
 
     def accept(self):
         if self.recovery_accepted:
-            self.storage.log("登录成功 (恢复代码)")
             super().accept()
             return
         if not self.methods:
             QMessageBox.critical(self, "错误", "没有可用的验证方式")
             return
-
         remaining = self.auth.get_login_lock_remaining()
         if remaining > 0:
             self._apply_lock(remaining)
@@ -197,13 +333,11 @@ class LoginDialog(QDialog):
         if method == 'password':
             ok = self.auth.verify_password(self.pw_input.text())
         elif method == 'question':
-            ok = self.auth.verify_question(self.question_combo.currentText(),
-                                            self.answer_input.text())
+            ok = self.auth.verify_question(self.question_combo.currentText(), self.answer_input.text())
         elif method == 'totp':
-            ok = self.auth.verify_totp(self.totp_input.text())
+            ok = self.auth.verify_totp(self.totp_input.text(), domain='login')
         elif method == 'email':
-            status, msg = verify_email_code(
-                self.email_code_input.text(), self.email_code, self.email_code_time)
+            status, msg = verify_email_code(self.email_code_input.text(), self.email_code, self.email_code_time)
             if status in ('no_code', 'expired'):
                 QMessageBox.warning(self, "提示", msg)
                 if status == 'expired':
@@ -219,15 +353,12 @@ class LoginDialog(QDialog):
             return
 
         fail_count, lock_seconds = self.auth.register_login_failure()
+        self.storage.log(f"登录失败 (尝试 {fail_count})")
         if lock_seconds > 0:
             self.storage.log(f"登录失败次数过多，已锁定 {lock_seconds} 秒")
-            QMessageBox.warning(
-                self, "验证失败",
-                f"错误次数已达 {self.auth.LOGIN_MAX_ATTEMPTS} 次，"
-                f"已锁定 {lock_seconds} 秒。")
+            QMessageBox.warning(self, "验证失败", f"错误次数已达上限，已锁定 {lock_seconds} 秒。")
             self._apply_lock(lock_seconds)
         else:
-            self.storage.log(f"登录失败 (尝试 {fail_count})")
             QMessageBox.warning(self, "验证失败", f"失败 {fail_count} 次")
 
 
@@ -258,8 +389,7 @@ class SetupWizard(QWizard):
         row.addWidget(btn)
         l.addLayout(row)
         l.addSpacing(20)
-        tip = QLabel("提示：仅需设置一次，后续可在“设置 → 安全”中修改。\n"
-                     "配置文件和密钥固定保存在系统默认位置，以保证安全。")
+        tip = QLabel("提示：仅需设置一次，后续可在“设置 → 安全”中修改。\n配置文件和密钥固定保存在系统默认位置，以保证安全。")
         tip.setStyleSheet("color: #888;")
         tip.setWordWrap(True)
         l.addWidget(tip)
@@ -272,21 +402,20 @@ class SetupWizard(QWizard):
         p1.setSubTitle("配置安全设置以保护您的文件")
         l = QVBoxLayout()
         l.addWidget(QLabel("请依次设置以下安全选项，至少需要配置一种验证方式。"))
-        p1.setLayout(l); self.addPage(p1)
+        p1.setLayout(l)
+        self.addPage(p1)
 
         p_import = QWizardPage()
         p_import.setTitle("导入保险库（可选）")
-        p_import.setSubTitle("已有 SecureVault 备份可在此导入，并恢复验证信息")
+        p_import.setSubTitle("已有 SecureVault 备份可在此导入")
         l = QVBoxLayout()
-        self.import_enable = QCheckBox(
-            "从备份文件导入（会恢复密码 / 安全问题 / TOTP / 邮箱等验证信息）")
+        self.import_enable = QCheckBox("从备份文件导入（会恢复密码 / 安全问题 / TOTP / 邮箱等验证信息）")
         l.addWidget(self.import_enable)
         l.addSpacing(8)
         l.addWidget(QLabel("备份文件："))
         row = QHBoxLayout()
         self.import_path_input = QLineEdit()
         self.import_path_input.setReadOnly(True)
-        self.import_path_input.setPlaceholderText("未选择文件")
         row.addWidget(self.import_path_input)
         self.import_browse_btn = QPushButton("浏览...")
         self.import_browse_btn.setFixedWidth(80)
@@ -296,18 +425,11 @@ class SetupWizard(QWizard):
         l.addWidget(QLabel("备份密码："))
         self.import_password_input = QLineEdit()
         self.import_password_input.setEchoMode(QLineEdit.Password)
-        self.import_password_input.setPlaceholderText("输入备份文件密码")
         l.addWidget(self.import_password_input)
         self.import_status_label = QLabel("")
         self.import_status_label.setWordWrap(True)
-        self.import_status_label.setStyleSheet("color: #888;")
         l.addWidget(self.import_status_label)
         l.addStretch()
-        tip = QLabel("提示：导入成功后，将跳过后面的验证方式配置页，直接进入完成步骤。\n"
-                     "如果不需要导入，请保持未勾选并点击“下一步”。")
-        tip.setStyleSheet("color: #888;")
-        tip.setWordWrap(True)
-        l.addWidget(tip)
         p_import.setLayout(l)
         self.addPage(p_import)
 
@@ -317,13 +439,14 @@ class SetupWizard(QWizard):
         l = QVBoxLayout()
         self.pw_enable = QCheckBox("启用密码验证")
         l.addWidget(self.pw_enable)
-        self.pw_input = QLineEdit(); self.pw_input.setEchoMode(QLineEdit.Password)
-        self.pw_input.setPlaceholderText("输入密码（至少 6 个字符，UTF-8 编码不超过 72 字节，支持大小写字母、数字、符号）")
+        self.pw_input = QLineEdit()
+        self.pw_input.setEchoMode(QLineEdit.Password)
         l.addWidget(self.pw_input)
-        self.pw_confirm = QLineEdit(); self.pw_confirm.setEchoMode(QLineEdit.Password)
-        self.pw_confirm.setPlaceholderText("确认密码")
+        self.pw_confirm = QLineEdit()
+        self.pw_confirm.setEchoMode(QLineEdit.Password)
         l.addWidget(self.pw_confirm)
-        p3_pwd.setLayout(l); self.addPage(p3_pwd)
+        p3_pwd.setLayout(l)
+        self.addPage(p3_pwd)
 
         p4_qa = QWizardPage()
         p4_qa.setTitle("安全问题")
@@ -332,16 +455,23 @@ class SetupWizard(QWizard):
         self.qa_enable = QCheckBox("启用安全问题")
         self.qa_enable.setChecked(True)
         l.addWidget(self.qa_enable)
-        self.q1 = QLineEdit(); self.q1.setPlaceholderText("问题1")
-        self.a1 = QLineEdit(); self.a1.setEchoMode(QLineEdit.Password); self.a1.setPlaceholderText("答案1")
-        self.q2 = QLineEdit(); self.q2.setPlaceholderText("问题2")
-        self.a2 = QLineEdit(); self.a2.setEchoMode(QLineEdit.Password); self.a2.setPlaceholderText("答案2")
-        self.q3 = QLineEdit(); self.q3.setPlaceholderText("问题3")
-        self.a3 = QLineEdit(); self.a3.setEchoMode(QLineEdit.Password); self.a3.setPlaceholderText("答案3")
-        l.addWidget(QLabel("问题1")); l.addWidget(self.q1); l.addWidget(self.a1)
-        l.addWidget(QLabel("问题2")); l.addWidget(self.q2); l.addWidget(self.a2)
-        l.addWidget(QLabel("问题3")); l.addWidget(self.q3); l.addWidget(self.a3)
-        p4_qa.setLayout(l); self.addPage(p4_qa)
+        self.q1 = QLineEdit()
+        self.a1 = QLineEdit()
+        self.a1.setEchoMode(QLineEdit.Password)
+        self.q2 = QLineEdit()
+        self.a2 = QLineEdit()
+        self.a2.setEchoMode(QLineEdit.Password)
+        self.q3 = QLineEdit()
+        self.a3 = QLineEdit()
+        self.a3.setEchoMode(QLineEdit.Password)
+        l.addWidget(self.q1)
+        l.addWidget(self.a1)
+        l.addWidget(self.q2)
+        l.addWidget(self.a2)
+        l.addWidget(self.q3)
+        l.addWidget(self.a3)
+        p4_qa.setLayout(l)
+        self.addPage(p4_qa)
 
         p5_totp = QWizardPage()
         p5_totp.setTitle("TOTP 验证")
@@ -349,9 +479,10 @@ class SetupWizard(QWizard):
         l = QVBoxLayout()
         self.totp_enable = QCheckBox("启用 TOTP")
         l.addWidget(self.totp_enable)
-        self.qr_label = QLabel(); self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignCenter)
         l.addWidget(self.qr_label)
-        self.totp_code = QLineEdit(); self.totp_code.setPlaceholderText("输入当前动态码以验证")
+        self.totp_code = QLineEdit()
         l.addWidget(self.totp_code)
         self.totp_secret_label = QLabel()
         l.addWidget(self.totp_secret_label)
@@ -366,34 +497,32 @@ class SetupWizard(QWizard):
         l = QVBoxLayout()
         self.email_enable = QCheckBox("启用邮箱验证")
         l.addWidget(self.email_enable)
-        self.smtp_server = QLineEdit(); self.smtp_server.setPlaceholderText("SMTP服务器 (如 smtp.qq.com)")
+        self.smtp_server = QLineEdit()
         l.addWidget(self.smtp_server)
-        self.smtp_port = QLineEdit(); self.smtp_port.setPlaceholderText("端口 (如 587)")
+        self.smtp_port = QLineEdit()
         l.addWidget(self.smtp_port)
-        self.sender_email = QLineEdit(); self.sender_email.setPlaceholderText("发件邮箱")
+        self.sender_email = QLineEdit()
         l.addWidget(self.sender_email)
-        self.sender_password = QLineEdit(); self.sender_password.setEchoMode(QLineEdit.Password)
-        self.sender_password.setPlaceholderText("授权码或密码")
+        self.sender_password = QLineEdit()
+        self.sender_password.setEchoMode(QLineEdit.Password)
         l.addWidget(self.sender_password)
-        self.receiver_email = QLineEdit(); self.receiver_email.setPlaceholderText("收件邮箱（用于接收验证码）")
+        self.receiver_email = QLineEdit()
         l.addWidget(self.receiver_email)
-
-        # 下载配置助手按钮
         self.download_helper_btn = create_download_button(self)
         self.download_helper_btn.clicked.connect(self._download_email_helper)
         l.addWidget(self.download_helper_btn)
-
-        p6_email.setLayout(l); self.addPage(p6_email)
+        p6_email.setLayout(l)
+        self.addPage(p6_email)
 
         p7_done = QWizardPage()
         p7_done.setTitle("完成")
         p7_done.setSubTitle("设置已保存，点击完成启动程序")
         l = QVBoxLayout()
         l.addWidget(QLabel("所有设置将加密存储，请牢记您的安全信息。"))
-        p7_done.setLayout(l); self.addPage(p7_done)
+        p7_done.setLayout(l)
+        self.addPage(p7_done)
 
     def _download_email_helper(self):
-        """下载邮箱配置助手。"""
         if self._email_downloader is None:
             self._email_downloader = EmailConfigHelperDownloader(self)
         self._email_downloader.start()
@@ -404,15 +533,12 @@ class SetupWizard(QWizard):
         return super().nextId()
 
     def _choose_secret_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择加密文件目录",
-                                              self.secret_dir_input.text())
+        d = QFileDialog.getExistingDirectory(self, "选择加密文件目录", self.secret_dir_input.text())
         if d:
             self.secret_dir_input.setText(d)
 
     def _choose_import_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择备份文件", "",
-            "SecureVault Backup (*.vaultbk);;All Files (*.*)")
+        path, _ = QFileDialog.getOpenFileName(self, "选择备份文件", "", "SecureVault Backup (*.vaultbk);;All Files (*.*)")
         if path:
             self.import_path_input.setText(path)
             self.import_enable.setChecked(True)
@@ -426,52 +552,46 @@ class SetupWizard(QWizard):
                 image = qrcode.make(uri)
                 buffer = BytesIO()
                 image.save(buffer, format='PNG')
-                pixmap = QPixmap(); pixmap.loadFromData(buffer.getvalue())
+                pixmap = QPixmap()
+                pixmap.loadFromData(buffer.getvalue())
                 self.qr_label.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio))
                 self.totp_secret_label.setText(f"密钥：{self.totp_secret}")
                 self.totp_setup_done = True
 
     def validateCurrentPage(self):
         page_id = self.currentId()
-
         if page_id == 0:
             new_dir = self.secret_dir_input.text().strip()
-            if new_dir and os.path.normcase(os.path.abspath(new_dir)) != \
-                    os.path.normcase(os.path.abspath(DEFAULT_SECRET_DIR)):
+            if new_dir and os.path.normcase(os.path.abspath(new_dir)) != os.path.normcase(os.path.abspath(DEFAULT_SECRET_DIR)):
                 try:
                     os.makedirs(new_dir, exist_ok=True)
                 except Exception as e:
                     QMessageBox.warning(self, "错误", f"无法创建目录：{e}")
                     return False
             return True
-
         if page_id == 1:
             return True
-
         if page_id == 2:
             if not self.import_enable.isChecked():
                 return True
             if self._imported_auth:
                 return True
             return self._do_import()
-
         if page_id == 3:
             if not self.pw_enable.isChecked():
                 return True
             pw = self.pw_input.text()
             if not (len(pw) >= 6 and len(pw.encode('utf-8')) <= 72):
-                QMessageBox.warning(self, "错误", "密码长度必须为 至少 6 个字符，UTF-8 编码不超过 72 字节")
+                QMessageBox.warning(self, "错误", "密码长度错误")
                 return False
             if pw != self.pw_confirm.text():
                 QMessageBox.warning(self, "错误", "两次密码输入不一致")
                 return False
             return True
-
         if page_id == 4:
             if not self.qa_enable.isChecked():
                 return True
-            for i, (q, a) in enumerate(
-                    [(self.q1, self.a1), (self.q2, self.a2), (self.q3, self.a3)], 1):
+            for i, (q, a) in enumerate([(self.q1, self.a1), (self.q2, self.a2), (self.q3, self.a3)], 1):
                 if not q.text().strip() or not a.text().strip():
                     QMessageBox.warning(self, "错误", f"请完整填写问题 {i} 和答案")
                     return False
@@ -479,28 +599,23 @@ class SetupWizard(QWizard):
                     QMessageBox.warning(self, '错误', '答案的 UTF-8 编码不超过 72 字节')
                     return False
             return True
-
         if page_id == 5:
             if not self.totp_enable.isChecked():
                 return True
             if not self.totp_secret:
-                QMessageBox.warning(self, "错误", "TOTP 密钥未生成，请返回上一页再进入")
+                QMessageBox.warning(self, "错误", "TOTP 密钥未生成")
                 return False
             code = self.totp_code.text().strip()
             if not code:
-                QMessageBox.warning(self, "错误", "请输入 Authenticator 中显示的当前动态码")
+                QMessageBox.warning(self, "错误", "请输入动态码")
                 self.totp_code.setFocus()
                 return False
             if not self.auth.verify_totp_secret(self.totp_secret, code):
-                QMessageBox.warning(
-                    self, "验证失败",
-                    "TOTP 动态码不正确，或已超过 30 秒有效期。\n"
-                    "请打开 Authenticator 查看当前最新的 6 位数字，重新输入。")
+                QMessageBox.warning(self, "验证失败", "动态码不正确")
                 self.totp_code.clear()
                 self.totp_code.setFocus()
                 return False
             return True
-
         if page_id == 6:
             if not self.email_enable.isChecked():
                 return True
@@ -516,30 +631,25 @@ class SetupWizard(QWizard):
             if not all([server, sender, email_password, receiver]):
                 QMessageBox.warning(self, "错误", "请完整填写邮箱配置")
                 return False
-            success, result = self.auth.test_email_config(
-                server, port, sender, email_password, receiver)
+            success, result = self.auth.test_email_config(server, port, sender, email_password, receiver)
             if not success:
                 QMessageBox.warning(self, "错误", f"邮箱配置测试失败：{result}")
                 return False
-            verify_code, ok = QInputDialog.getText(
-                self, "验证邮箱",
-                f"验证码已发送到 {receiver}\n请输入收到的 6 位验证码：")
+            verify_code, ok = QInputDialog.getText(self, "验证邮箱", f"验证码已发送到 {receiver}\n请输入收到的 6 位验证码：")
             if not ok:
                 return False
-            if not secrets.compare_digest(verify_code.strip().encode('utf-8'), str(result).encode('utf-8')):
-                QMessageBox.warning(self, "错误", "验证码错误，请重试或重新发送")
+            status, msg = verify_email_code(verify_code.strip(), result, time.time())
+            if status != 'ok':
+                QMessageBox.warning(self, "错误", msg or "验证码错误")
                 return False
             return True
-
         if page_id == 7:
             if self._imported_auth:
                 return True
-            if not any((self.pw_enable.isChecked(), self.qa_enable.isChecked(),
-                        self.totp_enable.isChecked(), self.email_enable.isChecked())):
+            if not any((self.pw_enable.isChecked(), self.qa_enable.isChecked(), self.totp_enable.isChecked(), self.email_enable.isChecked())):
                 QMessageBox.warning(self, "错误", "至少需要配置一种验证方式")
                 return False
             return True
-
         return True
 
     def _do_import(self):
@@ -559,6 +669,7 @@ class SetupWizard(QWizard):
         except Exception as e:
             QMessageBox.warning(self, "导入失败", f"无法导入备份：{e}")
             return False
+
         auth_settings = result.get('auth_settings') if isinstance(result, dict) else None
         imported_count = result.get('imported_count', 0) if isinstance(result, dict) else 0
         if auth_settings:
@@ -568,16 +679,12 @@ class SetupWizard(QWizard):
                 QMessageBox.warning(self, "错误", f"恢复验证信息失败：{e}")
                 return False
             self._imported_auth = True
-            self.import_status_label.setText(
-                f"已成功导入 {imported_count} 个文件，并恢复验证信息。\n"
-                f"点击“下一步”将直接进入完成步骤。")
+            self.import_status_label.setText(f"已成功导入 {imported_count} 个文件，并恢复验证信息。\n点击“下一步”将直接进入完成步骤。")
             self.import_status_label.setStyleSheet("color: #4caf50;")
             return True
         else:
             self._imported_auth = False
-            self.import_status_label.setText(
-                f"已导入 {imported_count} 个文件，但备份中未包含验证信息。\n"
-                f"请继续在后续页面手动配置验证方式。")
+            self.import_status_label.setText(f"已导入 {imported_count} 个文件，但备份中未包含验证信息。\n请继续在后续页面手动配置验证方式。")
             self.import_status_label.setStyleSheet("color: #ffaa00;")
             return True
 
@@ -589,49 +696,51 @@ class SetupWizard(QWizard):
                 else:
                     self.auth.password_hash = None
                     self.auth.settings_dict.pop('password_hash', None)
-
                 if self.qa_enable.isChecked():
-                    qa_list = [
-                        (self.q1.text().strip(), self.a1.text().strip()),
-                        (self.q2.text().strip(), self.a2.text().strip()),
-                        (self.q3.text().strip(), self.a3.text().strip()),
-                    ]
-                    self.auth.set_questions(qa_list)
+                    self.auth.set_questions([(self.q1.text().strip(), self.a1.text().strip()),
+                                             (self.q2.text().strip(), self.a2.text().strip()),
+                                             (self.q3.text().strip(), self.a3.text().strip())])
                 else:
                     self.auth.qa = {}
                     self.auth.settings_dict.pop('qa', None)
-
                 if self.totp_enable.isChecked():
                     self.auth.save_totp_secret(self.totp_secret)
                 else:
                     self.auth.settings_dict.pop('totp_secret', None)
                     self.auth.totp_secret = None
-
                 if self.email_enable.isChecked():
-                    self.auth.save_email_config(
-                        self.smtp_server.text().strip(),
-                        int(self.smtp_port.text().strip()),
-                        self.sender_email.text().strip(),
-                        self.sender_password.text(),
-                        self.receiver_email.text().strip())
+                    self.auth.save_email_config(self.smtp_server.text().strip(), int(self.smtp_port.text().strip()),
+                                                self.sender_email.text().strip(), self.sender_password.text(),
+                                                self.receiver_email.text().strip())
                 else:
                     self.auth.email_config = {}
                     self.auth.settings_dict.pop('email', None)
-
                 enabled_map = {}
-                if self.pw_enable.isChecked(): enabled_map['password'] = True
-                if self.qa_enable.isChecked(): enabled_map['question'] = True
-                if self.totp_enable.isChecked(): enabled_map['totp'] = True
-                if self.email_enable.isChecked(): enabled_map['email'] = True
+                if self.pw_enable.isChecked():
+                    enabled_map['password'] = True
+                if self.qa_enable.isChecked():
+                    enabled_map['question'] = True
+                if self.totp_enable.isChecked():
+                    enabled_map['totp'] = True
+                if self.email_enable.isChecked():
+                    enabled_map['email'] = True
                 self.auth.settings_dict['method_enabled'] = enabled_map
             except ValueError as e:
                 QMessageBox.warning(self, "错误", str(e))
                 return
 
         new_dir = self.secret_dir_input.text().strip()
-        if new_dir and os.path.normcase(os.path.abspath(new_dir)) != \
-                os.path.normcase(os.path.abspath(DEFAULT_SECRET_DIR)):
-            self.auth.settings.set_secret_dir(new_dir)
+        if new_dir and os.path.normcase(os.path.abspath(new_dir)) != os.path.normcase(os.path.abspath(DEFAULT_SECRET_DIR)):
+            new_abs = os.path.abspath(new_dir)
+            old_abs = os.path.abspath(self.storage.SECRET_DIR) if self.storage else os.path.abspath(DEFAULT_SECRET_DIR)
+            try:
+                common = os.path.commonpath([old_abs, new_abs])
+            except ValueError:
+                common = ''
+            if common in (old_abs, new_abs):
+                QMessageBox.warning(self, "错误", "新目录不能是当前目录的子目录，当前目录也不能是新目录的子目录")
+                return
+            self.auth.settings_dict['_pending_secret_dir'] = new_abs
 
         self.auth.settings_dict['initialized'] = True
         self.auth._save()

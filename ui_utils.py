@@ -1,4 +1,5 @@
 import ctypes
+from ctypes import wintypes
 from PyQt5.QtWidgets import QApplication
 
 WDA_NONE = 0x00000000
@@ -8,10 +9,12 @@ WDA_EXCLUDEFROMCAPTURE = 0x00000011
 def set_window_display_affinity(hwnd, enable=True):
     """对指定 HWND 应用/取消截屏保护。"""
     try:
-        ctypes.windll.user32.SetWindowDisplayAffinity(
+        ctypes.windll.user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+        ctypes.windll.user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+        res = ctypes.windll.user32.SetWindowDisplayAffinity(
             hwnd, WDA_EXCLUDEFROMCAPTURE if enable else WDA_NONE
         )
-        return True
+        return bool(res)
     except Exception:
         return False
 

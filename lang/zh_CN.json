@@ -10,7 +10,6 @@
     "settings.sidebar.feedback": "反馈",
     "settings.sidebar.update": "检查更新",
     "settings.sidebar.about": "关于",
-
     "security.locked_hint": "为了保证安全请验证身份后设置",
     "security.verify_button": "验证",
     "security.title": "安全设置",
@@ -43,7 +42,6 @@
     "security.backup_import": "导入备份",
     "security.backup_import_row": "与当前保险库合并",
     "security.need_at_least_one": "至少需要保留一种启用的验证方式。",
-
     "web.title": "网页端",
     "web.status": "状态：",
     "web.status_running": "运行中",
@@ -60,7 +58,6 @@
     "web.https_tip": "开启后使用自签名证书加密传输，避免同一局域网内其他设备嗅探会话。浏览器会提示证书不受信任，选择“继续访问”即可。",
     "web.https_warning": "🔒 已启用 HTTPS（自签名证书）。浏览器可能提示证书不受信任，请手动选择继续访问。",
     "web.https_restart_hint": "修改 HTTPS 设置需要先停止服务，再重新启动。",
-
     "appearance.title": "个性化",
     "appearance.theme": "主题",
     "appearance.theme_light": "明亮",
@@ -79,17 +76,14 @@
     "appearance.stats_no_tags": "（暂无标签）",
     "appearance.stats_estimated": "按文件时间估算",
     "appearance.stats_more_tags": "以及其他 {n} 个标签",
-
     "main.search_placeholder": "搜索文件名...",
     "main.search_clear": "清空搜索",
-
     "language.title": "语言",
     "language.select": "选择语言",
     "language.import": "导入语言包",
     "language.import_success": "语言包已导入：",
     "language.import_failed": "导入失败：",
     "language.restart_tip": "已切换语言，部分界面将在下次启动时更新。",
-
     "update.title": "检查更新",
     "update.current": "当前版本",
     "update.check": "检查更新",
@@ -97,12 +91,9 @@
     "update.up_to_date": "已是最新版本",
     "update.new_available": "发现新版本",
     "update.download": "下载并更新",
-
     "about.title": "关于",
-
     "feedback.vpn_tip": "如果打不开请使用 VPN 或加速器，确认后将打开浏览器。",
     "feedback.opening": "正在打开 GitHub Issues 页面...",
-
     "common.ok": "确定",
     "common.cancel": "取消",
     "common.close": "关闭",
@@ -111,6 +102,10 @@
     "common.success": "成功",
     "common.error": "错误",
     "common.warning": "警告",
-    "common.info": "提示"
+    "common.info": "提示",
+    "security.method_password": "密码",
+    "security.method_question": "安全问题",
+    "security.method_totp": "TOTP",
+    "security.method_email": "邮箱"
   }
 }

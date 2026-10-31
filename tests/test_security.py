@@ -137,7 +137,10 @@ def test_atomic_config_write_does_not_follow_predictable_tmp_link(tmp_path):
     victim = tmp_path / 'victim'
     victim.write_bytes(b'keep')
     destination = tmp_path / 'config.dat'
-    (tmp_path / 'config.dat.tmp').symlink_to(victim)
+    try:
+        (tmp_path / 'config.dat.tmp').symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"当前环境不允许创建符号链接: {exc}")
     settings.SettingsManager._atomic_write(str(destination), b'safe')
     assert victim.read_bytes() == b'keep'
     assert destination.read_bytes() == b'safe'

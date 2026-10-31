@@ -1,8 +1,8 @@
-import os, socket
+import os, socket, threading
 from io import BytesIO
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                               QMessageBox, QCheckBox)
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap
 import qrcode
 from i18n import tr
@@ -14,13 +14,17 @@ from ui_settings_style import (SettingsPage, make_page_title, make_section_title
 
 
 class WebPage(SettingsPage):
+    # 后台线程 -> GUI 线程的排队信号（普通 Python 线程里不能直接用 QTimer.singleShot）
+    _web_stopped = pyqtSignal()
+
     def __init__(self, settings_dialog):
         super().__init__()
         self.settings_dialog = settings_dialog
+        self._stop_thread = None
+        self._web_stopped.connect(self._on_stopped)
 
         self.layout().addWidget(make_page_title(tr("web.title")))
 
-        # ---- 状态卡片 ----
         self.section_status = make_section_title(tr("web.section_status"))
         self.layout().addWidget(self.section_status)
         card, c = make_card()
@@ -39,7 +43,6 @@ class WebPage(SettingsPage):
         c.addWidget(row)
         c.addWidget(make_hline())
 
-        # HTTPS 复选框（在服务未运行时才能切换）
         self.https_cb = QCheckBox(tr("web.https_cb"))
         self.https_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('web_https_enabled', True))
@@ -63,14 +66,12 @@ class WebPage(SettingsPage):
         c.addWidget(self.warning_label)
         self.layout().addWidget(card)
 
-        # ---- 二维码卡片 ----
         self.section_qr = make_section_title(tr("web.qr_hint"))
         self.layout().addWidget(self.section_qr)
         self.qr_card, qc = make_card()
 
         self.qr_label = QLabel()
         self.qr_label.setAlignment(Qt.AlignCenter)
-        # 去掉之前强制的 260x260 最小尺寸，改为较小的限制，允许随窗口缩小
         self.qr_label.setMinimumSize(100, 100)
         qc.addWidget(self.qr_label, 0, Qt.AlignHCenter)
 
@@ -92,8 +93,7 @@ class WebPage(SettingsPage):
         self.layout().addWidget(self.qr_card)
         self.layout().addStretch()
 
-        self._qr_pixmap = None  # 保存原始大小的二维码 Pixmap
-
+        self._qr_pixmap = None
         self.refresh_state()
 
     def _get_ip(self):
@@ -124,26 +124,21 @@ class WebPage(SettingsPage):
         return pixmap
 
     def _update_qr_display(self):
-        """根据当前控件大小缩放二维码图片。"""
         if self._qr_pixmap is None:
             return
-        # 获取当前标签的可用大小
         w = self.qr_label.width()
         h = self.qr_label.height()
         if w < 50 or h < 50:
-            return  # 太小了，不绘制，等 resizeEvent 再处理
+            return
         scaled = self._qr_pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.qr_label.setPixmap(scaled)
 
     def resizeEvent(self, event):
-        """窗口大小变化时，自动缩放二维码。"""
         super().resizeEvent(event)
         self._update_qr_display()
 
     def on_https_toggled(self, state):
-        """保存 HTTPS 首选项。运行时不允许切换。"""
         if is_web_running():
-            # 服务运行中不允许切换
             self.https_cb.blockSignals(True)
             self.https_cb.setChecked(is_https_enabled())
             self.https_cb.blockSignals(False)
@@ -158,22 +153,49 @@ class WebPage(SettingsPage):
             f"Web HTTPS: {'启用' if enabled else '禁用'}")
         self.refresh_state()
 
+    def _verify_before_start(self):
+        # 二次鉴权：防止已解锁会话被他人一键暴露到局域网
+        if not self.settings_dialog._verify_identity():
+            return False
+        reply = QMessageBox.question(
+            self, "确认启动 Web 服务",
+            "启动后，同一局域网内的设备可通过浏览器访问您的加密文件（仍需验证身份）。\n\n"
+            "确定要启动吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return reply == QMessageBox.Yes
+
     def toggle_server(self):
         if is_web_running():
-            stop_web_server()
-            self.settings_dialog.storage.log("停止移动端Web服务")
+            # 停止服务放到后台线程，避免 shutdown() 阻塞 GUI
+            self.toggle_btn.setEnabled(False)
+            self.toggle_btn.setText("正在停止...")
+            def _stop():
+                try:
+                    stop_web_server()
+                finally:
+                    self._web_stopped.emit()
+            self._stop_thread = threading.Thread(target=_stop, daemon=True)
+            self._stop_thread.start()
+            return
+
+        if not self._verify_before_start():
+            return
+
+        enable_https = self.https_cb.isChecked()
+        if start_web_server(self.settings_dialog.storage,
+                            self.settings_dialog.auth,
+                            enable_https=enable_https):
+            self.settings_dialog.storage.log(
+                f"启动移动端Web服务 (HTTPS={'on' if enable_https else 'off'})")
         else:
-            enable_https = self.https_cb.isChecked()
-            if start_web_server(self.settings_dialog.storage,
-                                self.settings_dialog.auth,
-                                enable_https=enable_https):
-                self.settings_dialog.storage.log(
-                    f"启动移动端Web服务 (HTTPS={'on' if enable_https else 'off'})")
-            else:
-                QMessageBox.warning(
-                    self, tr("common.error"),
-                    f"无法启动 Web 服务，请检查端口 {WEB_PORT} 是否被占用。")
-            QTimer.singleShot(800, self.refresh_state)
+            QMessageBox.warning(
+                self, tr("common.error"),
+                f"无法启动 Web 服务，请检查端口 {WEB_PORT} 是否被占用。")
+        QTimer.singleShot(800, self.refresh_state)
+        self.refresh_state()
+
+    def _on_stopped(self):
+        self.toggle_btn.setEnabled(True)
         self.refresh_state()
 
     def refresh_state(self):
@@ -183,7 +205,7 @@ class WebPage(SettingsPage):
             self.status_label.setText(tr("web.status") + tr("web.status_running"))
             self.status_label.setStyleSheet("color: #4caf50; font-size: 11pt;")
             self.toggle_btn.setText(tr("web.stop"))
-            # 服务运行中不允许修改 HTTPS 开关
+            self.toggle_btn.setEnabled(True)
             self.https_cb.setEnabled(False)
 
             ip, is_loopback = self._get_ip() if https_on else ('127.0.0.1', True)
@@ -202,7 +224,6 @@ class WebPage(SettingsPage):
                 self.url_label.setStyleSheet("padding: 8px; color: #5a8cbf;")
                 self.loopback_warning.setVisible(False)
 
-            # 更新提示：HTTPS 下的浏览器警告
             if https_on:
                 self.warning_label.setText(tr("web.https_warning"))
                 self.warning_label.setStyleSheet("color: #5a8cbf; padding: 8px 10px;")
@@ -213,6 +234,7 @@ class WebPage(SettingsPage):
             self.status_label.setText(tr("web.status") + tr("web.status_stopped"))
             self.status_label.setStyleSheet("color: #888; font-size: 11pt;")
             self.toggle_btn.setText(tr("web.start"))
+            self.toggle_btn.setEnabled(True)
             self.https_cb.setEnabled(True)
             self._qr_pixmap = None
             self.qr_label.clear()

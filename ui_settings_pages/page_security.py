@@ -1,6 +1,6 @@
 import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                              QMessageBox, QCheckBox, QSizePolicy)
+                              QMessageBox, QCheckBox, QSizePolicy, QInputDialog, QLineEdit)
 from PyQt5.QtCore import Qt
 from i18n import tr
 from ui_settings_style import (SettingsPage, make_page_title, make_section_title,
@@ -8,10 +8,10 @@ from ui_settings_style import (SettingsPage, make_page_title, make_section_title
 
 
 METHOD_LABELS = {
-    'password': ('security.password', 'password'),
-    'question': ('security.questions', 'question'),
-    'totp':     ('security.totp', 'totp'),
-    'email':    ('security.email', 'email'),
+    'password': ('security.method_password', '密码', 'password'),
+    'question': ('security.method_question', '安全问题', 'question'),
+    'totp':     ('security.method_totp', 'TOTP', 'totp'),
+    'email':    ('security.method_email', '邮箱', 'email'),
 }
 
 
@@ -98,6 +98,20 @@ class SecurityPage(SettingsPage):
         ul.addWidget(make_section_title(tr("security.section_protection")))
         card3, c3 = make_card()
 
+        self.high_sec_cb = QCheckBox()
+        self.high_sec_cb.blockSignals(True)
+        self.high_sec_cb.setChecked(self.settings_dialog.auth.settings.is_high_security_enabled())
+        self.high_sec_cb.blockSignals(False)
+        self.high_sec_cb.clicked.connect(self._on_high_sec_clicked)
+        row_hsec, _ = make_setting_row(
+            tr("security.high_sec", "高安全模式（防范后台恶意程序）"), self.high_sec_cb)
+        c3.addWidget(row_hsec)
+        self.hsec_tip = TipLabel(
+            "开启后，每次启动必须输入独立的主密码。主密码直接参与底层主密钥的保护，可有效防御已获取 Windows 权限的恶意软件。\n"
+            "注意：主密码一旦忘记将无法找回（除非使用紧急恢复代码）。")
+        c3.addWidget(self.hsec_tip)
+        c3.addWidget(make_hline())
+
         self.screenshot_cb = QCheckBox()
         self.screenshot_cb.setChecked(
             self.settings_dialog.auth.settings_dict.get('screenshot_protection', False))
@@ -180,6 +194,56 @@ class SecurityPage(SettingsPage):
         except Exception as e:
             QMessageBox.warning(self, tr("common.error"), str(e))
 
+    def _on_high_sec_clicked(self, checked):
+        auth = self.settings_dialog.auth
+        settings = auth.settings
+
+        if checked:
+            if not auth.password_hash:
+                QMessageBox.warning(self, "提示", "必须先在上方启用并设置密码，才能开启高安全模式。")
+                self.high_sec_cb.setChecked(False)
+                return
+            pw, ok = QInputDialog.getText(
+                self, "确认主密码",
+                "请输入您当前的登录密码，它将被作为主密码用于保护底层密钥：",
+                QLineEdit.Password)
+            if not ok or not pw:
+                self.high_sec_cb.setChecked(False)
+                return
+            if not auth.verify_password(pw):
+                QMessageBox.warning(self, "错误", "密码验证失败。")
+                self.high_sec_cb.setChecked(False)
+                return
+            try:
+                new_code = auth.generate_recovery_code(send_email=False)
+                settings.enable_high_security(pw, new_code)
+                auth.clear_recovery_code()
+                email_sent = auth.send_high_security_enabled_email()
+                msg = (f"高安全模式已开启。下次启动需要输入该密码。\n\n"
+                       f"您的新紧急恢复代码是：\n{new_code}\n\n"
+                       "请务必截图或保存在安全的地方！忘记主密码时将无法找回。")
+                if email_sent:
+                    msg += "\n\n（一封无敏感信息的提示邮件已发送至您的邮箱。）"
+                QMessageBox.information(self, "开启成功 - 请保存恢复代码", msg)
+                self.settings_dialog.storage.log("开启高安全模式")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"开启失败：{e}")
+                self.high_sec_cb.setChecked(False)
+        else:
+            pw, ok = QInputDialog.getText(
+                self, "关闭高安全模式", "请输入主密码以关闭此模式：", QLineEdit.Password)
+            if not ok or not pw:
+                self.high_sec_cb.setChecked(True)
+                return
+            try:
+                master_key = settings.unlock_master_key(password=pw)
+                settings.disable_high_security(master_key)
+                QMessageBox.information(self, "成功", "高安全模式已关闭。")
+                self.settings_dialog.storage.log("关闭高安全模式")
+            except Exception as e:
+                QMessageBox.warning(self, "错误", str(e))
+                self.high_sec_cb.setChecked(True)
+
     def _build_storage_card(self):
         card, c = make_card()
         row = QWidget()
@@ -191,6 +255,8 @@ class SecurityPage(SettingsPage):
         path_text = self.settings_dialog.storage.SECRET_DIR
         self.secret_dir_label = QLabel(path_text)
         self.secret_dir_label.setStyleSheet("color: #888; font-size: 9pt;")
+        self.secret_dir_label.setWordWrap(True)
+        self.secret_dir_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.secret_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         rl.addWidget(self.secret_dir_label, 1)
         btn = QPushButton(tr("security.storage_change"))
@@ -201,14 +267,14 @@ class SecurityPage(SettingsPage):
         return card
 
     def _build_method_row(self, key):
-        label_key, method_name = METHOD_LABELS[key]
+        label_key, fallback_name, method_name = METHOD_LABELS[key]
         auth = self.settings_dialog.auth
         configured = key in auth.get_configured_methods()
         row = QWidget()
         rl = QHBoxLayout(row)
         rl.setContentsMargins(10, 8, 10, 8)
         rl.setSpacing(10)
-        name_label = QLabel(tr(label_key))
+        name_label = QLabel(tr(label_key, fallback_name))
         name_label.setObjectName("SettingLabel")
         rl.addWidget(name_label)
         status = QLabel(tr("security.configured") if configured

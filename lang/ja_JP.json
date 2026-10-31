@@ -10,7 +10,6 @@
     "settings.sidebar.feedback": "フィードバック",
     "settings.sidebar.update": "更新確認",
     "settings.sidebar.about": "情報",
-
     "security.locked_hint": "セキュリティのため本人確認をしてください",
     "security.verify_button": "認証",
     "security.title": "セキュリティ設定",
@@ -43,7 +42,6 @@
     "security.backup_import": "バックアップをインポート",
     "security.backup_import_row": "現在のボールトにマージ",
     "security.need_at_least_one": "少なくとも1つの認証方式を有効にしておく必要があります。",
-
     "web.title": "ウェブ",
     "web.status": "状態：",
     "web.status_running": "実行中",
@@ -60,7 +58,6 @@
     "web.https_tip": "自己署名証明書で通信を暗号化し、同じLAN内の盗聴を防ぎます。ブラウザが証明書を警告しますが、「続行」を選択してください。",
     "web.https_warning": "🔒 HTTPS（自己署名）が有効です。ブラウザが警告を表示する場合がありますが、「続行」を選択してください。",
     "web.https_restart_hint": "HTTPS設定を変更するには、サービスを停止してから再起動してください。",
-
     "appearance.title": "外観",
     "appearance.theme": "テーマ",
     "appearance.theme_light": "ライト",
@@ -79,17 +76,14 @@
     "appearance.stats_no_tags": "（タグなし）",
     "appearance.stats_estimated": "ファイル時刻から推定",
     "appearance.stats_more_tags": "他 {n} 個のタグ",
-
     "main.search_placeholder": "ファイル名を検索...",
     "main.search_clear": "検索をクリア",
-
     "language.title": "言語",
     "language.select": "言語を選択",
     "language.import": "言語パックをインポート",
     "language.import_success": "言語パックをインポートしました：",
     "language.import_failed": "インポート失敗：",
     "language.restart_tip": "言語を変更しました。次回起動時に反映されます。",
-
     "update.title": "更新確認",
     "update.current": "現在のバージョン",
     "update.check": "更新を確認",
@@ -97,12 +91,9 @@
     "update.up_to_date": "最新版です",
     "update.new_available": "新しいバージョンがあります",
     "update.download": "ダウンロードして更新",
-
     "about.title": "情報",
-
     "feedback.vpn_tip": "開けない場合はVPNをご利用ください。",
     "feedback.opening": "GitHub Issuesを開いています...",
-
     "common.ok": "OK",
     "common.cancel": "キャンセル",
     "common.close": "閉じる",
@@ -111,6 +102,10 @@
     "common.success": "成功",
     "common.error": "エラー",
     "common.warning": "警告",
-    "common.info": "情報"
+    "common.info": "情報",
+    "security.method_password": "パスワード",
+    "security.method_question": "秘密の質問",
+    "security.method_totp": "TOTP",
+    "security.method_email": "メール"
   }
 }
