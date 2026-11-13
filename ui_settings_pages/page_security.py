@@ -104,11 +104,15 @@ class SecurityPage(SettingsPage):
         self.high_sec_cb.blockSignals(False)
         self.high_sec_cb.clicked.connect(self._on_high_sec_clicked)
         row_hsec, _ = make_setting_row(
-            tr("security.high_sec", "高安全模式（防范后台恶意程序）"), self.high_sec_cb)
+            tr("security.high_sec", "高安全模式（主密码保护）"), self.high_sec_cb)
         c3.addWidget(row_hsec)
         self.hsec_tip = TipLabel(
-            "开启后，每次启动必须输入独立的主密码。主密码直接参与底层主密钥的保护，可有效防御已获取 Windows 权限的恶意软件。\n"
-            "注意：主密码一旦忘记将无法找回（除非使用紧急恢复代码）。")
+            "开启后，主密钥不再由 DPAPI 自动解封，而是由主密码（与登录密码一致，可随时修改）"
+            "经 scrypt 派生密钥保护；每次启动必须输入主密码。\n"
+            "可显著提高后台恶意程序直接读取主密钥的门槛，但不能防御键盘记录、内存转储，"
+            "或已经掌握主密码的攻击者。\n"
+            "恢复代码只在开启 / 重设时显示一次，请离线妥善保存；忘记主密码时可使用恢复代码，"
+            "主密码与恢复代码都丢失则无法恢复数据。")
         c3.addWidget(self.hsec_tip)
         c3.addWidget(make_hline())
 
